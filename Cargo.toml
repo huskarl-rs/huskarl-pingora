@@ -1,0 +1,35 @@
+[package]
+name = "huskarl-pingora"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Pingora integration for huskarl OAuth2 resource server."
+repository = "https://github.com/huskarl-rs/huskarl-pingora"
+homepage = "https://github.com/huskarl-rs/huskarl-pingora"
+documentation = "https://docs.rs/huskarl-pingora"
+license = "MIT OR Apache-2.0"
+keywords = ["oauth2", "pingora", "security", "authentication"]
+categories = ["authentication"]
+
+[dependencies]
+async-trait = "0.1.89"
+bytes = "1"
+http = "1"
+huskarl-resource-server = { version = "0.5.0", default-features = false }
+matchit = "0.9"
+pingora-cache = "0.8.0"
+pingora-core = { version = "0.8.0", default-features = false }
+pingora-error = "0.8.0"
+pingora-http = "0.8.0"
+pingora-proxy = { version = "0.8.0", default-features = false }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+huskarl-resource-server = { version = "0.5.0" }
+huskarl-reqwest = { version = "0.4", features = ["rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+env_logger = "0.11"
+
+[[example]]
+name = "jwt_proxy"
