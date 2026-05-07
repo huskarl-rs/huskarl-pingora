@@ -1,3 +1,10 @@
+//! Composable access control rules.
+//!
+//! A [`Rule`] defines the authentication and authorization policy for a route:
+//! whether a token is required, optional, or unnecessary, plus optional
+//! audience, scope, and custom checks. Rules are registered on a
+//! [`Guard`](super::Guard) via its builder.
+
 use std::sync::Arc;
 
 use crate::resource_server::validator::ValidatedRequest;
@@ -56,18 +63,22 @@ impl<C> Clone for Rule<C> {
 }
 
 impl<C> Rule<C> {
-    /// Creates a rule that requires no authentication.
-    ///
-    /// The validator is not called at all for matching paths.
-    pub fn public() -> Self {
+    fn with_requirement(token: TokenRequirement) -> Self {
         Self {
-            token: TokenRequirement::None,
+            token,
             audiences: Vec::new(),
             scopes: Vec::new(),
             scope_param: None,
             check: None,
             strip_credentials: true,
         }
+    }
+
+    /// Creates a rule that requires no authentication.
+    ///
+    /// The validator is not called at all for matching paths.
+    pub fn public() -> Self {
+        Self::with_requirement(TokenRequirement::None)
     }
 
     /// Creates a rule where a token is accepted but not required.
@@ -75,26 +86,12 @@ impl<C> Rule<C> {
     /// If a token is present it is validated; if absent the request proceeds
     /// with `token: None`.
     pub fn optional() -> Self {
-        Self {
-            token: TokenRequirement::Optional,
-            audiences: Vec::new(),
-            scopes: Vec::new(),
-            scope_param: None,
-            check: None,
-            strip_credentials: true,
-        }
+        Self::with_requirement(TokenRequirement::Optional)
     }
 
     /// Creates a rule that requires a valid token.
     pub fn required() -> Self {
-        Self {
-            token: TokenRequirement::Required,
-            audiences: Vec::new(),
-            scopes: Vec::new(),
-            scope_param: None,
-            check: None,
-            strip_credentials: true,
-        }
+        Self::with_requirement(TokenRequirement::Required)
     }
 
     /// Requires that the token's `audience` contains at least one of the given values.
@@ -114,7 +111,7 @@ impl<C> Rule<C> {
         self
     }
 
-    /// Requires that the token's scopes (via [`HasScopes`](crate::HasScopes)) contain
+    /// Requires that the token's scopes (via [`HasScopes`](super::HasScopes)) contain
     /// all of the given values.
     ///
     /// If any are missing, the request is denied with 403 `insufficient_scope`.

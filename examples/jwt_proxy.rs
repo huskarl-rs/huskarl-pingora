@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl_pingora::{
-    AuthCtx, AuthProxy, Guard, Rule,
+    resource::{AuthCtx, AuthProxy, Guard, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
         validator::{dpop_nonce::NoNonceCheck, rfc9068::Rfc9068Validator},
@@ -68,10 +68,10 @@ async fn build_validator(issuer: &str, audience: &str) -> Rfc9068Validator<NoNon
     // Uses the RFC 8414 well-known path by default. For OIDC providers
     // (Auth0, Keycloak, etc.), use `.well_known_path("/.well-known/openid-configuration")`
     // or `AuthorizationServerMetadata::oidc_builder()` instead.
-    let metadata = AuthorizationServerMetadata::builder()
+    let metadata = AuthorizationServerMetadata::fetch()
         .http_client(&http_client)
         .issuer(issuer)
-        .build()
+        .call()
         .await
         .expect("failed to fetch authorization server metadata");
 
