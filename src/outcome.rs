@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
-use huskarl_resource_server::validator::ValidatedRequest;
+use crate::resource_server::validator::ValidatedRequest;
 
 /// The low-level result of [`Guard::check`](crate::Guard::check).
+///
+/// The `Debug` impl intentionally omits token internals.
 pub enum Outcome<C> {
     /// The request should proceed. Contains the validated token (if any) and
     /// an optional DPoP nonce to include in the response.
@@ -26,3 +28,29 @@ pub enum Outcome<C> {
     },
 }
 
+impl<C> std::fmt::Debug for Outcome<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Forward {
+                token,
+                dpop_nonce,
+                strip_credentials,
+            } => f
+                .debug_struct("Forward")
+                .field("has_token", &token.is_some())
+                .field("dpop_nonce", &dpop_nonce.is_some())
+                .field("strip_credentials", strip_credentials)
+                .finish(),
+            Outcome::Deny {
+                status,
+                challenges,
+                dpop_nonce,
+            } => f
+                .debug_struct("Deny")
+                .field("status", status)
+                .field("challenges", challenges)
+                .field("dpop_nonce", &dpop_nonce.is_some())
+                .finish(),
+        }
+    }
+}

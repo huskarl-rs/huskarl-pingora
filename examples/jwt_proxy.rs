@@ -20,17 +20,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pingora_core::server::Server;
-use pingora_core::upstreams::peer::HttpPeer;
-use pingora_error::Result;
-use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
-
-use huskarl_pingora::resource_server::core::jwk::JwksSource;
-use huskarl_pingora::resource_server::core::server_metadata::AuthorizationServerMetadata;
-use huskarl_pingora::resource_server::validator::dpop_nonce::NoNonceCheck;
-use huskarl_pingora::resource_server::validator::rfc9068::Rfc9068Validator;
-use huskarl_pingora::{AuthCtx, AuthProxy, Guard, Rule};
+use huskarl_pingora::{
+    AuthCtx, AuthProxy, Guard, Rule,
+    resource_server::{
+        core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
+        validator::{dpop_nonce::NoNonceCheck, rfc9068::Rfc9068Validator},
+    },
+};
 use huskarl_reqwest::ReqwestClient;
+use pingora_core::{server::Server, upstreams::peer::HttpPeer};
+use pingora_error::Result;
+use pingora_proxy::{ProxyHttp, Session, http_proxy_service};
 
 type Claims = huskarl_pingora::resource_server::validator::rfc9068::Rfc9068AccessTokenClaims;
 
@@ -96,9 +96,11 @@ async fn main() {
 
     let validator = build_validator(&issuer, &audience).await;
 
-    let guard = Guard::builder(validator)
+    let guard = Guard::builder()
+        .validator(validator)
         .route("/health", Rule::public())
-        .build();
+        .build()
+        .expect("failed to build guard");
 
     let proxy = AuthProxy::new(Upstream(upstream.clone()), guard);
 

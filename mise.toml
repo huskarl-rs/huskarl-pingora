@@ -1,2 +1,6 @@
 [tools]
 cmake = "4"
+
+[tasks.fmt]
+run = "cargo +nightly fmt"
+description = "Format code with nightly rustfmt"
