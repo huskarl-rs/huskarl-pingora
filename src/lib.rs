@@ -1,9 +1,15 @@
-//! Pingora integration for huskarl-resource-server.
+//! Pingora integration for huskarl.
 //!
-//! This crate provides [`AuthProxy`], a decorator that wraps a [`ProxyHttp`](pingora_proxy::ProxyHttp)
-//! implementation to add OAuth 2.0 token validation via a [`Guard`].
+//! This crate provides two independent feature-gated modules:
 //!
-//! # Example
+//! - **`resource`** — OAuth 2.0 resource-server (bearer token) protection via
+//!   [`resource::AuthProxy`] and [`resource::Guard`].
+//! - **`login`** — OAuth 2.0 Authorization Code Grant login layer via
+//!   [`login::LoginProxy`].
+//!
+//! Both features are enabled by default.
+//!
+//! # Resource server example
 //!
 //! A minimal JWT-protected reverse proxy using an [RFC 9068] validator:
 //!
@@ -14,7 +20,7 @@
 //!
 //! use async_trait::async_trait;
 //! use huskarl_pingora::{
-//!     AuthCtx, AuthProxy, Guard, Rule,
+//!     resource::{AuthCtx, AuthProxy, Guard, Rule},
 //!     resource_server::{
 //!         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
 //!         validator::rfc9068::Rfc9068Validator,
@@ -32,7 +38,9 @@
 //! #[async_trait]
 //! impl ProxyHttp for MyProxy {
 //!     type CTX = AuthCtx<(), Claims>;
-//!     fn new_ctx(&self) -> Self::CTX { AuthCtx::new(()) }
+//!     fn new_ctx(&self) -> Self::CTX {
+//!         AuthCtx::new(())
+//!     }
 //!
 //!     async fn upstream_peer(
 //!         &self,
@@ -54,10 +62,10 @@
 //!         .expect("HTTP client");
 //!
 //!     // 2. Discover the authorization server's metadata (issuer, jwks_uri, …).
-//!     let metadata = AuthorizationServerMetadata::builder()
+//!     let metadata = AuthorizationServerMetadata::fetch()
 //!         .http_client(&http_client)
 //!         .issuer("https://auth.example.com")
-//!         .build()
+//!         .call()
 //!         .await
 //!         .expect("AS metadata");
 //!
@@ -82,22 +90,11 @@
 //! }
 //! ```
 
-mod ctx;
-pub(crate) mod error;
-mod guard;
-mod outcome;
-mod proxy;
-pub(crate) mod response;
-pub mod rule;
-pub mod scopes;
-pub(crate) mod uri;
+#[cfg(feature = "login")]
+pub mod login;
+#[cfg(feature = "resource")]
+pub mod resource;
 
-pub use ctx::{AuthCtx, HasAuthState};
-pub use error::ConfigError;
-pub use guard::{ClientCertDer, Guard, GuardBuilder};
 /// Re-export of [`huskarl_resource_server`] for convenience.
+#[cfg(feature = "resource")]
 pub use huskarl_resource_server as resource_server;
-pub use outcome::Outcome;
-pub use proxy::AuthProxy;
-pub use rule::{CheckError, Rule, TokenRequirement};
-pub use scopes::HasScopes;

@@ -1,7 +1,16 @@
+//! Error types for the resource server module.
+//!
+//! [`ConfigError`] covers build-time issues with [`Guard`](super::Guard)
+//! construction (invalid route patterns, unreachable constraints on public
+//! rules, metadata serialization failures). Internal error helpers map
+//! validation outcomes to [RFC 6750] challenge responses.
+//!
+//! [RFC 6750]: https://datatracker.ietf.org/doc/html/rfc6750
+
 use crate::resource_server::error::{ToRfc6750Error, TokenErrorCode, TokenValidationError};
 
-/// Errors that can occur when building or configuring a [`Guard`](crate::Guard)
-/// or [`AuthProxy`](crate::AuthProxy).
+/// Errors that can occur when building or configuring a [`Guard`](super::Guard)
+/// or [`AuthProxy`](super::AuthProxy).
 #[derive(Debug)]
 pub enum ConfigError {
     /// A route pattern was invalid.

@@ -1,8 +1,14 @@
+//! Guard check outcome.
+//!
+//! [`Outcome`] is the result of [`Guard::check`](super::Guard::check),
+//! indicating whether a request should be forwarded upstream (with optional
+//! validated token) or denied with HTTP challenge headers.
+
 use std::sync::Arc;
 
 use crate::resource_server::validator::ValidatedRequest;
 
-/// The low-level result of [`Guard::check`](crate::Guard::check).
+/// The low-level result of [`Guard::check`](super::Guard::check).
 ///
 /// The `Debug` impl intentionally omits token internals.
 pub enum Outcome<C> {

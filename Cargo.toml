@@ -1,6 +1,6 @@
 [package]
 name = "huskarl-pingora"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Pingora integration for huskarl OAuth2 resource server."
@@ -11,28 +11,52 @@ license = "MIT OR Apache-2.0"
 keywords = ["oauth2", "pingora", "security", "authentication"]
 categories = ["authentication"]
 
+[features]
+default = ["resource", "login"]
+resource = ["dep:bon", "dep:huskarl-resource-server", "dep:matchit", "dep:pingora-core", "dep:serde_json"]
+login = ["dep:base64", "dep:bon", "dep:huskarl", "dep:pingora-core", "dep:serde_html_form", "dep:serde_json", "dep:uuid", "serde/derive"]
+
 [dependencies]
 async-trait = "0.1.89"
-bon = "3.9"
 bytes = "1"
 http = "1"
-huskarl-resource-server = { version = "0.6", default-features = false }
 log = "0.4"
-matchit = "0.9"
 pingora-cache = "0.8.0"
 pingora-proxy-delegate = "0.1.0"
-pingora-core = { version = "0.8.0", default-features = false }
 pingora-error = "0.8.0"
 pingora-http = "0.8.0"
 pingora-proxy = { version = "0.8.0", default-features = false }
-serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 
+# resource feature
+bon = { version = "3.9", optional = true }
+huskarl-resource-server = { version = "0.7", default-features = false, optional = true }
+matchit = { version = "0.9", optional = true }
+pingora-core = { version = "0.8.0", default-features = false, optional = true }
+serde_json = { version = "1", optional = true }
+
+# login feature
+base64 = { version = "0.22", optional = true }
+huskarl = { version = "0.7", default-features = false, features = ["default-jws-verifier-platform"], optional = true }
+serde = { version = "1", optional = true }
+serde_html_form = { version = "0.4", optional = true }
+uuid = { version = "1", features = ["v7"], optional = true }
+
 [dev-dependencies]
-huskarl-resource-server = { version = "0.6" }
-huskarl-reqwest = { version = "0.5", features = ["rustls-tls"] }
+huskarl-resource-server = { version = "0.7" }
+huskarl-reqwest = { version = "0.6", features = ["rustls-tls"] }
+huskarl-crypto-native = { version = "0.7" }
+hex = "0.4"
+pingora-core = { version = "0.8.0", features = ["rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+url = "2"
 env_logger = "0.11"
+rand = "0.10"
 
 [[example]]
 name = "jwt_proxy"
+required-features = ["resource"]
+
+[[example]]
+name = "login_proxy"
+required-features = ["login"]
