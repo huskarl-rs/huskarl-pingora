@@ -57,7 +57,7 @@ pub trait HasAuthState<C> {
     /// Mutable reference to the validated token. Used internally by
     /// [`AuthProxy`](super::AuthProxy) to store the validation result.
     fn validated_token_mut(&mut self) -> &mut Option<Arc<ValidatedRequest<C>>>;
-    /// Mutable reference to the DPoP nonce to include in the response, if any.
+    /// Mutable reference to the `DPoP` nonce to include in the response, if any.
     fn dpop_nonce_mut(&mut self) -> &mut Option<String>;
     /// Whether the `Authorization` and `DPoP` headers should be stripped before
     /// forwarding the request upstream.

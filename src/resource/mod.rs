@@ -15,7 +15,7 @@
 //!   (e.g. `/users/{id}`, `/public/*rest`).
 //! - **Scope enforcement** — requires tokens to carry specific scopes via the
 //!   [`HasScopes`] trait.
-//! - **DPoP support** — proof-of-possession tokens are validated and
+//! - **`DPoP` support** — proof-of-possession tokens are validated and
 //!   `DPoP-Nonce` headers are propagated automatically.
 //! - **Credential stripping** — `Authorization` and `DPoP` headers are removed
 //!   before forwarding to upstream by default.

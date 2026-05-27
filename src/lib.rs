@@ -1,3 +1,9 @@
+#![forbid(unsafe_code)]
+#![deny(clippy::panic)]
+#![warn(clippy::pedantic)]
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! Pingora integration for huskarl.
 //!
 //! This crate provides two independent feature-gated modules:

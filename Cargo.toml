@@ -1,6 +1,6 @@
 [package]
 name = "huskarl-pingora"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Pingora integration for huskarl OAuth2 resource server."
@@ -12,16 +12,19 @@ keywords = ["oauth2", "pingora", "security", "authentication"]
 categories = ["authentication"]
 
 [features]
-default = ["resource", "login"]
+default = ["resource", "login", "default-jws-verifier-platform"]
 resource = ["dep:bon", "dep:huskarl-resource-server", "dep:matchit", "dep:pingora-core", "dep:serde_json"]
-login = ["dep:base64", "dep:bon", "dep:huskarl", "dep:pingora-core", "dep:serde_html_form", "dep:serde_json", "dep:uuid", "serde/derive"]
+login = ["dep:bon", "dep:huskarl", "dep:huskarl-login", "dep:matchit", "dep:pingora-core"]
+default-jws-verifier-platform = [
+    "huskarl?/default-jws-verifier-platform",
+    "huskarl-resource-server?/default-jws-verifier-platform",
+]
 
 [dependencies]
 async-trait = "0.1.89"
 bytes = "1"
 http = "1"
 log = "0.4"
-pingora-cache = "0.8.0"
 pingora-proxy-delegate = "0.1.0"
 pingora-error = "0.8.0"
 pingora-http = "0.8.0"
@@ -36,11 +39,9 @@ pingora-core = { version = "0.8.0", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
 
 # login feature
-base64 = { version = "0.22", optional = true }
-huskarl = { version = "0.7", default-features = false, features = ["default-jws-verifier-platform"], optional = true }
-serde = { version = "1", optional = true }
-serde_html_form = { version = "0.4", optional = true }
-uuid = { version = "1", features = ["v7"], optional = true }
+huskarl = { version = "0.7", default-features = false, optional = true }
+huskarl-login = { version = "0.1", optional = true }
+pingora-cache = "0.8.0"
 
 [dev-dependencies]
 huskarl-resource-server = { version = "0.7" }
@@ -60,3 +61,6 @@ required-features = ["resource"]
 [[example]]
 name = "login_proxy"
 required-features = ["login"]
+
+[package.metadata.cargo-machete]
+ignored = ["pingora-cache"]

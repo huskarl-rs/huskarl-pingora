@@ -161,7 +161,7 @@ impl<C> std::fmt::Debug for Rule<C> {
             .field("scopes", &self.scopes)
             .field("strip_credentials", &self.strip_credentials)
             .field("check", &self.check.as_ref().map(|_| ..))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

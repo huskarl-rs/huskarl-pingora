@@ -13,11 +13,11 @@ use crate::resource_server::validator::ValidatedRequest;
 /// The `Debug` impl intentionally omits token internals.
 pub enum Outcome<C> {
     /// The request should proceed. Contains the validated token (if any) and
-    /// an optional DPoP nonce to include in the response.
+    /// an optional `DPoP` nonce to include in the response.
     Forward {
         /// The validated token, or `None` for unauthenticated/public requests.
         token: Option<Arc<ValidatedRequest<C>>>,
-        /// A DPoP nonce to set in the `DPoP-Nonce` response header, if any.
+        /// A `DPoP` nonce to set in the `DPoP-Nonce` response header, if any.
         dpop_nonce: Option<String>,
         /// Whether to strip the `Authorization` header before forwarding upstream.
         strip_credentials: bool,
@@ -29,7 +29,7 @@ pub enum Outcome<C> {
         status: http::StatusCode,
         /// `WWW-Authenticate` challenge header values.
         challenges: Vec<String>,
-        /// A DPoP nonce to set in the `DPoP-Nonce` response header, if any.
+        /// A `DPoP` nonce to set in the `DPoP-Nonce` response header, if any.
         dpop_nonce: Option<String>,
     },
 }

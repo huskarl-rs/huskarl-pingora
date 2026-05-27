@@ -88,7 +88,7 @@ pub(crate) async fn write_challenge_response(
     challenges: &[String],
     dpop_nonce: Option<&str>,
 ) -> Result<(), Box<Error>> {
-    let capacity = challenges.len() + 2 + dpop_nonce.is_some() as usize;
+    let capacity = challenges.len() + 2 + usize::from(dpop_nonce.is_some());
     let mut resp = build_response(status.as_u16(), capacity)?;
 
     for challenge in challenges {

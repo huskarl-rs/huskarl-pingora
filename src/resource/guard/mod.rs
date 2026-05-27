@@ -103,13 +103,24 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> std::fmt::Debug for Gua
 
 #[bon]
 impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
+    /// Builds a new [`Guard`] with the given validator and per-path rules.
+    ///
+    /// Use [`Guard::builder`] (the generated builder) to set routes and
+    /// configuration; this constructor is the builder's terminal `build`
+    /// step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if any route pattern is rejected by
+    /// [`matchit`] or if a public rule is configured with audience or scope
+    /// constraints (which can never be enforced).
     #[builder]
     pub fn new(
         #[builder(field)] routes: Vec<(String, Rule<V::Claims>)>,
         validator: V,
         /// the resource identifier for the validator metadata.
         resource: Option<http::Uri>,
-        /// Path prefix to strip from the request path before prepending the resource path during DPoP URI reconstruction.
+        /// Path prefix to strip from the request path before prepending the resource path during `DPoP` URI reconstruction.
         ///
         /// This is useful when a front proxy adds a path prefix that isn't part of the client-facing URI.
         #[builder(into)]
@@ -135,7 +146,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             return Err(ConfigError::PublicRuleWithConstraints("<default>".into()));
         }
 
-        let resource_str = resource.as_ref().map(|u| u.to_string());
+        let resource_str = resource.as_ref().map(ToString::to_string);
         let metadata = validator.validator_metadata(resource_str.as_deref());
 
         // Collect unique scopes from all route rules and the default rule.
@@ -146,15 +157,15 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         all_scopes.extend(default.scopes.iter().cloned());
         let scopes_supported: Vec<String> = all_scopes.into_iter().collect();
 
-        let mut router = Router::new();
+        let mut rule_router = Router::new();
         for (pattern, rule) in routes {
-            router.insert(&pattern, rule)?;
+            rule_router.insert(&pattern, rule)?;
         }
 
         Ok(Self {
             validator,
             metadata,
-            router,
+            router: rule_router,
             default,
             scopes_supported,
             base_uri: resource,
@@ -249,11 +260,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     {
         let path = uri.path();
 
-        let rule = self
-            .router
-            .at(path)
-            .map(|m| m.value)
-            .unwrap_or(&self.default);
+        let rule = self.router.at(path).map_or(&self.default, |m| m.value);
 
         let scope_param = rule.scope_param.as_deref();
 

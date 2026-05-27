@@ -395,12 +395,13 @@ async fn strip_credentials_propagated() {
         vec![("/api", Rule::required().strip_credentials(false))],
     );
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    match outcome {
+    assert!(matches!(
+        outcome,
         Outcome::Forward {
-            strip_credentials, ..
-        } => assert!(!strip_credentials),
-        other => panic!("expected Forward, got {other:?}"),
-    }
+            strip_credentials: false,
+            ..
+        }
+    ));
 }
 
 // --- request_uri reconstruction ---

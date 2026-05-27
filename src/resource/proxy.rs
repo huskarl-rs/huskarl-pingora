@@ -72,7 +72,7 @@ where
                 "resource_metadata",
                 &self.resource_metadata.as_ref().map(|(path, _)| path),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -92,7 +92,7 @@ where
     /// Enables or disables the RFC 9728 protected resource metadata endpoint.
     ///
     /// When enabled, the proxy serves a JSON document describing the resource
-    /// server's OAuth 2.0 capabilities (authorization servers, scopes, DPoP
+    /// server's OAuth 2.0 capabilities (authorization servers, scopes, `DPoP`
     /// config, etc.) at the well-known path derived from the resource identifier.
     ///
     /// Per RFC 9728 §3.1, the well-known segment is inserted between the host
@@ -101,6 +101,11 @@ where
     /// `/.well-known/oauth-protected-resource/tenant1`.
     ///
     /// Disabled by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`](crate::resource::error::ConfigError) if the
+    /// metadata document cannot be serialized.
     pub fn resource_metadata(
         mut self,
         enabled: bool,

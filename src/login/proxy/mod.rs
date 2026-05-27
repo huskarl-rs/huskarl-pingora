@@ -1,62 +1,52 @@
 //! [`ProxyHttp`](pingora_proxy::ProxyHttp) decorator for the login flow.
 //!
-//! [`LoginProxy`] wraps an inner proxy and intercepts `request_filter` to
-//! manage the full Authorization Code Grant lifecycle: session loading,
-//! lifetime enforcement, token refresh, OAuth callback handling, and logout.
-//! Session mutations are automatically persisted in `upstream_response_filter`.
+//! [`LoginProxy`] wraps an inner proxy and runs each request through the
+//! shared [`LoginEngine`]: `/callback` and `/logout` are handled internally,
+//! the session is loaded (and refreshed if needed) for paths that need it,
+//! and persistence happens in `upstream_response_filter`.
+//!
+//! Per-path policy is configured via a routing DSL that mirrors the resource
+//! side's [`Guard`](crate::resource::Guard): `.route(pattern, LoginRule::…)`
+//! registers a [`LoginRule`] for paths matching a [`matchit`] pattern.
 
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
 
-use http::{Method, header};
-use huskarl::{
-    core::{
-        crypto::cipher::{AeadV1Sealer, AeadV1Unsealer, BoxedAeadCipher},
-        http::HttpClient,
-    },
-    grant::authorization_code::PendingState,
+use http::HeaderValue;
+use huskarl::core::http::HttpClient;
+use huskarl_login::{
+    LoginGrant, SessionDriver,
+    engine::{LoginEngine, LoginResponse, SessionPersistence, error_chain, is_cors_preflight},
 };
+use matchit::{InsertError, Router};
 use pingora_error::{Error, ErrorType::InternalError, Result};
+use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_proxy_delegate::proxy_http_delegate;
-use serde::{Deserialize, Serialize};
 
 use super::{
-    config::LoginConfig,
     ctx::HasLoginSession,
-    error_page::{DefaultErrorPage, ErrorPage},
-    grant::LoginGrant,
-    session::SessionDriver,
-    token_session::TokenSession,
+    rule::{CheckError, LoginRule, SessionRequirement},
 };
 
-mod handlers;
 #[cfg(test)]
 mod tests;
-
-// ── Cookie payload types ──────────────────────────────────────────────────────
-
-/// Encrypted payload stored in the per-flow login-state cookie.
-///
-/// The flow's `state` value is used as AEAD associated data, binding the cookie
-/// to the specific authorization request.
-#[derive(Serialize, Deserialize)]
-struct LoginStateCookie {
-    original_url: String,
-    pending_state: PendingState,
-}
 
 // ── LoginProxy ────────────────────────────────────────────────────────────────
 
 /// A [`ProxyHttp`] decorator implementing OAuth 2.0 Authorization Code Grant login.
 ///
-/// - Unauthenticated requests are redirected to the authorization server via
-///   [`LoginGrant::start`]. A short-lived login-state cookie is set carrying the
-///   [`PendingState`] and the original URL, encrypted with the flow's `state`
-///   value as AEAD associated data.
-/// - The callback path is handled internally: the code is exchanged via
-///   [`LoginGrant::complete`], a session is created, the login-state cookie is
-///   cleared, and the user is redirected to their original URL.
-/// - Requests that present a valid session are forwarded to `P`.
+/// All OAuth-flow logic lives in the shared [`LoginEngine`]. This decorator
+/// adapts it to pingora's `ProxyHttp` lifecycle and applies a per-route
+/// [`LoginRule`]:
+///
+/// - `request_filter` runs the engine's route handlers (callback/logout),
+///   looks up the [`LoginRule`] for the request path, loads the session if
+///   the rule requires it, and either gates the request (rule = `required`)
+///   or forwards it to the inner proxy with the loaded session in the
+///   context (rules `required` or `optional`). Paths matched by a `public`
+///   rule skip session loading entirely.
+/// - `upstream_response_filter` persists or deletes the session via the
+///   engine, appending the resulting `Set-Cookie` headers to the response.
 ///
 /// # Type parameters
 ///
@@ -65,83 +55,204 @@ struct LoginStateCookie {
 /// - `SD` — session driver ([`CookieSessionStore`](super::CookieSessionStore) or
 ///   [`StoreBackedSessionStore`](super::StoreBackedSessionStore))
 /// - `H` — [`HttpClient`] for token endpoint and optional PAR requests
+///
+/// # Example
+///
+/// ```ignore
+/// let engine = Arc::new(
+///     LoginEngine::builder()
+///         .config(login_config)
+///         .grant(grant)
+///         .session_store(store)
+///         .cipher(cipher)
+///         .http_client(client)
+///         .build(),
+/// );
+///
+/// let proxy = LoginProxy::builder()
+///     .inner(my_upstream)
+///     .engine(engine)
+///     // Defaults to `LoginRule::required()` for paths that don't match.
+///     .route("/health", LoginRule::public())
+///     .route("/", LoginRule::optional())
+///     .route("/dashboard/{*rest}", LoginRule::required())
+///     .build()
+///     .expect("valid routes");
+/// ```
 pub struct LoginProxy<P, G, SD, H>
 where
     P: ProxyHttp + Send + Sync,
-    P::CTX: HasLoginSession<SD::Session> + Send + Sync,
+    P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
     G: LoginGrant + Send + Sync,
     SD: SessionDriver + Send + Sync,
-    SD::Session: TokenSession,
     H: HttpClient + Send + Sync,
 {
     inner: P,
-    config: LoginConfig,
-    grant: G,
-    session_store: SD,
-    sealer: AeadV1Sealer<BoxedAeadCipher>,
-    unsealer: AeadV1Unsealer<BoxedAeadCipher>,
-    http_client: H,
-    error_page: Box<dyn ErrorPage>,
+    engine: Arc<LoginEngine<G, SD, H>>,
+    router: Router<LoginRule<SD::SessionType>>,
+    default: LoginRule<SD::SessionType>,
 }
 
 #[bon::bon]
 impl<P, G, SD, H> LoginProxy<P, G, SD, H>
 where
     P: ProxyHttp + Send + Sync,
-    P::CTX: HasLoginSession<SD::Session> + Send + Sync,
+    P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
     G: LoginGrant + Send + Sync,
     SD: SessionDriver + Send + Sync,
-    SD::Session: TokenSession,
     H: HttpClient + Send + Sync,
 {
-    /// Creates a new `LoginProxy`.
+    /// Creates a new `LoginProxy` from a pre-built [`LoginEngine`].
     ///
-    /// The `cipher` is used only for the short-lived login-state cookie (CSRF
-    /// protection during the OAuth flow). Session persistence is handled
-    /// entirely by the session store.
+    /// Use [`LoginEngine::builder`] to construct the engine, then wrap it in
+    /// an [`Arc`] so it can be shared between this proxy and any other
+    /// consumer that needs engine primitives (for example, an inner-proxy
+    /// handler that calls [`LoginEngine::redirect_to_login`] directly).
+    ///
+    /// Route patterns use [`matchit`] syntax. Paths that match no registered
+    /// route fall back to `default` (defaults to [`LoginRule::required`]).
     #[builder]
     pub fn new(
+        /// Per-route session policy. Patterns use [`matchit`] syntax.
+        #[builder(field)]
+        routes: Vec<(String, LoginRule<SD::SessionType>)>,
         inner: P,
-        config: LoginConfig,
-        grant: G,
-        session_store: SD,
-        cipher: BoxedAeadCipher,
-        http_client: H,
-        /// Custom error page renderer. Defaults to [`DefaultErrorPage`] which
-        /// renders minimal self-contained HTML.
-        #[builder(default = Box::new(DefaultErrorPage) as Box<dyn ErrorPage>)]
-        error_page: Box<dyn ErrorPage>,
-    ) -> Self {
-        Self {
+        engine: Arc<LoginEngine<G, SD, H>>,
+        /// Fallback rule for paths that don't match any registered route.
+        /// Defaults to [`LoginRule::required`] — i.e. everything is protected
+        /// unless explicitly opened up.
+        #[builder(default)]
+        default: LoginRule<SD::SessionType>,
+    ) -> Result<Self, RouteConfigError> {
+        let mut rule_router = Router::new();
+        for (pattern, rule) in routes {
+            rule_router
+                .insert(&pattern, rule)
+                .map_err(|err| RouteConfigError::Route { pattern, err })?;
+        }
+        Ok(Self {
             inner,
-            config,
-            grant,
-            session_store,
-            sealer: AeadV1Sealer::new(cipher.clone()),
-            unsealer: AeadV1Unsealer::new(cipher),
-            http_client,
-            error_page,
+            engine,
+            router: rule_router,
+            default,
+        })
+    }
+}
+
+// Custom builder method for the routes collection.
+impl<P, G, SD, H, S: login_proxy_builder::State> LoginProxyBuilder<P, G, SD, H, S>
+where
+    P: ProxyHttp + Send + Sync,
+    P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
+    G: LoginGrant + Send + Sync,
+    SD: SessionDriver + Send + Sync,
+    H: HttpClient + Send + Sync,
+{
+    /// Adds a route pattern with an associated [`LoginRule`].
+    ///
+    /// Patterns use [`matchit`] syntax (e.g. `/users/{id}`, `/static/{*rest}`).
+    pub fn route(mut self, pattern: impl Into<String>, rule: LoginRule<SD::SessionType>) -> Self {
+        self.routes.push((pattern.into(), rule));
+        self
+    }
+}
+
+impl<P, G, SD, H> LoginProxy<P, G, SD, H>
+where
+    P: ProxyHttp + Send + Sync,
+    P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
+    G: LoginGrant + Send + Sync,
+    SD: SessionDriver + Send + Sync,
+    H: HttpClient + Send + Sync,
+{
+    /// Returns a handle to the underlying [`LoginEngine`].
+    ///
+    /// Exposed so an inner proxy can drive engine primitives directly — for
+    /// example, calling [`LoginEngine::redirect_to_login`] from a handler
+    /// that wants to force re-authentication outside the normal routing
+    /// policy.
+    pub fn engine(&self) -> &Arc<LoginEngine<G, SD, H>> {
+        &self.engine
+    }
+
+    /// Looks up the rule for `path`, falling back to the configured default.
+    fn rule_for(&self, path: &str) -> &LoginRule<SD::SessionType> {
+        self.router.at(path).map_or(&self.default, |m| m.value)
+    }
+}
+
+/// Errors that can occur when building a [`LoginProxy`]'s route table.
+///
+/// Distinct from [`huskarl_login::ConfigError`], which covers session driver
+/// and [`LoginConfig`] validation.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RouteConfigError {
+    /// A route pattern was rejected by [`matchit`].
+    Route {
+        /// The offending pattern.
+        pattern: String,
+        /// The error returned by [`matchit::Router::insert`].
+        err: InsertError,
+    },
+}
+
+impl std::fmt::Display for RouteConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Route { pattern, err } => {
+                write!(f, "invalid route pattern {pattern:?}: {err}")
+            }
         }
     }
 }
 
-// ── Navigation detection ─────────────────────────────────────────────────────
-
-/// Returns `true` if this looks like a top-level browser navigation (as
-/// opposed to a fetch/XHR, image load, script, etc.).
-///
-/// Uses the `Sec-Fetch-Mode` header when present (all modern browsers send
-/// it). Falls back to checking the `Accept` header for `text/html`.
-pub(super) fn is_navigation_request(session: &Session) -> bool {
-    let headers = &session.req_header().headers;
-    if let Some(mode) = headers.get("sec-fetch-mode") {
-        return mode.as_bytes() == b"navigate";
+impl std::error::Error for RouteConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Route { err, .. } => Some(err),
+        }
     }
-    // Fallback for older clients: HTML in Accept usually means a page load.
-    headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("text/html"))
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Writes a framework-neutral [`LoginResponse`] back to a pingora session,
+/// appending any extra `Set-Cookie` headers.
+async fn write_login_response(
+    session: &mut Session,
+    resp: LoginResponse,
+    extra_cookies: Vec<HeaderValue>,
+) -> Result<()> {
+    let header_count = resp.headers.len() + extra_cookies.len();
+    let mut header = ResponseHeader::build(resp.status, Some(header_count))
+        .map_err(|e| Error::explain(InternalError, format!("failed to build response: {e}")))?;
+    for (name, value) in resp.headers {
+        header
+            .append_header(name, value)
+            .map_err(|e| Error::explain(InternalError, format!("response header: {e}")))?;
+    }
+    for cookie in extra_cookies {
+        header
+            .append_header(http::header::SET_COOKIE, cookie)
+            .map_err(|e| Error::explain(InternalError, format!("set-cookie: {e}")))?;
+    }
+    let has_body = !resp.body.is_empty();
+    session
+        .write_response_header(Box::new(header), !has_body)
+        .await?;
+    if has_body {
+        session.write_response_body(Some(resp.body), true).await?;
+    }
+    Ok(())
+}
+
+fn append_set_cookies(resp: &mut ResponseHeader, cookies: Vec<HeaderValue>) -> Result<()> {
+    for c in cookies {
+        resp.append_header(http::header::SET_COOKIE, c)
+            .map_err(|e| Error::explain(InternalError, format!("set-cookie: {e}")))?;
+    }
+    Ok(())
 }
 
 // ── ProxyHttp implementation ──────────────────────────────────────────────────
@@ -150,166 +261,139 @@ pub(super) fn is_navigation_request(session: &Session) -> bool {
 impl<P, G, SD, H> ProxyHttp for LoginProxy<P, G, SD, H>
 where
     P: ProxyHttp + Send + Sync,
-    P::CTX: HasLoginSession<SD::Session> + Send + Sync,
+    P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
     G: LoginGrant + Send + Sync,
     SD: SessionDriver + Send + Sync,
-    SD::Session: TokenSession,
     H: HttpClient + Send + Sync,
 {
     type CTX = P::CTX;
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        if session.req_header().uri.path() == self.config.callback_path {
-            return self.handle_callback(session).await;
-        }
-        if self
-            .config
-            .logout_path
-            .as_deref()
-            .is_some_and(|p| session.req_header().uri.path() == p)
-        {
-            return self.handle_logout(session).await;
-        }
-        // Let CORS preflight requests pass through to the inner proxy
-        // unauthenticated — browsers strip credentials from preflights, so
-        // they will never carry a session cookie.
-        if session.req_header().method == Method::OPTIONS
-            && session
-                .req_header()
-                .headers
-                .contains_key("access-control-request-method")
-        {
+        let req = session.req_header();
+
+        // CORS preflight: browsers strip credentials, so a session cookie
+        // would never reach us. Let the inner proxy handle these directly.
+        if is_cors_preflight(&req.method, &req.headers) {
             return self.inner.request_filter(session, ctx).await;
         }
-        match self.session_store.load(&session.req_header().headers).await {
-            Ok(Some(mut loaded)) => {
-                let now = SystemTime::now();
 
-                // ── Max lifetime check ───────────────────────────────
-                if let Some(max_lifetime) = self.config.max_lifetime
-                    && now
-                        .duration_since(loaded.created_at())
-                        .unwrap_or(Duration::ZERO)
-                        > max_lifetime
-                {
-                    return self.expire_session(session, Some(&loaded)).await;
-                }
+        let uri = req.uri.clone();
+        let method = req.method.clone();
+        let headers = req.headers.clone();
 
-                // ── Idle timeout check ───────────────────────────────
-                if let Some(idle_timeout) = self.config.idle_timeout
-                    && now
-                        .duration_since(loaded.last_active())
-                        .unwrap_or(Duration::ZERO)
-                        > idle_timeout
-                {
-                    return self.expire_session(session, Some(&loaded)).await;
-                }
+        // The engine handles its configured callback / logout paths fully —
+        // they take precedence over any user-registered route.
+        if let Some(resp) = self
+            .engine
+            .try_handle_login_route(uri.path(), &method, &headers, &uri)
+            .await
+        {
+            write_login_response(session, resp, vec![]).await?;
+            return Ok(true);
+        }
 
-                // ── Token expiry check ───────────────────────────────
-                let token_expired = loaded
-                    .token_expiry()
-                    .is_some_and(|exp| now + self.config.token_refresh_margin >= exp);
+        let rule = self.rule_for(uri.path());
 
-                if token_expired {
-                    let refresh_token = loaded.refresh_token().cloned();
-
-                    if let Some(rt) = refresh_token {
-                        match self.grant.refresh(&self.http_client, &rt).await {
-                            Ok(token_response) => {
-                                loaded.apply_refresh(&token_response);
-                                ctx.set_login_session(Some(loaded));
-                                // Mark dirty so upstream_response_filter persists
-                                // the refreshed session.
-                                let _ = ctx.login_session_mut();
-                            }
-                            Err(e) => {
-                                log::error!("token refresh failed: {e}");
-                                return self.expire_session(session, Some(&loaded)).await;
-                            }
-                        }
-                    } else {
-                        return self.expire_session(session, Some(&loaded)).await;
-                    }
-                } else {
-                    loaded.record_activity();
-                    ctx.set_login_session(Some(loaded));
-                }
-
+        // Public routes bypass session handling entirely.
+        let required = match rule.requirement {
+            SessionRequirement::None => {
                 return self.inner.request_filter(session, ctx).await;
             }
-            Ok(None) => {} // fall through to redirect/401
+            SessionRequirement::Required => true,
+            SessionRequirement::Optional => false,
+        };
+
+        let loaded = match self.engine.load_session(&headers).await {
+            Ok(l) => l,
             Err(e) => {
-                log::error!("failed to load session: {e}");
-                return self
-                    .error_response(
-                        session,
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to load session",
-                        None,
-                    )
-                    .await;
+                log::error!("failed to load session: {}", error_chain(&*e));
+                let resp = self.engine.render_error(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to load session",
+                );
+                write_login_response(session, resp, vec![]).await?;
+                return Ok(true);
             }
-        }
-        // Only start the OAuth flow for top-level navigations. Subresource
-        // requests (fetch, images, scripts, etc.) get a 401 so they fail
-        // cleanly instead of receiving an HTML redirect.
-        if is_navigation_request(session) {
-            if let Err(e) = self.redirect_to_as(session, None).await {
-                log::error!("failed to redirect to authorization server: {e}");
-                return self
-                    .error_response(
-                        session,
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to start login",
-                        None,
-                    )
-                    .await;
+        };
+
+        let Some((sess, persistence)) = loaded.session else {
+            // No session. clear_cookies carries clears for stale cookies the
+            // engine decided to drop (expired, refresh failed).
+            if required {
+                let resp = self.engine.redirect_to_login(&headers, &uri).await;
+                write_login_response(session, resp, loaded.clear_cookies).await?;
+                return Ok(true);
             }
-        } else {
-            self.error_response(
-                session,
-                http::StatusCode::UNAUTHORIZED,
-                "authentication required",
-                None,
-            )
-            .await?;
+            let state = ctx.login_state_mut();
+            state.session = None;
+            state.persistence = SessionPersistence::Skip;
+            state.request_headers = headers;
+            state.clear_cookies = loaded.clear_cookies;
+            state.delete_requested = false;
+            return self.inner.request_filter(session, ctx).await;
+        };
+
+        if let Some(check) = rule.check.as_ref()
+            && let Err(err) = check(&sess)
+        {
+            let (status, msg) = match err {
+                CheckError::Forbidden(msg) => (http::StatusCode::FORBIDDEN, msg),
+            };
+            let resp = self.engine.render_error(status, &msg);
+            write_login_response(session, resp, loaded.clear_cookies).await?;
+            return Ok(true);
         }
-        Ok(true)
+
+        let state = ctx.login_state_mut();
+        state.session = Some(sess);
+        state.persistence = persistence;
+        state.request_headers = headers;
+        state.clear_cookies = loaded.clear_cookies;
+        state.delete_requested = false;
+
+        self.inner.request_filter(session, ctx).await
     }
 
     async fn upstream_response_filter(
         &self,
         session: &mut Session,
-        upstream_response: &mut pingora_http::ResponseHeader,
+        upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         self.inner
             .upstream_response_filter(session, upstream_response, ctx)
             .await?;
 
-        if ctx.is_delete_requested() {
-            if let Some(s) = ctx.login_session() {
-                self.session_store
-                    .delete(s, upstream_response)
-                    .await
-                    .map_err(|e| Error::because(InternalError, "failed to delete session", e))?;
-            }
-            ctx.set_login_session(None);
-        } else if ctx.is_session_dirty() {
-            if let Some(s) = ctx.login_session() {
-                self.session_store
-                    .save(s, upstream_response)
-                    .await
-                    .map_err(|e| Error::because(InternalError, "failed to save session", e))?;
-            }
-            ctx.clear_session_dirty();
-        } else if let Some(s) = ctx.login_session() {
-            self.session_store
-                .touch(s, upstream_response)
-                .await
-                .map_err(|e| Error::because(InternalError, "failed to touch session", e))?;
-        }
+        let state = ctx.login_state_mut();
+        let maybe_sess = state.session.take();
+        let request_headers = std::mem::take(&mut state.request_headers);
+        let clear_cookies = std::mem::take(&mut state.clear_cookies);
+        let persistence = std::mem::replace(&mut state.persistence, SessionPersistence::Skip);
+        let delete_requested = std::mem::replace(&mut state.delete_requested, false);
 
-        Ok(())
+        append_set_cookies(upstream_response, clear_cookies)?;
+
+        let Some(sess) = maybe_sess else {
+            return Ok(());
+        };
+
+        let result = if delete_requested {
+            self.engine.delete_session(&sess, &request_headers).await
+        } else {
+            self.engine
+                .persist_session(&sess, persistence, &request_headers)
+                .await
+        };
+
+        match result {
+            Ok(cookies) => append_set_cookies(upstream_response, cookies),
+            Err(e) => {
+                log::error!("failed to persist session: {}", error_chain(&*e));
+                Err(Error::explain(
+                    InternalError,
+                    format!("failed to persist session: {}", error_chain(&*e)),
+                ))
+            }
+        }
     }
 }

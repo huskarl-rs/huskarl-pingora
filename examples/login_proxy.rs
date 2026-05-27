@@ -40,7 +40,7 @@ use huskarl::{
 };
 use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 use huskarl_pingora::login::{
-    CookieSession, CookieSessionStore, LoginConfig, LoginCtx, LoginProxy,
+    CookieSession, CookieSessionStore, LoginConfig, LoginCtx, LoginEngine, LoginProxy, LoginRule,
 };
 use huskarl_reqwest::ReqwestClient;
 use huskarl_resource_server::core::client_auth::NoAuth;
@@ -227,14 +227,28 @@ fn main() {
             tls: upstream_tls,
         };
 
+        let engine = Arc::new(
+            LoginEngine::builder()
+                .config(login_config)
+                .grant(grant)
+                .session_store(session_store)
+                .cipher(cipher)
+                .http_client(http_client)
+                .build(),
+        );
+
         LoginProxy::builder()
             .inner(inner)
-            .config(login_config)
-            .grant(grant)
-            .session_store(session_store)
-            .cipher(cipher)
-            .http_client(http_client)
+            .engine(engine)
+            // Liveness probe — skip session handling entirely.
+            .route("/health", LoginRule::public())
+            // Landing page — render publicly but personalize if the user is
+            // already signed in.
+            .route("/", LoginRule::optional())
+            // Everything else falls through to the default (`required`),
+            // redirecting unauthenticated browsers through the auth-code flow.
             .build()
+            .expect("valid LoginProxy configuration")
     });
     drop(rt);
 

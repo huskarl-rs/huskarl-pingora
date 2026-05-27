@@ -1,11 +1,11 @@
-//! URI reconstruction for DPoP proof validation.
+//! URI reconstruction for `DPoP` proof validation.
 //!
 //! When a `base_uri` (resource identifier) is configured on the
 //! [`Guard`](super::Guard), the request path is rewritten to the client-facing
-//! URI so that DPoP `htu` (HTTP URI) binding works correctly behind a reverse
+//! URI so that `DPoP` `htu` (HTTP URI) binding works correctly behind a reverse
 //! proxy.
 
-/// Reconstructs the client-facing URI for DPoP `htu` matching.
+/// Reconstructs the client-facing URI for `DPoP` `htu` matching.
 ///
 /// Combines the scheme and authority from `base_uri` with its path
 /// prepended to the request path (after stripping `strip_prefix`).
@@ -25,11 +25,7 @@ pub(crate) fn request_uri(
     let stripped = match strip_prefix {
         Some(prefix) => {
             let Some(stripped) = req_path.strip_prefix(prefix) else {
-                log::warn!(
-                    "strip_prefix {:?} did not match request path {:?}",
-                    prefix,
-                    req_path,
-                );
+                log::warn!("strip_prefix {prefix:?} did not match request path {req_path:?}");
                 return None;
             };
             stripped
@@ -55,19 +51,14 @@ pub(crate) fn request_uri(
     parts.path_and_query = match path_and_query.parse() {
         Ok(pq) => Some(pq),
         Err(e) => {
-            log::warn!(
-                "failed to parse reconstructed path_and_query {:?}: {e}",
-                path_and_query,
-            );
+            log::warn!("failed to parse reconstructed path_and_query {path_and_query:?}: {e}");
             return None;
         }
     };
     http::Uri::from_parts(parts)
         .map_err(|e| {
             log::warn!(
-                "failed to reconstruct DPoP URI from base {:?} and path {:?}: {e}",
-                base,
-                path_and_query,
+                "failed to reconstruct DPoP URI from base {base:?} and path {path_and_query:?}: {e}"
             );
             e
         })
