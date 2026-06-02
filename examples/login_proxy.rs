@@ -199,12 +199,12 @@ fn main() {
         let key_bytes = load_or_generate_key_bytes();
         let cipher = BoxedAeadCipher::new(aes_key_from_bytes(key_bytes).await);
 
-        let session_store = CookieSessionStore::new(
-            cipher.clone(),
-            "huskarl_session",
-            parsed_redirect.scheme() == "https",
-            "/",
-        );
+        let session_store = CookieSessionStore::builder()
+            .cipher(cipher.clone())
+            .cookie_name("huskarl_session")
+            .secure(parsed_redirect.scheme() == "https")
+            .cookie_path("/")
+            .build();
 
         let login_config = LoginConfig::builder()
             .callback_path(parsed_redirect.path().to_owned())
