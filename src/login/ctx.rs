@@ -6,7 +6,6 @@
 //! [`LoginCtx`], a convenience wrapper that implements it automatically.
 
 use http::{HeaderMap, HeaderValue};
-use huskarl_login::engine::SessionPersistence;
 
 /// State held on the proxy context across the request lifecycle.
 ///
@@ -14,37 +13,37 @@ use huskarl_login::engine::SessionPersistence;
 /// reads it in `upstream_response_filter` to persist or delete the session
 /// after the inner proxy responds.
 ///
-/// User code mostly interacts with `LoginState` via [`HasLoginSession`]'s
-/// convenience methods (`login_session`, `request_session_delete`). The
-/// `session` and `delete_requested` fields are public for direct access; the
+/// User code reads `session` and sets `delete_requested` directly; the
 /// remaining fields are proxy-managed bookkeeping.
 #[non_exhaustive]
 pub struct LoginState<S> {
     /// The loaded session, if one was present and valid.
     pub session: Option<S>,
-    /// Set by the inner proxy via [`HasLoginSession::request_session_delete`]
-    /// when it wants the session destroyed on this response (e.g. an
-    /// inner-proxy-managed account-deletion endpoint).
+    /// Set to `true` by the inner proxy when it wants the session destroyed on
+    /// this response (e.g. an inner-proxy-managed account-deletion endpoint).
     pub delete_requested: bool,
-    /// How the engine wants the session persisted after the inner proxy responds.
-    pub(crate) persistence: SessionPersistence,
+    /// `true` when a post-response save is owed to the store: a token refresh
+    /// succeeded but the engine's eager save failed, so the re-sealed session
+    /// must be persisted after the inner proxy responds. `false` when the loaded
+    /// session was already fully persisted.
+    pub(crate) pending_save: bool,
     /// The request headers captured at load time. Cookie-backed stores need the
     /// original `Cookie` header to know which chunked slots the browser has so
     /// they can `Max-Age=0` the leftover ones.
     pub(crate) request_headers: HeaderMap,
-    /// `Set-Cookie` headers the engine produced during load (typically clears
-    /// for an expired or refresh-failed session). Always empty when a session
-    /// successfully loaded.
-    pub(crate) clear_cookies: Vec<HeaderValue>,
+    /// `Set-Cookie` headers the engine produced during load: clears for an
+    /// expired or refresh-failed session, or the re-sealed session cookies
+    /// when a token refresh was persisted eagerly.
+    pub(crate) set_cookies: Vec<HeaderValue>,
 }
 
 impl<S> Default for LoginState<S> {
     fn default() -> Self {
         Self {
             session: None,
-            persistence: SessionPersistence::Skip,
+            pending_save: false,
             request_headers: HeaderMap::new(),
-            clear_cookies: Vec::new(),
+            set_cookies: Vec::new(),
             delete_requested: false,
         }
     }
@@ -57,6 +56,12 @@ impl<S> Default for LoginState<S> {
 /// original request headers it needs to persist or delete the session after
 /// the inner proxy responds.
 ///
+/// Inner-proxy code reaches the session and the delete flag through
+/// [`login_state`](Self::login_state) / [`login_state_mut`](Self::login_state_mut):
+/// read `login_state().session`, and set `login_state_mut().delete_requested = true`
+/// to tear the session down on this response (e.g. a "delete my account"
+/// endpoint).
+///
 /// See [`LoginCtx`] for a convenience wrapper that implements this trait
 /// automatically.
 pub trait HasLoginSession<S> {
@@ -64,18 +69,6 @@ pub trait HasLoginSession<S> {
     fn login_state(&self) -> &LoginState<S>;
     /// Mutable access to the [`LoginState`] container.
     fn login_state_mut(&mut self) -> &mut LoginState<S>;
-
-    /// Convenience accessor: the loaded session, if any.
-    fn login_session(&self) -> Option<&S> {
-        self.login_state().session.as_ref()
-    }
-
-    /// Signals that the session should be deleted on the response. Use this in
-    /// an inner-proxy handler (e.g. a "delete my account" endpoint) to tear
-    /// down the session as part of normal response processing.
-    fn request_session_delete(&mut self) {
-        self.login_state_mut().delete_requested = true;
-    }
 }
 
 /// Convenience context wrapper that bundles login state with an inner user
@@ -112,7 +105,7 @@ impl<T: std::fmt::Debug, S> std::fmt::Debug for LoginCtx<T, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginCtx")
             .field("session_loaded", &self.state.session.is_some())
-            .field("persistence", &self.state.persistence)
+            .field("pending_save", &self.state.pending_save)
             .field("delete_requested", &self.state.delete_requested)
             .field("inner", &self.inner)
             .finish()
@@ -136,7 +129,7 @@ mod tests {
     #[test]
     fn login_ctx_new_defaults() {
         let ctx = LoginCtx::<(), String>::new(());
-        assert!(ctx.login_session().is_none());
+        assert!(ctx.login_state().session.is_none());
         assert!(!ctx.login_state().delete_requested);
         assert_eq!(ctx.inner, ());
     }
@@ -144,7 +137,7 @@ mod tests {
     #[test]
     fn login_ctx_default_defaults() {
         let ctx = LoginCtx::<(), String>::default();
-        assert!(ctx.login_session().is_none());
+        assert!(ctx.login_state().session.is_none());
         assert!(!ctx.login_state().delete_requested);
     }
 
@@ -152,13 +145,16 @@ mod tests {
     fn set_session_and_read() {
         let mut ctx = LoginCtx::<(), String>::new(());
         ctx.login_state_mut().session = Some("session-data".into());
-        assert_eq!(ctx.login_session(), Some(&"session-data".to_owned()));
+        assert_eq!(
+            ctx.login_state().session.as_ref(),
+            Some(&"session-data".to_owned())
+        );
     }
 
     #[test]
-    fn request_session_delete_sets_flag() {
+    fn delete_requested_flag() {
         let mut ctx = LoginCtx::<(), String>::new(());
-        ctx.request_session_delete();
+        ctx.login_state_mut().delete_requested = true;
         assert!(ctx.login_state().delete_requested);
     }
 

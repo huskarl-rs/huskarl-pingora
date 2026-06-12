@@ -1489,7 +1489,9 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "huskarl"
-version = "0.8.0-pre.0"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c1d157298c64a1b7b98f7ce898eea94583689ab239c7a7b1e562caad61c8b0f"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1516,7 +1518,9 @@ dependencies = [
 
 [[package]]
 name = "huskarl-core"
-version = "0.7.0-pre.0"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4e3f175f879c49b19281bd6e1ca994ef65d0faa47da39bb6b6c2a816fa34429"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1534,6 +1538,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snafu",
+ "strum 0.27.2",
  "tokio",
  "url",
  "web-time",
@@ -1542,7 +1547,9 @@ dependencies = [
 
 [[package]]
 name = "huskarl-crypto-native"
-version = "0.8.0-pre.0"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45c6968d647f24693c0bab485a8ad8575c29181333cf3352b573f8326540cab0"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
@@ -1557,12 +1564,15 @@ dependencies = [
  "sha2",
  "signature",
  "snafu",
+ "strum 0.27.2",
  "subtle",
 ]
 
 [[package]]
 name = "huskarl-crypto-webcrypto"
-version = "0.8.0-pre.0"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f3784b21c695c99ef8951ce87c1ed1b35ab797ec6d07b5faaa3372237250e0b"
 dependencies = [
  "huskarl-core",
  "serde",
@@ -1577,7 +1587,9 @@ dependencies = [
 
 [[package]]
 name = "huskarl-login"
-version = "0.2.2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa2067855febdade6dedd84b47980203ea66b01c4901a461b453dcece86b971"
 dependencies = [
  "base64",
  "bon",
@@ -1590,12 +1602,16 @@ dependencies = [
  "serde",
  "serde_html_form",
  "serde_json",
+ "snafu",
+ "strum 0.27.2",
  "uuid",
 ]
 
 [[package]]
 name = "huskarl-macros"
-version = "0.2.0"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b261d20d18607e08320ccd64934ea2a8c7ef595f5a3ebc4b73c838025d8e3d9"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -1605,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "huskarl-pingora"
-version = "0.6.0-pre.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bon",
@@ -1630,11 +1646,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]
 name = "huskarl-reqwest"
-version = "0.7.0-pre.0"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98596e5627d6d0c92c2117570834b7e22d1f3edd0b213b8151aff1689948341a"
 dependencies = [
  "bon",
  "bytes",
@@ -1645,7 +1664,9 @@ dependencies = [
 
 [[package]]
 name = "huskarl-resource-server"
-version = "0.8.0-pre.0"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "583bf2ae518ca436dd702e5783e729d90f883034cca4655c017a2067fe63db15"
 dependencies = [
  "base64",
  "bon",
@@ -1661,6 +1682,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snafu",
+ "strum 0.27.2",
  "tokio",
  "web-time",
 ]
@@ -2393,7 +2415,7 @@ dependencies = [
  "rmp",
  "rmp-serde",
  "serde",
- "strum",
+ "strum 0.26.3",
  "tokio",
 ]
 
@@ -2440,8 +2462,8 @@ dependencies = [
  "serde_yaml",
  "sfv",
  "socket2",
- "strum",
- "strum_macros",
+ "strum 0.26.3",
+ "strum_macros 0.26.4",
  "tokio",
  "tokio-stream",
  "tokio-test",
@@ -3535,7 +3557,16 @@ version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
 dependencies = [
- "strum_macros",
+ "strum_macros 0.26.4",
+]
+
+[[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros 0.27.2",
 ]
 
 [[package]]
@@ -3548,6 +3579,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
  "syn 2.0.117",
 ]
 

@@ -37,9 +37,10 @@ use huskarl::{
     },
     grant::authorization_code::AuthorizationCodeGrant,
 };
-use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
+use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_pingora::login::{
     CookieSession, CookieSessionStore, LoginConfig, LoginCtx, LoginEngine, LoginProxy, LoginRule,
+    LogoutConfig,
 };
 use huskarl_reqwest::ReqwestClient;
 use huskarl_resource_server::core::client_auth::NoAuth;
@@ -141,13 +142,9 @@ fn load_or_generate_key_bytes() -> Vec<u8> {
 }
 
 async fn aes_key_from_bytes(bytes: Vec<u8>) -> AesGcmKey {
-    AesGcmKey::from_secret(
-        AesGcmKeyType::Aes256,
-        StaticBytesSecret(SecretBytes::new(bytes)),
-        |_| None,
-    )
-    .await
-    .expect("failed to load AES-256 key (expected 32 bytes)")
+    AesGcmKey::from_secret(StaticBytesSecret(SecretBytes::new(bytes)), |_| None)
+        .await
+        .expect("failed to load AES-256 key (expected 32 bytes)")
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -203,18 +200,21 @@ fn main() {
 
         let session_store = CookieSessionStore::builder()
             .cipher(cipher.clone())
-            .cookie_name("huskarl_session")
-            .secure(parsed_redirect.scheme() == "https")
-            .cookie_path("/")
+            .cookie_name("huskarl_session".parse().unwrap())
+            .cookie_path("/".parse().unwrap())
             .build();
 
         let login_config = LoginConfig::builder()
             .callback_path(parsed_redirect.path().to_owned())
             .scopes(vec!["openid".to_owned()])
-            .secure(parsed_redirect.scheme() == "https")
             .base_url(base_url.parse().expect("valid base URL"))
-            .logout_path("/logout")
-            .maybe_end_session_endpoint(metadata.end_session_endpoint.map(|e| e.into_uri()))
+            .logout(
+                LogoutConfig::builder()
+                    .path("/logout")
+                    .maybe_end_session_endpoint(metadata.end_session_endpoint)
+                    .build()
+                    .expect("failed to build logout config"),
+            )
             .build()
             .expect("failed to build login config");
 
