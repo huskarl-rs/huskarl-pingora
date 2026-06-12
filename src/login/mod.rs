@@ -32,10 +32,10 @@ pub use huskarl::token::IdToken;
 /// Re-export of [`huskarl::token::RefreshToken`] for use in custom session types.
 pub use huskarl::token::RefreshToken;
 pub use huskarl_login::{
-    CompletedLogin, ConfigError, CookieData, CookieSession, CookieSessionStore, DefaultErrorPage,
+    CompletedLogin, ConfigError, CookieSession, CookieSessionStore, DefaultErrorPage,
     DefaultPersistFailurePolicy, ErrorPage, ErrorPageResponse, ExternalSessionStore, LoginConfig,
-    LoginGrant, PersistFailurePolicy, PersistedSession, PersistedSessionState, Session,
-    SessionDriver, SessionError, SessionState, StoreBackedSessionStore,
+    PersistFailurePolicy, PersistedSession, PersistedSessionState, Session, SessionDriver,
+    SessionError, SessionState, StoreBackedSessionStore,
     engine::{LoadedSession, LoginEngine, LoginResponse, SessionPersistence},
 };
 pub use proxy::{LoginProxy, RouteConfigError};

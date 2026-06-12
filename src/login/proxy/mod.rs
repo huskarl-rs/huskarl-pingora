@@ -12,9 +12,8 @@
 use std::sync::Arc;
 
 use http::HeaderValue;
-use huskarl::core::http::HttpClient;
 use huskarl_login::{
-    LoginGrant, SessionDriver,
+    SessionDriver,
     engine::{LoginEngine, LoginResponse, SessionPersistence, error_chain, is_cors_preflight},
 };
 use matchit::{InsertError, Router};
@@ -79,28 +78,24 @@ mod tests;
 ///     .build()
 ///     .expect("valid routes");
 /// ```
-pub struct LoginProxy<P, G, SD, H>
+pub struct LoginProxy<P, SD>
 where
     P: ProxyHttp + Send + Sync,
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
-    G: LoginGrant + Send + Sync,
     SD: SessionDriver + Send + Sync,
-    H: HttpClient + Send + Sync,
 {
     inner: P,
-    engine: Arc<LoginEngine<G, SD, H>>,
+    engine: Arc<LoginEngine<SD>>,
     router: Router<LoginRule<SD::SessionType>>,
     default: LoginRule<SD::SessionType>,
 }
 
 #[bon::bon]
-impl<P, G, SD, H> LoginProxy<P, G, SD, H>
+impl<P, SD> LoginProxy<P, SD>
 where
     P: ProxyHttp + Send + Sync,
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
-    G: LoginGrant + Send + Sync,
     SD: SessionDriver + Send + Sync,
-    H: HttpClient + Send + Sync,
 {
     /// Creates a new `LoginProxy` from a pre-built [`LoginEngine`].
     ///
@@ -117,7 +112,7 @@ where
         #[builder(field)]
         routes: Vec<(String, LoginRule<SD::SessionType>)>,
         inner: P,
-        engine: Arc<LoginEngine<G, SD, H>>,
+        engine: Arc<LoginEngine<SD>>,
         /// Fallback rule for paths that don't match any registered route.
         /// Defaults to [`LoginRule::required`] — i.e. everything is protected
         /// unless explicitly opened up.
@@ -140,13 +135,11 @@ where
 }
 
 // Custom builder method for the routes collection.
-impl<P, G, SD, H, S: login_proxy_builder::State> LoginProxyBuilder<P, G, SD, H, S>
+impl<P, SD, S: login_proxy_builder::State> LoginProxyBuilder<P, SD, S>
 where
     P: ProxyHttp + Send + Sync,
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
-    G: LoginGrant + Send + Sync,
     SD: SessionDriver + Send + Sync,
-    H: HttpClient + Send + Sync,
 {
     /// Adds a route pattern with an associated [`LoginRule`].
     ///
@@ -157,13 +150,11 @@ where
     }
 }
 
-impl<P, G, SD, H> LoginProxy<P, G, SD, H>
+impl<P, SD> LoginProxy<P, SD>
 where
     P: ProxyHttp + Send + Sync,
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
-    G: LoginGrant + Send + Sync,
     SD: SessionDriver + Send + Sync,
-    H: HttpClient + Send + Sync,
 {
     /// Returns a handle to the underlying [`LoginEngine`].
     ///
@@ -171,7 +162,7 @@ where
     /// example, calling [`LoginEngine::redirect_to_login`] from a handler
     /// that wants to force re-authentication outside the normal routing
     /// policy.
-    pub fn engine(&self) -> &Arc<LoginEngine<G, SD, H>> {
+    pub fn engine(&self) -> &Arc<LoginEngine<SD>> {
         &self.engine
     }
 
@@ -258,13 +249,11 @@ fn append_set_cookies(resp: &mut ResponseHeader, cookies: Vec<HeaderValue>) -> R
 // ── ProxyHttp implementation ──────────────────────────────────────────────────
 
 #[proxy_http_delegate(self.inner)]
-impl<P, G, SD, H> ProxyHttp for LoginProxy<P, G, SD, H>
+impl<P, SD> ProxyHttp for LoginProxy<P, SD>
 where
     P: ProxyHttp + Send + Sync,
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
-    G: LoginGrant + Send + Sync,
     SD: SessionDriver + Send + Sync,
-    H: HttpClient + Send + Sync,
 {
     type CTX = P::CTX;
 

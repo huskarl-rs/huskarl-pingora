@@ -15,21 +15,16 @@ use bytes::Bytes;
 use http::HeaderValue;
 use huskarl::{
     core::{
-        BoxedError,
-        crypto::cipher::BoxedAeadCipher,
-        http::{HttpClient, HttpResponse as HuskarlHttpResponse},
+        client_auth::NoAuth,
+        http::{HttpClient, HttpResponse, Idempotency},
+        platform::MaybeSendBoxFuture,
         secrets::{Secret, SecretBytes, SecretOutput},
     },
-    grant::{
-        authorization_code::{PendingState, StartOutput},
-        core::TokenResponse,
-    },
-    token::RefreshToken,
+    grant::authorization_code::AuthorizationCodeGrant,
 };
 use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 use huskarl_login::{
-    CompletedLogin, LoginConfig, LoginGrant, Session as LoginSession, SessionDriver, SessionError,
-    SessionState,
+    CompletedLogin, LoginConfig, Session as LoginSession, SessionDriver, SessionError, SessionState,
 };
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::{ProxyHttp, Session};
@@ -37,34 +32,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use super::*;
 use crate::login::{LoginCtx, LoginRule};
-
-// ── Mock HTTP client (never actually called) ─────────────────────
-
-struct MockHttpResponse;
-
-impl HuskarlHttpResponse for MockHttpResponse {
-    type Error = Infallible;
-    fn status(&self) -> http::StatusCode {
-        unimplemented!()
-    }
-    fn headers(&self) -> http::HeaderMap {
-        unimplemented!()
-    }
-    async fn body(self) -> Result<Bytes, Infallible> {
-        unimplemented!()
-    }
-}
-
-struct MockHttpClient;
-
-impl HttpClient for MockHttpClient {
-    type Response = MockHttpResponse;
-    type Error = Infallible;
-    type ResponseError = Infallible;
-    async fn execute(&self, _: http::Request<Bytes>) -> Result<MockHttpResponse, Infallible> {
-        unimplemented!()
-    }
-}
 
 // ── Mock session ─────────────────────────────────────────────────
 
@@ -90,6 +57,21 @@ fn mock_session() -> MockSession {
             .token_expiry(now + Duration::from_hours(1))
             .created_at(now)
             .last_active(now)
+            .build(),
+        role: None,
+    }
+}
+
+/// A valid session whose `last_active` is older than the engine's
+/// `touch_min_interval` (default one hour), so a request records activity
+/// (`Touch`) instead of being throttled (`Skip`).
+fn mock_session_stale_activity() -> MockSession {
+    let now = SystemTime::now();
+    MockSession {
+        state: SessionState::builder()
+            .token_expiry(now + Duration::from_hours(1))
+            .created_at(now - Duration::from_hours(3))
+            .last_active(now - Duration::from_hours(2))
             .build(),
         role: None,
     }
@@ -231,24 +213,29 @@ struct TestSecret(SecretBytes);
 
 impl Secret for TestSecret {
     type Output = SecretBytes;
-    type Error = Infallible;
-    async fn get_secret_value(&self) -> Result<SecretOutput<SecretBytes>, Infallible> {
-        Ok(SecretOutput {
-            value: self.0.clone(),
-            identity: None,
+    fn get_secret_value(
+        &self,
+    ) -> MaybeSendBoxFuture<
+        '_,
+        Result<SecretOutput<SecretBytes>, huskarl_resource_server::core::Error>,
+    > {
+        Box::pin(async {
+            Ok(SecretOutput {
+                value: self.0.clone(),
+                identity: None,
+            })
         })
     }
 }
 
-async fn test_cipher() -> BoxedAeadCipher {
-    let key = AesGcmKey::from_secret(
+async fn test_cipher() -> AesGcmKey {
+    AesGcmKey::from_secret(
         AesGcmKeyType::Aes256,
         TestSecret(SecretBytes::new(vec![0u8; 32])),
         |_| None,
     )
     .await
-    .unwrap();
-    BoxedAeadCipher::new(key)
+    .unwrap()
 }
 
 fn default_config() -> LoginConfig {
@@ -262,56 +249,39 @@ fn default_config() -> LoginConfig {
 
 // ── Test grant (never actually exchanged; redirect_to_login uses start()) ──
 
-struct TestGrant {
-    authorization_url: String,
-    state: String,
+struct MockHttpClient;
+
+impl HttpClient for MockHttpClient {
+    fn execute(
+        &self,
+        _: http::Request<Bytes>,
+        _: Idempotency,
+    ) -> MaybeSendBoxFuture<'_, Result<HttpResponse, huskarl::core::Error>> {
+        unimplemented!("wrapper tests never reach the token endpoint")
+    }
 }
 
-impl TestGrant {
-    fn new(authorization_url: &str, state: &str) -> Self {
-        Self {
-            authorization_url: authorization_url.to_owned(),
-            state: state.to_owned(),
-        }
-    }
-}
-
-impl LoginGrant for TestGrant {
-    async fn start(&self, _: &impl HttpClient, _: Vec<String>) -> Result<StartOutput, BoxedError> {
-        Ok(StartOutput {
-            authorization_url: self.authorization_url.parse().unwrap(),
-            expires_in: None,
-            pending_state: PendingState {
-                redirect_uri: "https://localhost/callback".to_owned(),
-                pkce_verifier: None,
-                state: self.state.clone(),
-                nonce: "test_nonce".to_owned(),
-                dpop_jkt: None,
-            },
-        })
-    }
-    async fn complete(
-        &self,
-        _: &impl HttpClient,
-        _: &PendingState,
-        _: String,
-        _: String,
-        _: Option<String>,
-    ) -> Result<CompletedLogin, BoxedError> {
-        Err(BoxedError::from_err("\0".parse::<http::Uri>().unwrap_err()))
-    }
-    async fn refresh(
-        &self,
-        _: &impl HttpClient,
-        _: &RefreshToken,
-    ) -> Result<TokenResponse, BoxedError> {
-        Err(BoxedError::from_err("\0".parse::<http::Uri>().unwrap_err()))
-    }
+/// A real `AuthorizationCodeGrant` over a never-called HTTP double. `start()`
+/// uses direct delivery (no PAR) and performs no HTTP, and these wrapper
+/// tests never complete a token exchange.
+async fn test_grant() -> AuthorizationCodeGrant {
+    AuthorizationCodeGrant::builder()
+        .client_id("client")
+        .http_client(MockHttpClient)
+        .client_auth(NoAuth)
+        .token_endpoint("https://auth.example.com/token")
+        .unwrap()
+        .authorization_endpoint("https://auth.example.com/authorize")
+        .unwrap()
+        .redirect_uri("https://app.example.com/callback")
+        .build()
+        .await
+        .unwrap()
 }
 
 // ── Build helpers ────────────────────────────────────────────────
 
-type TestProxy = LoginProxy<InnerProxy, TestGrant, MockSessionDriver, MockHttpClient>;
+type TestProxy = LoginProxy<InnerProxy, MockSessionDriver>;
 
 async fn build_proxy_with_routes(
     store: MockSessionDriver,
@@ -320,10 +290,9 @@ async fn build_proxy_with_routes(
     let engine = Arc::new(
         huskarl_login::engine::LoginEngine::builder()
             .config(default_config())
-            .grant(TestGrant::new("https://auth.example.com/authorize", "s"))
+            .grant(test_grant().await)
             .session_store(store)
             .cipher(test_cipher().await)
-            .http_client(MockHttpClient)
             .build(),
     );
     let mut builder = LoginProxy::builder()
@@ -550,8 +519,8 @@ async fn response_filter_save_on_dirty_persistence() {
     let mut ctx = proxy.inner.new_ctx();
 
     proxy.request_filter(&mut s, &mut ctx).await.unwrap();
-    // Engine assigns Touch by default when no refresh fires. Force Save to
-    // exercise the save branch.
+    // Engine assigns Skip here (fresh last_active, no refresh). Force Save
+    // to exercise the save branch.
     ctx.login_state_mut().persistence = SessionPersistence::Save;
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
@@ -566,7 +535,9 @@ async fn response_filter_save_on_dirty_persistence() {
 
 #[tokio::test]
 async fn response_filter_touch_path() {
-    let store = MockSessionDriver::with_session(mock_session());
+    // last_active must predate touch_min_interval or the engine throttles
+    // the activity update to Skip.
+    let store = MockSessionDriver::with_session(mock_session_stale_activity());
     let proxy = build_proxy(store).await;
     let (mut s, _c) = make_session("GET", "/api", "Accept: application/json\r\n").await;
     let mut ctx = proxy.inner.new_ctx();
@@ -580,6 +551,28 @@ async fn response_filter_touch_path() {
         .unwrap();
 
     assert!(proxy.engine().session_store().was_touch_called());
+    assert!(!proxy.engine().session_store().was_save_called());
+    assert!(!proxy.engine().session_store().was_delete_called());
+}
+
+#[tokio::test]
+async fn response_filter_skip_when_activity_throttled() {
+    // Fresh last_active is within touch_min_interval — the engine assigns
+    // Skip and no store call happens at all.
+    let store = MockSessionDriver::with_session(mock_session());
+    let proxy = build_proxy(store).await;
+    let (mut s, _c) = make_session("GET", "/api", "Accept: application/json\r\n").await;
+    let mut ctx = proxy.inner.new_ctx();
+
+    proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+
+    let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
+    proxy
+        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .await
+        .unwrap();
+
+    assert!(!proxy.engine().session_store().was_touch_called());
     assert!(!proxy.engine().session_store().was_save_called());
     assert!(!proxy.engine().session_store().was_delete_called());
 }

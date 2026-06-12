@@ -15,10 +15,16 @@ cargo-reedme: info-end -->
 
 Pingora integration for huskarl.
 
-This crate provides [`AuthProxy`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/resource/proxy/struct.AuthProxy.html), a decorator that wraps a [`ProxyHttp`](https://docs.rs/pingora_proxy/latest/pingora_proxy/proxy_trait/trait.ProxyHttp.html)
-implementation to add OAuth 2.0 token validation via a [`Guard`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/resource/guard/struct.Guard.html).
+This crate provides two independent feature-gated modules:
 
-# Example
+- **`resource`** — OAuth 2.0 resource-server (bearer token) protection via
+  [`resource::AuthProxy`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/resource/proxy/struct.AuthProxy.html) and [`resource::Guard`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/resource/guard/struct.Guard.html).
+- **`login`** — OAuth 2.0 Authorization Code Grant login layer via
+  [`login::LoginProxy`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/login/proxy/struct.LoginProxy.html).
+
+Both features are enabled by default.
+
+# Resource server example
 
 A minimal JWT-protected reverse proxy using an [RFC 9068] validator:
 
@@ -71,10 +77,10 @@ async fn main() {
         .expect("HTTP client");
 
     // 2. Discover the authorization server's metadata (issuer, jwks_uri, …).
-    let metadata = AuthorizationServerMetadata::builder()
+    let metadata = AuthorizationServerMetadata::fetch()
         .http_client(&http_client)
         .issuer("https://auth.example.com")
-        .build()
+        .call()
         .await
         .expect("AS metadata");
 

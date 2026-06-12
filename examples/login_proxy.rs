@@ -25,18 +25,17 @@
 //!   - `UPSTREAM_TLS`  — Set to enable TLS to the upstream (SNI derived from hostname)
 //!   - `LISTEN`        — Listen address (default: `0.0.0.0:6188`)
 
-use std::{convert::Infallible, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl::{
     core::{
-        crypto::cipher::BoxedAeadCipher,
-        dpop::NoDPoP,
         jwk::JwksSource,
+        platform::MaybeSendBoxFuture,
         secrets::{SecretBytes, SecretOutput},
         server_metadata::AuthorizationServerMetadata,
     },
-    grant::authorization_code::{AuthorizationCodeGrant, NoJar},
+    grant::authorization_code::AuthorizationCodeGrant,
 };
 use huskarl_crypto_native::aead::{AesGcmKey, AesGcmKeyType};
 use huskarl_pingora::login::{
@@ -109,12 +108,18 @@ struct StaticBytesSecret(SecretBytes);
 
 impl huskarl::core::secrets::Secret for StaticBytesSecret {
     type Output = SecretBytes;
-    type Error = Infallible;
 
-    async fn get_secret_value(&self) -> std::result::Result<SecretOutput<SecretBytes>, Infallible> {
-        Ok(SecretOutput {
-            value: self.0.clone(),
-            identity: None,
+    fn get_secret_value(
+        &self,
+    ) -> MaybeSendBoxFuture<
+        '_,
+        Result<SecretOutput<SecretBytes>, huskarl_resource_server::core::Error>,
+    > {
+        Box::pin(async {
+            Ok(SecretOutput {
+                value: self.0.clone(),
+                identity: None,
+            })
         })
     }
 }
@@ -184,20 +189,17 @@ fn main() {
             .expect("authorization server does not advertise an authorization endpoint")
             .client_id(client_id)
             .client_auth(NoAuth)
+            .http_client(http_client.clone())
             .redirect_uri(redirect_uri.clone())
-            .dpop(NoDPoP)
-            .jar(NoJar)
             .jws_verifier_factory(Arc::new(
-                JwksSource::builder()
-                    .http_client(http_client.clone())
-                    .build(),
+                JwksSource::builder().http_client(http_client).build(),
             ))
             .build()
             .await
             .expect("failed to build authorization code grant");
 
         let key_bytes = load_or_generate_key_bytes();
-        let cipher = BoxedAeadCipher::new(aes_key_from_bytes(key_bytes).await);
+        let cipher = Arc::new(aes_key_from_bytes(key_bytes).await);
 
         let session_store = CookieSessionStore::builder()
             .cipher(cipher.clone())
@@ -233,7 +235,6 @@ fn main() {
                 .grant(grant)
                 .session_store(session_store)
                 .cipher(cipher)
-                .http_client(http_client)
                 .build(),
         );
 

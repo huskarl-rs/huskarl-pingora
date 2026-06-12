@@ -24,7 +24,7 @@ use huskarl_pingora::{
     resource::{AuthCtx, AuthProxy, Guard, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
-        validator::{dpop_nonce::NoNonceCheck, rfc9068::Rfc9068Validator},
+        validator::rfc9068::Rfc9068Validator,
     },
 };
 use huskarl_reqwest::ReqwestClient;
@@ -56,7 +56,7 @@ impl ProxyHttp for Upstream {
 }
 
 /// Discover authorization server metadata and build an RFC 9068 JWT validator.
-async fn build_validator(issuer: &str, audience: &str) -> Rfc9068Validator<NoNonceCheck> {
+async fn build_validator(issuer: &str, audience: &str) -> Rfc9068Validator {
     let http_client = ReqwestClient::builder()
         .mtls(huskarl_reqwest::mtls::NoMtls)
         .build()
