@@ -271,7 +271,8 @@ async fn build_proxy_with_routes(
     );
     let mut builder = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(engine);
+        .engine(engine)
+        .case_sensitivity(crate::login::CaseSensitivity::Sensitive);
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
@@ -349,6 +350,39 @@ async fn default_required_no_session_navigation_redirects() {
     assert!(handled);
     assert!(!proxy.inner.was_forwarded());
     assert_eq!(read_status(&mut c).await, 302);
+}
+
+// ── Subtree matching ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn subtree_required_covers_path_and_descendants() {
+    let engine = Arc::new(
+        huskarl_login::engine::LoginEngine::builder()
+            .config(default_config())
+            .grant(test_grant().await)
+            .session_store(MockSessionDriver::default())
+            .cipher(test_cipher().await)
+            .build(),
+    );
+    let proxy = LoginProxy::builder()
+        .inner(InnerProxy::new())
+        .engine(engine)
+        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .subtree("/dashboard", LoginRule::required())
+        .build()
+        .expect("valid routes");
+
+    // No session: the bare path, the trailing-slash form, and descendants are
+    // all gated (401 for an XHR request).
+    for path in ["/dashboard", "/dashboard/", "/dashboard/reports"] {
+        let (mut s, mut c) = make_session("GET", path, "Accept: application/json\r\n").await;
+        let mut ctx = proxy.inner.new_ctx();
+
+        let handled = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+
+        assert!(handled, "{path} should be gated");
+        assert_eq!(read_status(&mut c).await, 401, "{path}");
+    }
 }
 
 // ── Public routes ────────────────────────────────────────────────
@@ -780,6 +814,168 @@ async fn response_filter_no_session_does_nothing() {
     assert!(!proxy.engine().session_store.was_save_called());
 }
 
+// ── Path-confusion guard ────────────────────────────────────────
+
+async fn build_structural_proxy(
+    routes: Vec<(&'static str, LoginRule<MockSession>)>,
+    path_confusion: crate::login::PathConfusion,
+) -> TestProxy {
+    let engine = Arc::new(
+        huskarl_login::engine::LoginEngine::builder()
+            .config(default_config())
+            .grant(test_grant().await)
+            .session_store(MockSessionDriver::default())
+            .cipher(test_cipher().await)
+            .build(),
+    );
+    let mut builder = LoginProxy::builder()
+        .inner(InnerProxy::new())
+        .engine(engine)
+        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .path_confusion(path_confusion);
+    for (pattern, rule) in routes {
+        builder = builder.subtree(pattern, rule);
+    }
+    builder.build().expect("valid routes")
+}
+
+#[tokio::test]
+async fn structural_denies_traversal_into_subtree() {
+    let proxy = build_structural_proxy(
+        vec![("/dashboard", LoginRule::required())],
+        crate::login::PathConfusion::reject_structural(),
+    )
+    .await;
+    let (mut s, mut c) =
+        make_session("GET", "/x/../dashboard", "Sec-Fetch-Mode: navigate\r\n").await;
+    let mut ctx = proxy.inner.new_ctx();
+
+    let handled = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+
+    assert!(handled);
+    assert!(!proxy.inner.was_forwarded());
+    assert_eq!(read_status(&mut c).await, 400);
+}
+
+#[tokio::test]
+async fn structural_denies_path_param_vector() {
+    let proxy = build_structural_proxy(
+        vec![("/dashboard", LoginRule::required())],
+        crate::login::PathConfusion::reject_structural(),
+    )
+    .await;
+    let (mut s, mut c) = make_session(
+        "GET",
+        "/dashboard/..;/secret",
+        "Accept: application/json\r\n",
+    )
+    .await;
+    let mut ctx = proxy.inner.new_ctx();
+
+    let handled = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+
+    assert!(handled);
+    assert_eq!(read_status(&mut c).await, 400);
+}
+
+#[tokio::test]
+async fn structural_allows_same_rule_encoded_content() {
+    // Non-structural encoded content (`%20`) decodes to a deeper path under the same
+    // public `/files/{*rest}` rule — no route change → forwarded. (A structural byte
+    // like `%2f` would be denied under the uniform-live model unless declared opaque.)
+    let proxy = build_structural_proxy(
+        vec![("/files", LoginRule::public())],
+        crate::login::PathConfusion::reject_structural(),
+    )
+    .await;
+    let (mut s, _c) = make_session("GET", "/files/a%20b", "").await;
+    let mut ctx = proxy.inner.new_ctx();
+
+    let handled = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+
+    assert!(!handled);
+    assert!(proxy.inner.was_forwarded());
+}
+
+#[tokio::test]
+async fn method_specific_rule_does_not_escape_to_catchall() {
+    // `GET /admin` is public; the catch-all is public for any method. A `POST /admin`
+    // must NOT escape its `/admin` claim into the public catch-all — it falls to the
+    // default (required) and is gated, not forwarded. (If the builder failed to wire
+    // `.method()`, the GET-public rule would register as wildcard and POST would forward.)
+    let proxy = build_proxy_with_routes(
+        MockSessionDriver::default(),
+        vec![
+            ("/{*rest}", LoginRule::public()),
+            ("/admin", LoginRule::public().method(http::Method::GET)),
+        ],
+    )
+    .await;
+
+    // GET /admin → its GET-public rule → forwarded.
+    let (mut s, _c) = make_session("GET", "/admin", "").await;
+    let mut ctx = proxy.inner.new_ctx();
+    let handled = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+    assert!(!handled);
+    assert!(proxy.inner.was_forwarded());
+
+    // POST /admin → no POST rule at /admin → default (required) → gated, NOT forwarded
+    // to the public catch-all.
+    let proxy = build_proxy_with_routes(
+        MockSessionDriver::default(),
+        vec![
+            ("/{*rest}", LoginRule::public()),
+            ("/admin", LoginRule::public().method(http::Method::GET)),
+        ],
+    )
+    .await;
+    let (mut s, _c) = make_session("POST", "/admin", "").await;
+    let mut ctx = proxy.inner.new_ctx();
+    let _ = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+    assert!(!proxy.inner.was_forwarded());
+}
+
+#[tokio::test]
+async fn structural_off_allows_traversal() {
+    let proxy = build_structural_proxy(
+        vec![("/dashboard", LoginRule::required())],
+        crate::login::PathConfusion::off(),
+    )
+    .await;
+    let (mut s, mut c) =
+        make_session("GET", "/x/../dashboard", "Sec-Fetch-Mode: navigate\r\n").await;
+    let mut ctx = proxy.inner.new_ctx();
+
+    let handled = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+
+    // No guard → default (required) rule, unauthenticated navigation → 302.
+    assert!(handled);
+    assert_eq!(read_status(&mut c).await, 302);
+}
+
+#[tokio::test]
+async fn build_rejects_noncanonical_pattern() {
+    let engine = Arc::new(
+        huskarl_login::engine::LoginEngine::builder()
+            .config(default_config())
+            .grant(test_grant().await)
+            .session_store(MockSessionDriver::default())
+            .cipher(test_cipher().await)
+            .build(),
+    );
+    let result = LoginProxy::builder()
+        .inner(InnerProxy::new())
+        .engine(engine)
+        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .route("/a/b", LoginRule::public())
+        .route("/a//b", LoginRule::required())
+        .build();
+    assert!(matches!(
+        result,
+        Err(crate::login::RouteConfigError::NonCanonicalPattern { .. })
+    ));
+}
+
 // ── Store-backed (server-side) integration ───────────────────────
 //
 // The tests above drive the low-level `SessionDriver` through a mock. These
@@ -927,6 +1123,7 @@ mod store_backed {
         LoginProxy::builder()
             .inner(StoreInner::new())
             .engine(engine)
+            .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
             .build()
             .expect("valid routes")
     }

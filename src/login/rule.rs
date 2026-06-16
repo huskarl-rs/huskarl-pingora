@@ -3,7 +3,7 @@
 //! [`LoginRule`] describes what session handling a path requires, plus
 //! optional authorization checks that run after the session is loaded. Rules
 //! are registered on [`LoginProxy`](super::LoginProxy) via
-//! `.route(pattern, rule)` using [`matchit`] path-pattern syntax (e.g.
+//! `.route(pattern, rule)` using `matchit` path-pattern syntax (e.g.
 //! `/users/{id}`, `/static/{*rest}`).
 //!
 //! Use the constructor methods [`LoginRule::public`], [`LoginRule::optional`],
@@ -11,6 +11,8 @@
 //! authorization logic.
 
 use std::sync::Arc;
+
+use crate::route_tree::MethodMatch;
 
 /// An error returned by a custom [`LoginRule::check`] function.
 #[derive(Debug)]
@@ -84,7 +86,10 @@ pub enum LoginRule<S = ()> {
     /// proxy sees no session. Cheapest option for paths that genuinely don't
     /// care (e.g. `/health`, `/static/...`). Carries no authorization check:
     /// there is no session to inspect.
-    Public,
+    Public {
+        /// Which HTTP method(s) this rule applies to (wildcard by default).
+        method: MethodMatch,
+    },
     /// Load the session if a cookie is present, but pass through to the inner
     /// proxy either way. Use this when the path is publicly accessible but
     /// should still render personalized content (e.g. a "Sign in" vs
@@ -94,6 +99,8 @@ pub enum LoginRule<S = ()> {
         /// Authorization check, run after the session is loaded when one is
         /// present. Set via [`check`](Self::check).
         check: Option<CheckFn<S>>,
+        /// Which HTTP method(s) this rule applies to (wildcard by default).
+        method: MethodMatch,
     },
     /// Load the session and require it. Unauthenticated browser navigation
     /// gets a `302` to the authorization server; XHR/API requests get a
@@ -103,6 +110,8 @@ pub enum LoginRule<S = ()> {
         /// Authorization check, run after the session is loaded. Set via
         /// [`check`](Self::check).
         check: Option<CheckFn<S>>,
+        /// Which HTTP method(s) this rule applies to (wildcard by default).
+        method: MethodMatch,
     },
 }
 
@@ -115,12 +124,16 @@ impl<S> Default for LoginRule<S> {
 impl<S> Clone for LoginRule<S> {
     fn clone(&self) -> Self {
         match self {
-            Self::Public => Self::Public,
-            Self::Optional { check } => Self::Optional {
-                check: check.clone(),
+            Self::Public { method } => Self::Public {
+                method: method.clone(),
             },
-            Self::Required { check } => Self::Required {
+            Self::Optional { check, method } => Self::Optional {
                 check: check.clone(),
+                method: method.clone(),
+            },
+            Self::Required { check, method } => Self::Required {
+                check: check.clone(),
+                method: method.clone(),
             },
         }
     }
@@ -129,14 +142,16 @@ impl<S> Clone for LoginRule<S> {
 impl<S> std::fmt::Debug for LoginRule<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Public => f.write_str("Public"),
-            Self::Optional { check } => f
+            Self::Public { method } => f.debug_struct("Public").field("method", method).finish(),
+            Self::Optional { check, method } => f
                 .debug_struct("Optional")
                 .field("check", &check.as_ref().map(|_| ..))
+                .field("method", method)
                 .finish(),
-            Self::Required { check } => f
+            Self::Required { check, method } => f
                 .debug_struct("Required")
                 .field("check", &check.as_ref().map(|_| ..))
+                .field("method", method)
                 .finish(),
         }
     }
@@ -149,7 +164,9 @@ impl<S> LoginRule<S> {
     /// [`Public`](Self::Public) carries no authorization check — there is no
     /// session to inspect — so [`check`](Self::check) has no effect on it.
     pub fn public() -> Self {
-        Self::Public
+        Self::Public {
+            method: MethodMatch::Any,
+        }
     }
 
     /// A rule that loads the session if a cookie is present but never gates
@@ -159,7 +176,10 @@ impl<S> LoginRule<S> {
     /// Chain [`check`](Self::check) to run an authorization check when a
     /// session is present.
     pub fn optional() -> Self {
-        Self::Optional { check: None }
+        Self::Optional {
+            check: None,
+            method: MethodMatch::Any,
+        }
     }
 
     /// A rule that requires an authenticated session. Unauthenticated
@@ -169,7 +189,10 @@ impl<S> LoginRule<S> {
     /// Chain [`check`](Self::check) to gate the request further on session
     /// content.
     pub fn required() -> Self {
-        Self::Required { check: None }
+        Self::Required {
+            check: None,
+            method: MethodMatch::Any,
+        }
     }
 
     /// Adds a custom authorization check that runs after the session is
@@ -185,9 +208,42 @@ impl<S> LoginRule<S> {
     pub fn check(self, f: impl Fn(&S) -> Result<(), CheckError> + Send + Sync + 'static) -> Self {
         let check: Option<CheckFn<S>> = Some(Arc::new(f));
         match self {
-            Self::Public => Self::Public,
-            Self::Optional { .. } => Self::Optional { check },
-            Self::Required { .. } => Self::Required { check },
+            Self::Public { method } => Self::Public { method },
+            Self::Optional { method, .. } => Self::Optional { check, method },
+            Self::Required { method, .. } => Self::Required { check, method },
+        }
+    }
+
+    /// Restricts this rule to a single HTTP method.
+    ///
+    /// By default a rule applies to **any** method. Scope it (e.g. `GET` public, `POST`
+    /// protected on the same path) by registering one rule per method. The method axis is
+    /// orthogonal to the path — it never affects which *path* matches.
+    ///
+    /// **Default-deny on the method axis:** registering any method-specific rule on a path
+    /// makes every *other* method on that path fall to the default rule. Add a wildcard
+    /// rule (no `.method()`) on the same path for a fallback policy; it is **not** inherited
+    /// from a broader catch-all.
+    ///
+    /// The guard authorizes on the **request-line** method. If your backend honors method
+    /// override headers (`X-HTTP-Method-Override`, …) or folds `HEAD` into `GET`, strip
+    /// those at your edge. A CORS preflight (`OPTIONS`, credential-less) is handled above
+    /// this layer.
+    pub fn method(self, method: http::Method) -> Self {
+        let method = MethodMatch::Only(method);
+        match self {
+            Self::Public { .. } => Self::Public { method },
+            Self::Optional { check, .. } => Self::Optional { check, method },
+            Self::Required { check, .. } => Self::Required { check, method },
+        }
+    }
+
+    /// The method qualifier — read by the proxy builder when registering the route.
+    pub(crate) fn method_match(&self) -> &MethodMatch {
+        match self {
+            Self::Public { method }
+            | Self::Optional { method, .. }
+            | Self::Required { method, .. } => method,
         }
     }
 }
@@ -199,37 +255,37 @@ mod tests {
     #[test]
     fn public_rule_has_no_check() {
         let r: LoginRule = LoginRule::public();
-        assert!(matches!(r, LoginRule::Public));
+        assert!(matches!(r, LoginRule::Public { .. }));
     }
 
     #[test]
     fn optional_rule_starts_without_check() {
         let r: LoginRule = LoginRule::optional();
-        assert!(matches!(r, LoginRule::Optional { check: None }));
+        assert!(matches!(r, LoginRule::Optional { check: None, .. }));
     }
 
     #[test]
     fn required_rule_starts_without_check() {
         let r: LoginRule = LoginRule::required();
-        assert!(matches!(r, LoginRule::Required { check: None }));
+        assert!(matches!(r, LoginRule::Required { check: None, .. }));
     }
 
     #[test]
     fn default_is_required() {
         let r: LoginRule = LoginRule::default();
-        assert!(matches!(r, LoginRule::Required { check: None }));
+        assert!(matches!(r, LoginRule::Required { check: None, .. }));
     }
 
     #[test]
     fn check_attaches_to_required() {
         let r = LoginRule::<String>::required().check(|_| Ok(()));
-        assert!(matches!(r, LoginRule::Required { check: Some(_) }));
+        assert!(matches!(r, LoginRule::Required { check: Some(_), .. }));
     }
 
     #[test]
     fn check_attaches_to_optional() {
         let r = LoginRule::<String>::optional().check(|_| Ok(()));
-        assert!(matches!(r, LoginRule::Optional { check: Some(_) }));
+        assert!(matches!(r, LoginRule::Optional { check: Some(_), .. }));
     }
 
     #[test]
@@ -238,7 +294,7 @@ mod tests {
         // check — `.check()` is a structural no-op rather than a silently
         // stored dead field.
         let r = LoginRule::<String>::public().check(|_| Err(CheckError::Forbidden("nope".into())));
-        assert!(matches!(r, LoginRule::Public));
+        assert!(matches!(r, LoginRule::Public { .. }));
     }
 
     #[test]
@@ -250,8 +306,11 @@ mod tests {
                 Err(CheckError::Forbidden("non-positive".into()))
             }
         });
-        assert!(matches!(r, LoginRule::Required { check: Some(_) }));
-        if let LoginRule::Required { check: Some(check) } = r {
+        assert!(matches!(r, LoginRule::Required { check: Some(_), .. }));
+        if let LoginRule::Required {
+            check: Some(check), ..
+        } = r
+        {
             assert!(check(&1).is_ok());
             assert!(matches!(check(&0), Err(CheckError::Forbidden(_))));
         }

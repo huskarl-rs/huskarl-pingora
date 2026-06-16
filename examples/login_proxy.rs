@@ -39,8 +39,8 @@ use huskarl::{
 };
 use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_pingora::login::{
-    CookieSession, CookieSessionStore, LoginConfig, LoginCtx, LoginEngine, LoginProxy, LoginRule,
-    LogoutConfig,
+    CaseSensitivity, CookieSession, CookieSessionStore, LoginConfig, LoginCtx, LoginEngine,
+    LoginProxy, LoginRule, LogoutConfig, PathConfusion,
 };
 use huskarl_reqwest::ReqwestClient;
 use huskarl_resource_server::core::client_auth::NoAuth;
@@ -241,13 +241,28 @@ fn main() {
         LoginProxy::builder()
             .inner(inner)
             .engine(engine)
-            // Liveness probe — skip session handling entirely.
+            .case_sensitivity(CaseSensitivity::Sensitive)
+            // `subtree` applies a rule to a path and everything beneath it;
+            // `route` matches a single exact path.
+            //
+            // Protect the whole dashboard area — `/dashboard`, `/dashboard/`,
+            // and every page under it.
+            .subtree("/dashboard", LoginRule::required())
+            // Liveness probe — exact path, skip session handling entirely.
             .route("/health", LoginRule::public())
-            // Landing page — render publicly but personalize if the user is
-            // already signed in.
+            // Landing page — exact path; render publicly but personalize if the
+            // user is already signed in.
             .route("/", LoginRule::optional())
             // Everything else falls through to the default (`required`),
             // redirecting unauthenticated browsers through the auth-code flow.
+            //
+            // Path-confusion protection is ON by default (`RejectStructural`): a
+            // request carrying a structural byte in a route position the table makes
+            // able to change which rule matches (e.g. `/x/../dashboard`,
+            // `/dashboard/..;/admin`) is rejected with 400, while the raw path is
+            // still forwarded. `::reject_non_canonical()` is a stricter,
+            // defense-in-depth alternative; `::off()` disables it.
+            .path_confusion(PathConfusion::reject_structural())
             .build()
             .expect("valid LoginProxy configuration")
     });

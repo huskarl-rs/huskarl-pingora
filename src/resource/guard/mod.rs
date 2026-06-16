@@ -1,7 +1,7 @@
 //! Token validation guard with path-based routing.
 //!
 //! [`Guard`] matches incoming request paths against registered [`Rule`]s using
-//! [`matchit`] patterns and validates bearer tokens via an
+//! `matchit` patterns and validates bearer tokens via an
 //! [`AccessTokenValidator`]. It returns an [`Outcome`] indicating whether
 //! the request should be forwarded or denied with [RFC 6750] challenges.
 //!
@@ -10,10 +10,11 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use bon::bon;
-use matchit::Router;
 use pingora_proxy::Session;
 
 use crate::{
+    path_confusion::{CaseSensitivity, PathConfusion, StructuralClasses},
+    path_router::{RouteEntry, RuleRouter, next_rule_id},
     resource::{
         error::{ConfigError, CustomCheckError, InvalidRequest, InvalidToken},
         outcome::Outcome,
@@ -67,7 +68,7 @@ pub struct ClientCertDer(pub Vec<u8>);
 /// # Example
 ///
 /// ```
-/// # use huskarl_pingora::resource::{Guard, Rule};
+/// # use huskarl_pingora::resource::{CaseSensitivity, Guard, Rule};
 /// # fn build<V>(my_validator: V)
 /// # where
 /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -75,8 +76,13 @@ pub struct ClientCertDer(pub Vec<u8>);
 /// # {
 /// let guard = Guard::builder()
 ///     .validator(my_validator)
-///     .route("/public/*rest", Rule::public())
-///     .route("/api/admin", Rule::required().scopes(["admin"]))
+///     // Required: declare whether the upstream folds path case.
+///     .case_sensitivity(CaseSensitivity::Sensitive)
+///     // `subtree` protects a path and everything beneath it (the usual intent).
+///     .subtree("/admin", Rule::required().scopes(["admin"]))
+///     .subtree("/public", Rule::public())
+///     // `route` matches one exact path — here, a single health endpoint.
+///     .route("/health", Rule::public())
 ///     .build()
 ///     .expect("route");
 /// # }
@@ -84,8 +90,9 @@ pub struct ClientCertDer(pub Vec<u8>);
 pub struct Guard<V: AccessTokenValidator + ProvideValidatorMetadata> {
     validator: V,
     metadata: ValidatorMetadata,
-    router: Router<Rule<V::Claims>>,
-    default: Rule<V::Claims>,
+    /// Path → rule routing with rule-granularity identity and the path-confusion
+    /// structural guard (see [`RuleRouter`]).
+    routes: RuleRouter<Rule<V::Claims>>,
     scopes_supported: Vec<String>,
     base_uri: Option<http::Uri>,
     strip_prefix: Option<String>,
@@ -112,11 +119,14 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// # Errors
     ///
     /// Returns [`ConfigError`] if any route pattern is rejected by
-    /// [`matchit`] or if a public rule is configured with audience or scope
+    /// `matchit` or if a public rule is configured with audience or scope
     /// constraints (which can never be enforced).
     #[builder]
     pub fn new(
-        #[builder(field)] routes: Vec<(String, Rule<V::Claims>)>,
+        // (pattern, rule, rule_id, opaque, method) — patterns from one route/subtree call
+        // share an id; `opaque` marks a blob_subtree catch-all; `method` is the rule's
+        // method qualifier (wildcard by default).
+        #[builder(field)] routes: Vec<RouteEntry<Rule<V::Claims>>>,
         validator: V,
         /// the resource identifier for the validator metadata.
         resource: Option<http::Uri>,
@@ -130,18 +140,34 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         /// Defaults to [`Rule::required()`].
         #[builder(default)]
         default: Rule<V::Claims>,
+        /// Whether the upstream resolves paths **case-insensitively** — a required
+        /// declaration the library cannot infer (see [`CaseSensitivity`]). There is no
+        /// default: every deployment must state it, because a case-folding backend
+        /// turns a differently-cased path into a route-confusion vector.
+        case_sensitivity: CaseSensitivity,
+        /// Which path-confusion guard to apply — denies requests whose path a
+        /// normalizing backend could route to a different rule than the one matched
+        /// on the raw path. Defaults to [`PathConfusion::RejectStructural`].
+        #[builder(default)]
+        path_confusion: PathConfusion,
+        /// The structural classes and encodings the guard recognises beyond the
+        /// always-on trio. Defaults to [`StructuralClasses::new`].
+        #[builder(default)]
+        structural_classes: StructuralClasses,
     ) -> Result<Self, ConfigError> {
         // Reject public rules with audience or scope constraints — they can never
         // be enforced because the token validator is skipped for public routes.
-        for (pattern, rule) in &routes {
+        for (pattern, rule, _id, _opaque, _method) in &routes {
             if rule.token == TokenRequirement::None
-                && (!rule.audiences.is_empty() || !rule.scopes.is_empty())
+                && (!rule.audiences.is_empty() || !rule.scopes.is_empty() || rule.check.is_some())
             {
                 return Err(ConfigError::PublicRuleWithConstraints(pattern.clone()));
             }
         }
         if default.token == TokenRequirement::None
-            && (!default.audiences.is_empty() || !default.scopes.is_empty())
+            && (!default.audiences.is_empty()
+                || !default.scopes.is_empty()
+                || default.check.is_some())
         {
             return Err(ConfigError::PublicRuleWithConstraints("<default>".into()));
         }
@@ -151,22 +177,26 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 
         // Collect unique scopes from all route rules and the default rule.
         let mut all_scopes = BTreeSet::new();
-        for (_pattern, rule) in &routes {
+        for (_pattern, rule, _id, _opaque, _method) in &routes {
             all_scopes.extend(rule.scopes.iter().cloned());
         }
         all_scopes.extend(default.scopes.iter().cloned());
         let scopes_supported: Vec<String> = all_scopes.into_iter().collect();
 
-        let mut rule_router = Router::new();
-        for (pattern, rule) in routes {
-            rule_router.insert(&pattern, rule)?;
-        }
+        // Build the rule-id router + structural guard (also runs the build-time
+        // canonical-pattern check).
+        let routes = RuleRouter::build(
+            routes,
+            default,
+            path_confusion,
+            structural_classes,
+            case_sensitivity.is_insensitive(),
+        )?;
 
         Ok(Self {
             validator,
             metadata,
-            router: rule_router,
-            default,
+            routes,
             scopes_supported,
             base_uri: resource,
             strip_prefix,
@@ -177,16 +207,107 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State>
     GuardBuilder<V, S>
 {
-    /// Adds a route pattern with an associated rule.
+    /// Adds a single exact-match route pattern with an associated rule.
     ///
-    /// Patterns use [`matchit`] syntax (e.g. `/users/{id}`, `/public/*rest`).
+    /// Patterns use `matchit` syntax (e.g. `/users/{id}`, `/public/{*rest}`).
+    ///
+    /// This matches the given path *exactly* — `route("/admin", …)` does not
+    /// cover `/admin/` or `/admin/users`. To protect a path and everything
+    /// beneath it (the usual intent, and the safer default for authorization),
+    /// prefer [`subtree`](Self::subtree).
     pub fn route(mut self, pattern: impl Into<String>, rule: Rule<V::Claims>) -> Self {
-        self.routes.push((pattern.into(), rule));
+        let id = next_rule_id(&self.routes);
+        let method = rule.method.clone();
+        self.routes.push((pattern.into(), rule, id, false, method));
         self
+    }
+
+    /// Applies a rule to a path **and everything beneath it**.
+    ///
+    /// This is the recommended way to protect an area of the URL space:
+    /// matching only an exact path (via [`route`](Self::route)) is a common
+    /// source of authorization gaps, because a request to `/admin/` or
+    /// `/admin/users` would otherwise fall through to the default rule and skip
+    /// the scope/audience checks you attached to `/admin`.
+    ///
+    /// The path is expanded into the `matchit` patterns that cover the
+    /// subtree (each mapping to a clone of `rule`):
+    ///
+    /// - `subtree("/admin", …)`  covers `/admin`, `/admin/`, and `/admin/...`
+    /// - `subtree("/admin/", …)` covers `/admin/` and `/admin/...` — a trailing
+    ///   slash means "this directory and its contents, but not the bare
+    ///   `/admin`".
+    /// - `subtree("/", …)` covers the entire path space.
+    ///
+    /// A more-specific [`route`](Self::route) still takes precedence over a
+    /// subtree's catch-all, so you can layer exceptions:
+    ///
+    /// ```
+    /// # use huskarl_pingora::resource::{CaseSensitivity, Guard, Rule};
+    /// # fn build<V>(my_validator: V)
+    /// # where
+    /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
+    /// #         + huskarl_pingora::resource_server::validator::metadata::ProvideValidatorMetadata,
+    /// # {
+    /// let guard = Guard::builder()
+    ///     .validator(my_validator)
+    ///     .case_sensitivity(CaseSensitivity::Sensitive)
+    ///     .subtree("/admin", Rule::required().scopes(["admin"]))
+    ///     .route("/admin/health", Rule::public()) // exact carve-out wins
+    ///     .build()
+    ///     .expect("routes");
+    /// # }
+    /// ```
+    pub fn subtree(mut self, path: &str, rule: Rule<V::Claims>) -> Self {
+        self.push_subtree(path, rule, false);
+        self
+    }
+
+    /// Like [`subtree`](Self::subtree), but declares the subtree's catch-all tail an
+    /// **opaque** key space: structural bytes (`%2F`, `;`, `\`) *inside the key* are
+    /// tolerated rather than denied — for proxying opaque identifiers such as object-store
+    /// keys. Dot-segments (`..`), NUL truncation, and case folding are **still** denied
+    /// even in the blob, so traversal cannot escape it.
+    ///
+    /// Registering a more-specific [`route`](Self::route) or `subtree` *under* the blob is
+    /// a build error: a structural byte in the key could then relocate into that nested
+    /// route. Use a plain [`subtree`](Self::subtree) if you need nested routes.
+    pub fn blob_subtree(mut self, path: &str, rule: Rule<V::Claims>) -> Self {
+        self.push_subtree(path, rule, true);
+        self
+    }
+
+    /// Expand `path` into its subtree patterns and push them under one rule id. Only the
+    /// catch-all pattern's `opaque` flag is honored downstream (it is ignored on the bare
+    /// and trailing-slash patterns, which are not catch-alls).
+    fn push_subtree(&mut self, path: &str, rule: Rule<V::Claims>, opaque: bool) {
+        let id = next_rule_id(&self.routes);
+        let method = rule.method.clone();
+        let mut patterns = crate::subtree_patterns(path).into_iter();
+        // `subtree_patterns` always yields at least two patterns; all share one rule id.
+        if let Some(first) = patterns.next() {
+            for pattern in patterns {
+                self.routes
+                    .push((pattern, rule.clone(), id, opaque, method.clone()));
+            }
+            self.routes.push((first, rule, id, opaque, method));
+        }
     }
 }
 
 impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
+    /// Builds a `400 Bad Request` deny outcome with an `invalid_request` challenge.
+    fn bad_request(&self, msg: &'static str, scope_param: Option<&str>) -> Outcome<V::Claims> {
+        let challenges = self
+            .metadata
+            .challenges(Some(&InvalidRequest(msg)), scope_param, None);
+        Outcome::Deny {
+            status: http::StatusCode::BAD_REQUEST,
+            challenges,
+            dpop_nonce: None,
+        }
+    }
+
     /// Returns the well-known path and serialized JSON for RFC 9728 resource metadata.
     ///
     /// Per RFC 9728 §3.1, the well-known URI is constructed by inserting
@@ -260,9 +381,14 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     {
         let path = uri.path();
 
-        let rule = self.router.at(path).map_or(&self.default, |m| m.value);
+        let (_, rule) = self.routes.match_rule(path, method);
 
         let scope_param = rule.scope_param.as_deref();
+
+        // 0. Path-confusion guard: reject ambiguous paths before any work.
+        if let Some(msg) = self.routes.ambiguous(path) {
+            return self.bad_request(msg, scope_param);
+        }
 
         // 1. Public routes skip validation entirely.
         if rule.token == TokenRequirement::None {

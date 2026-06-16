@@ -1,7 +1,8 @@
 //! Simple JWT-protected reverse proxy.
 //!
 //! Forwards all traffic to an upstream service, requiring a valid
-//! RFC 9068 JWT access token on every route except `/health`.
+//! RFC 9068 JWT access token on every route except `/health` and the
+//! `/public` subtree.
 //!
 //! # Usage
 //!
@@ -16,12 +17,14 @@
 //!   - `AUDIENCE` — Expected `aud` claim value (required)
 //!   - `UPSTREAM` — Upstream host:port (default: `127.0.0.1:3000`)
 //!   - `LISTEN`   — Listen address (default: `0.0.0.0:6188`)
+//!   - `CASE_INSENSITIVE_UPSTREAM` — if set, add case-folding to the
+//!     path-confusion model (for a case-insensitive upstream)
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl_pingora::{
-    resource::{AuthCtx, AuthProxy, Guard, Rule},
+    resource::{AuthCtx, AuthProxy, CaseSensitivity, Guard, PathConfusion, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
         validator::rfc9068::Rfc9068Validator,
@@ -96,9 +99,29 @@ async fn main() {
 
     let validator = build_validator(&issuer, &audience).await;
 
+    // Path-confusion protection is ON by default (`PathConfusion::RejectStructural`):
+    // a request carrying a structural byte (`%2F`, `..`, `;`, …) in a route position
+    // the table makes able to change which rule matches (`/x/../public/secret`,
+    // `/health%2f..%2fadmin`, …) is rejected with 400, while the raw path is still
+    // forwarded. You must declare whether the upstream folds case: if it routes
+    // case-insensitively (IIS, some filesystems), `Insensitive` stops `/Health` from
+    // dodging a rule (and requires routes to be registered in lowercase).
+    let case_sensitivity = if std::env::var("CASE_INSENSITIVE_UPSTREAM").is_ok() {
+        CaseSensitivity::Insensitive
+    } else {
+        CaseSensitivity::Sensitive
+    };
+
+    // Everything is protected by default (`Rule::required()`). `subtree` opens
+    // up a whole area of the URL space (a path and everything beneath it);
+    // `route` opens a single exact path.
     let guard = Guard::builder()
         .validator(validator)
-        .route("/health", Rule::public())
+        .case_sensitivity(case_sensitivity)
+        .subtree("/public", Rule::public()) // /public and everything under it
+        .route("/health", Rule::public()) // exactly /health
+        // RejectStructural is the default; PathConfusion::off() disables the guard.
+        .path_confusion(PathConfusion::reject_structural())
         .build()
         .expect("failed to build guard");
 

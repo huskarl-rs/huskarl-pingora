@@ -24,11 +24,17 @@ pub(crate) fn request_uri(
     let req_path = req_uri.path();
     let stripped = match strip_prefix {
         Some(prefix) => {
-            let Some(stripped) = req_path.strip_prefix(prefix) else {
-                log::warn!("strip_prefix {prefix:?} did not match request path {req_path:?}");
-                return None;
-            };
-            stripped
+            // Only strip when the prefix ends at a segment boundary, so that
+            // `/proxy` matches `/proxy` and `/proxy/...` but not `/proxyX`.
+            // A raw byte-prefix match would collapse `/proxyX` and `/proxy/X`
+            // onto the same reconstructed URI, weakening DPoP `htu` binding.
+            match req_path.strip_prefix(prefix) {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+                _ => {
+                    log::warn!("strip_prefix {prefix:?} did not match request path {req_path:?}");
+                    return None;
+                }
+            }
         }
         None => req_path,
     };
@@ -128,6 +134,26 @@ mod tests {
         let base = uri("https://api.example.com");
         let req = uri("/other/users");
         assert!(request_uri(Some(&base), Some("/proxy"), &req).is_none());
+    }
+
+    #[test]
+    fn strip_prefix_requires_segment_boundary() {
+        // `/proxyX` shares a byte prefix with `/proxy` but is a different path
+        // segment — it must NOT be stripped (a raw byte-prefix match would
+        // collapse it onto the same htu as `/proxy/X`).
+        let base = uri("https://api.example.com");
+        let req = uri("/proxyusers");
+        assert!(request_uri(Some(&base), Some("/proxy"), &req).is_none());
+    }
+
+    #[test]
+    fn strip_prefix_boundary_does_not_collide() {
+        // `/proxyX` is rejected, while `/proxy/X` reconstructs to `.../X`, so the
+        // two no longer map to the same reconstructed URI.
+        let base = uri("https://api.example.com");
+        assert!(request_uri(Some(&base), Some("/proxy"), &uri("/proxyX")).is_none());
+        let collide = request_uri(Some(&base), Some("/proxy"), &uri("/proxy/X")).unwrap();
+        assert_eq!(collide.to_string(), "https://api.example.com/X");
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::resource_server::validator::ValidatedRequest;
+use crate::{resource_server::validator::ValidatedRequest, route_tree::MethodMatch};
 
 /// What level of authentication a route requires.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -47,6 +47,8 @@ pub struct Rule<C> {
     pub(crate) scope_param: Option<String>,
     pub(crate) check: Option<CheckFn<C>>,
     pub(crate) strip_credentials: bool,
+    /// Which HTTP method(s) this rule applies to. Wildcard by default.
+    pub(crate) method: MethodMatch,
 }
 
 impl<C> Clone for Rule<C> {
@@ -58,6 +60,7 @@ impl<C> Clone for Rule<C> {
             scope_param: self.scope_param.clone(),
             check: self.check.clone(),
             strip_credentials: self.strip_credentials,
+            method: self.method.clone(),
         }
     }
 }
@@ -71,6 +74,7 @@ impl<C> Rule<C> {
             scope_param: None,
             check: None,
             strip_credentials: true,
+            method: MethodMatch::Any,
         }
     }
 
@@ -128,6 +132,14 @@ impl<C> Rule<C> {
     /// Adds a custom check function that runs after audience and scope checks.
     ///
     /// Return `Ok(())` to allow the request, or `Err(CheckError)` to deny it.
+    ///
+    /// # Build-time error
+    ///
+    /// Attaching a check to a [`public`](Self::public) rule is a configuration
+    /// error: the validator is never called for public routes, so the check
+    /// would never run. [`Guard::new`](crate::resource::Guard) returns
+    /// [`ConfigError::PublicRuleWithConstraints`](crate::resource::error::ConfigError)
+    /// if a public rule carries a check function.
     pub fn check(
         mut self,
         f: impl Fn(&ValidatedRequest<C>) -> Result<(), CheckError> + Send + Sync + 'static,
@@ -145,6 +157,31 @@ impl<C> Rule<C> {
         self.strip_credentials = strip;
         self
     }
+
+    /// Restricts this rule to a single HTTP method.
+    ///
+    /// By default a rule applies to **any** method. Scope it (e.g. `GET` public, `POST`
+    /// protected on the same path) by registering one rule per method. The method axis is
+    /// orthogonal to the path — it never affects which *path* matches.
+    ///
+    /// **Default-deny on the method axis:** registering any method-specific rule on a path
+    /// makes every *other* method on that path fall to the default rule. Add a wildcard
+    /// rule (no `.method()`) on the same path if you want a fallback policy for the rest;
+    /// note the fallback must be on *that* path — it is **not** inherited from a broader
+    /// catch-all.
+    ///
+    /// # Method confusion (your responsibility)
+    ///
+    /// The guard authorizes on the **request-line** method. If your backend rewrites the
+    /// method via override headers (`X-HTTP-Method-Override`, `_method`, …) or folds `HEAD`
+    /// into `GET`, a method-based distinction can be bypassed — strip those at your edge,
+    /// or don't draw method lines. A CORS preflight (`OPTIONS`, sent without credentials)
+    /// is a separate concern that belongs *above* this layer; do not rely on a method rule
+    /// to allow it through.
+    pub fn method(mut self, method: http::Method) -> Self {
+        self.method = MethodMatch::Only(method);
+        self
+    }
 }
 
 impl<C> Default for Rule<C> {
@@ -160,6 +197,7 @@ impl<C> std::fmt::Debug for Rule<C> {
             .field("audiences", &self.audiences)
             .field("scopes", &self.scopes)
             .field("strip_credentials", &self.strip_credentials)
+            .field("method", &self.method)
             .field("check", &self.check.as_ref().map(|_| ..))
             .finish_non_exhaustive()
     }

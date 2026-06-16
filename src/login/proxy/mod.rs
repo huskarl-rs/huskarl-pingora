@@ -7,8 +7,10 @@
 //! fallback for requests that never produce an upstream response.
 //!
 //! Per-path policy is configured via a routing DSL that mirrors the resource
-//! side's [`Guard`](crate::resource::Guard): `.route(pattern, LoginRule::…)`
-//! registers a [`LoginRule`] for paths matching a [`matchit`] pattern.
+//! side's [`Guard`](crate::resource::Guard). Register a [`LoginRule`] with
+//! [`subtree`](LoginProxyBuilder::subtree) to cover a path and everything
+//! beneath it (the usual choice), or [`route`](LoginProxyBuilder::route) for a
+//! single exact path.
 
 use std::sync::Arc;
 
@@ -17,7 +19,6 @@ use huskarl_login::{
     DefaultPersistFailurePolicy, PersistFailurePolicy, SessionDriver,
     engine::{LoadedSession, LoginEngine, LoginResponse, error_chain, is_cors_preflight},
 };
-use matchit::{InsertError, Router};
 use pingora_error::{
     Error,
     ErrorType::{HTTPStatus, InternalError},
@@ -30,6 +31,10 @@ use pingora_proxy_delegate::proxy_http_delegate;
 use super::{
     ctx::HasLoginSession,
     rule::{CheckError, LoginRule},
+};
+use crate::{
+    path_confusion::{CaseSensitivity, PathConfusion, StructuralClasses},
+    path_router::{RouteEntry, RuleRouter, RuleRouterError, next_rule_id},
 };
 
 #[cfg(test)]
@@ -74,7 +79,8 @@ mod tests;
 /// # use huskarl::core::crypto::cipher::AeadCipher;
 /// # use huskarl::grant::authorization_code::AuthorizationCodeGrant;
 /// # use huskarl_pingora::login::{
-/// #     HasLoginSession, LoginConfig, LoginEngine, LoginProxy, LoginRule, SessionDriver,
+/// #     CaseSensitivity, HasLoginSession, LoginConfig, LoginEngine, LoginProxy, LoginRule,
+/// #     SessionDriver,
 /// # };
 /// # use pingora_proxy::ProxyHttp;
 /// # fn build<P, SD>(
@@ -100,10 +106,13 @@ mod tests;
 /// let proxy = LoginProxy::builder()
 ///     .inner(my_upstream)
 ///     .engine(engine)
+///     .case_sensitivity(CaseSensitivity::Sensitive) // required: declare backend case behavior
 ///     // Defaults to `LoginRule::required()` for paths that don't match.
-///     .route("/health", LoginRule::public())
-///     .route("/", LoginRule::optional())
-///     .route("/dashboard/{*rest}", LoginRule::required())
+///     // `subtree` covers a path and everything beneath it; `route` is one
+///     // exact path.
+///     .subtree("/dashboard", LoginRule::required()) // /dashboard and below
+///     .route("/health", LoginRule::public()) // exactly /health
+///     .route("/", LoginRule::optional()) // exactly /
 ///     .build()
 ///     .expect("valid routes");
 /// # }
@@ -116,8 +125,7 @@ where
 {
     inner: P,
     engine: Arc<LoginEngine<SD>>,
-    router: Router<LoginRule<SD::SessionType>>,
-    default: LoginRule<SD::SessionType>,
+    routes: RuleRouter<LoginRule<SD::SessionType>>,
     persist_failure_policy: Box<dyn PersistFailurePolicy>,
 }
 
@@ -135,13 +143,16 @@ where
     /// consumer that needs engine primitives (for example, an inner-proxy
     /// handler that calls [`LoginEngine::redirect_to_login`] directly).
     ///
-    /// Route patterns use [`matchit`] syntax. Paths that match no registered
+    /// Route patterns use `matchit` syntax. Paths that match no registered
     /// route fall back to `default` (defaults to [`LoginRule::required`]).
     #[builder]
     pub fn new(
-        /// Per-route session policy. Patterns use [`matchit`] syntax.
+        /// Per-route session policy as `(pattern, rule, rule_id, opaque, method)` —
+        /// patterns from one route/subtree call share an id; `opaque` marks a blob_subtree
+        /// catch-all. Method differentiation is not yet exposed on `LoginRule`, so every
+        /// entry is method-wildcard.
         #[builder(field)]
-        routes: Vec<(String, LoginRule<SD::SessionType>)>,
+        routes: Vec<RouteEntry<LoginRule<SD::SessionType>>>,
         inner: P,
         engine: Arc<LoginEngine<SD>>,
         /// Fallback rule for paths that don't match any registered route.
@@ -149,6 +160,20 @@ where
         /// unless explicitly opened up.
         #[builder(default)]
         default: LoginRule<SD::SessionType>,
+        /// Whether the upstream resolves paths **case-insensitively** — a required
+        /// declaration the library cannot infer (see [`CaseSensitivity`]). There is no
+        /// default: every deployment must state it, because a case-folding backend
+        /// turns a differently-cased path into a route-confusion vector.
+        case_sensitivity: CaseSensitivity,
+        /// Which path-confusion guard to apply — denies requests whose path a
+        /// normalizing backend could route to a different rule than the one matched
+        /// on the raw path. Defaults to [`PathConfusion::RejectStructural`].
+        #[builder(default)]
+        path_confusion: PathConfusion,
+        /// The structural classes and encodings the guard recognises beyond the
+        /// always-on trio. Defaults to [`StructuralClasses::new`].
+        #[builder(default)]
+        structural_classes: StructuralClasses,
         /// Decides how to react when the post-response session persist fails.
         ///
         /// Defaults to [`DefaultPersistFailurePolicy`]: fail closed when the
@@ -162,17 +187,17 @@ where
         #[builder(default = Box::new(DefaultPersistFailurePolicy) as Box<dyn PersistFailurePolicy>)]
         persist_failure_policy: Box<dyn PersistFailurePolicy>,
     ) -> Result<Self, RouteConfigError> {
-        let mut rule_router = Router::new();
-        for (pattern, rule) in routes {
-            rule_router
-                .insert(&pattern, rule)
-                .map_err(|err| RouteConfigError::Route { pattern, err })?;
-        }
+        let routes = RuleRouter::build(
+            routes,
+            default,
+            path_confusion,
+            structural_classes,
+            case_sensitivity.is_insensitive(),
+        )?;
         Ok(Self {
             inner,
             engine,
-            router: rule_router,
-            default,
+            routes,
             persist_failure_policy,
         })
     }
@@ -185,12 +210,69 @@ where
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
     SD: SessionDriver + Send + Sync,
 {
-    /// Adds a route pattern with an associated [`LoginRule`].
+    /// Adds a single exact-match route pattern with an associated [`LoginRule`].
     ///
-    /// Patterns use [`matchit`] syntax (e.g. `/users/{id}`, `/static/{*rest}`).
+    /// Patterns use `matchit` syntax (e.g. `/users/{id}`, `/static/{*rest}`).
+    ///
+    /// This matches the given path *exactly* — `route("/dashboard", …)` does
+    /// not cover `/dashboard/` or `/dashboard/reports`. To apply a rule to a
+    /// path and everything beneath it (the usual intent), prefer
+    /// [`subtree`](Self::subtree).
     pub fn route(mut self, pattern: impl Into<String>, rule: LoginRule<SD::SessionType>) -> Self {
-        self.routes.push((pattern.into(), rule));
+        let id = next_rule_id(&self.routes);
+        let method = rule.method_match().clone();
+        self.routes.push((pattern.into(), rule, id, false, method));
         self
+    }
+
+    /// Applies a [`LoginRule`] to a path **and everything beneath it**.
+    ///
+    /// Mirrors `Guard::subtree` on the resource side (plain code span, not a link:
+    /// this module compiles without the `resource` feature). Matching only an exact
+    /// path (via [`route`](Self::route))
+    /// is a common source of gaps — a request to `/dashboard/` or
+    /// `/dashboard/reports` would otherwise fall through to the default rule.
+    ///
+    /// The path is expanded into the `matchit` patterns that cover the
+    /// subtree (each mapping to a clone of `rule`):
+    ///
+    /// - `subtree("/dashboard", …)`  covers `/dashboard`, `/dashboard/`, and
+    ///   `/dashboard/...`
+    /// - `subtree("/dashboard/", …)` covers `/dashboard/` and `/dashboard/...`
+    ///   — a trailing slash excludes the bare `/dashboard`.
+    /// - `subtree("/", …)` covers the entire path space.
+    ///
+    /// A more-specific [`route`](Self::route) still takes precedence over a
+    /// subtree's catch-all.
+    pub fn subtree(mut self, path: &str, rule: LoginRule<SD::SessionType>) -> Self {
+        self.push_subtree(path, rule, false);
+        self
+    }
+
+    /// Like [`subtree`](Self::subtree), but declares the subtree's catch-all tail an
+    /// **opaque** key space: structural bytes (`%2F`, `;`, `\`) *inside the key* are
+    /// tolerated rather than denied — for proxying opaque identifiers. Dot-segments
+    /// (`..`), NUL truncation, and case folding are **still** denied even in the blob.
+    ///
+    /// Registering a more-specific route or `subtree` *under* the blob is a build error.
+    pub fn blob_subtree(mut self, path: &str, rule: LoginRule<SD::SessionType>) -> Self {
+        self.push_subtree(path, rule, true);
+        self
+    }
+
+    /// Expand `path` into its subtree patterns under one rule id. Only the catch-all
+    /// pattern's `opaque` flag is honored downstream.
+    fn push_subtree(&mut self, path: &str, rule: LoginRule<SD::SessionType>, opaque: bool) {
+        let id = next_rule_id(&self.routes);
+        let mut patterns = crate::subtree_patterns(path).into_iter();
+        let method = rule.method_match().clone();
+        if let Some(first) = patterns.next() {
+            for pattern in patterns {
+                self.routes
+                    .push((pattern, rule.clone(), id, opaque, method.clone()));
+            }
+            self.routes.push((first, rule, id, opaque, method));
+        }
     }
 }
 
@@ -209,11 +291,6 @@ where
     pub fn engine(&self) -> &Arc<LoginEngine<SD>> {
         &self.engine
     }
-
-    /// Looks up the rule for `path`, falling back to the configured default.
-    fn rule_for(&self, path: &str) -> &LoginRule<SD::SessionType> {
-        self.router.at(path).map_or(&self.default, |m| m.value)
-    }
 }
 
 /// Errors that can occur when building a [`LoginProxy`]'s route table.
@@ -223,21 +300,53 @@ where
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RouteConfigError {
-    /// A route pattern was rejected by [`matchit`].
+    /// A route pattern could not be lowered into the route grammar — e.g. an in-segment
+    /// prefix/suffix parameter (`/v{ver}`, which the whole-segment grammar cannot
+    /// express), a non-final catch-all, or a conflict with another route.
     Route {
         /// The offending pattern.
         pattern: String,
-        /// The error returned by [`matchit::Router::insert`].
-        err: InsertError,
+        /// A human-readable reason.
+        reason: &'static str,
+    },
+    /// A registered pattern is non-canonical: it carries a structural byte (`%2F`,
+    /// `..`, `//`, `;`, or an enabled opt-in form) the path-confusion guard treats as
+    /// route structure, so a normalizing backend would never present it canonically
+    /// and the route is effectively dead. Register the canonical pattern, or disable
+    /// `path_confusion`.
+    NonCanonicalPattern {
+        /// The offending (non-canonical) pattern.
+        pattern: String,
+    },
+    /// A registered pattern contains ASCII uppercase but the backend is declared
+    /// [`CaseSensitivity::Insensitive`](crate::path_confusion::CaseSensitivity) — a
+    /// case-folding backend resolves it to lowercase, so a differently-cased request
+    /// could reach it (or it could shadow a lowercase route) without the matched rule's
+    /// checks. Register the route in lowercase.
+    NonCanonicalCasePattern {
+        /// The offending pattern.
+        pattern: String,
     },
 }
 
 impl std::fmt::Display for RouteConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Route { pattern, err } => {
-                write!(f, "invalid route pattern {pattern:?}: {err}")
+            Self::Route { pattern, reason } => {
+                write!(f, "invalid route pattern {pattern:?}: {reason}")
             }
+            Self::NonCanonicalPattern { pattern } => write!(
+                f,
+                "route pattern {pattern:?} is non-canonical — it carries a structural byte \
+                 (%2F, .., //, ;, …) the path-confusion guard treats as route structure, so \
+                 requests to it would always be denied; register the canonical pattern, or \
+                 disable path_confusion"
+            ),
+            Self::NonCanonicalCasePattern { pattern } => write!(
+                f,
+                "route pattern {pattern:?} contains uppercase but the backend is declared \
+                 case-insensitive; register it in lowercase (the form the backend resolves to)"
+            ),
         }
     }
 }
@@ -245,7 +354,21 @@ impl std::fmt::Display for RouteConfigError {
 impl std::error::Error for RouteConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Route { err, .. } => Some(err),
+            Self::Route { .. }
+            | Self::NonCanonicalPattern { .. }
+            | Self::NonCanonicalCasePattern { .. } => None,
+        }
+    }
+}
+
+impl From<RuleRouterError> for RouteConfigError {
+    fn from(e: RuleRouterError) -> Self {
+        match e {
+            RuleRouterError::Route { pattern, reason } => Self::Route { pattern, reason },
+            RuleRouterError::NonCanonical { pattern } => Self::NonCanonicalPattern { pattern },
+            RuleRouterError::NonCanonicalCase { pattern } => {
+                Self::NonCanonicalCasePattern { pattern }
+            }
         }
     }
 }
@@ -340,16 +463,24 @@ where
             return Ok(true);
         }
 
-        let rule = self.rule_for(uri.path());
+        let (_, rule) = self.routes.match_rule(uri.path(), &method);
+
+        // Path-confusion guard: reject paths a normalizing backend would route
+        // to a different rule than the one matched here.
+        if let Some(msg) = self.routes.ambiguous(uri.path()) {
+            let resp = self.engine.render_error(http::StatusCode::BAD_REQUEST, msg);
+            write_login_response(session, resp, vec![]).await?;
+            return Ok(true);
+        }
 
         // Public routes bypass session handling entirely; the others differ
         // only in whether a missing session is fatal, plus an optional check.
         let (required, check) = match rule {
-            LoginRule::Public => {
+            LoginRule::Public { .. } => {
                 return self.inner.request_filter(session, ctx).await;
             }
-            LoginRule::Optional { check } => (false, check),
-            LoginRule::Required { check } => (true, check),
+            LoginRule::Optional { check, .. } => (false, check),
+            LoginRule::Required { check, .. } => (true, check),
         };
 
         let loaded = match self.engine.load_session(&headers).await {

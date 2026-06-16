@@ -9,10 +9,17 @@
 //! authenticated, or requires a valid token — and can additionally enforce
 //! audience, scope, and custom checks.
 //!
+//! Register rules with [`Guard::builder`]: prefer
+//! [`subtree`](GuardBuilder::subtree) to protect a path and everything beneath
+//! it, and use [`route`](GuardBuilder::route) for a single exact path. See the
+//! [crate-level routing notes](crate#routing) for why the choice matters.
+//!
 //! # Features
 //!
-//! - **Path-based routing** — rules are matched using [`matchit`] patterns
-//!   (e.g. `/users/{id}`, `/public/*rest`).
+//! - **Path-based routing** — protect a path and all descendants with
+//!   [`subtree`](crate::resource::GuardBuilder::subtree), or match one exact
+//!   path with [`route`](crate::resource::GuardBuilder::route). Patterns use
+//!   `matchit` syntax (e.g. `/users/{id}`, `/public/{*rest}`).
 //! - **Scope enforcement** — requires tokens to carry specific scopes via the
 //!   [`HasScopes`] trait.
 //! - **`DPoP` support** — proof-of-possession tokens are validated and
@@ -43,3 +50,9 @@ pub use outcome::Outcome;
 pub use proxy::AuthProxy;
 pub use rule::{CheckError, Rule, TokenRequirement};
 pub use scopes::HasScopes;
+
+#[doc(no_inline)]
+pub use crate::path_confusion::{
+    CaseSensitivity, PathConfusion, StructuralChar, StructuralClasses, StructuralProbe,
+};
+pub use crate::route_tree::MethodMatch;

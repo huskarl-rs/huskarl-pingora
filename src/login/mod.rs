@@ -6,6 +6,12 @@
 //! requests are redirected through an Authorization Code Grant flow before
 //! reaching the inner proxy.
 //!
+//! Per-path policy is registered on [`LoginProxy::builder`]: prefer
+//! [`subtree`](LoginProxyBuilder::subtree) to apply a [`LoginRule`] to a path
+//! and everything beneath it, and use [`route`](LoginProxyBuilder::route) for a
+//! single exact path. See the [crate-level routing notes](crate#routing) for why
+//! the choice matters.
+//!
 //! Session management is built in via two modes:
 //!
 //! - **Cookie sessions** ([`CookieSessionStore`]) — encrypt the full session
@@ -45,5 +51,11 @@ pub use huskarl_login::{
     ConfigError, CookieSession, CookieSessionStore, DefaultPersistFailurePolicy, LoginConfig,
     LogoutConfig, PersistFailurePolicy, SessionError, StoreBackedSessionStore, engine::LoginEngine,
 };
-pub use proxy::{LoginProxy, RouteConfigError};
+pub use proxy::{LoginProxy, LoginProxyBuilder, RouteConfigError};
 pub use rule::{CheckError, LoginRule};
+
+#[doc(no_inline)]
+pub use crate::path_confusion::{
+    CaseSensitivity, PathConfusion, StructuralChar, StructuralClasses, StructuralProbe,
+};
+pub use crate::route_tree::MethodMatch;

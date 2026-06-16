@@ -36,7 +36,7 @@ use crate::{
 /// # Example
 ///
 /// ```
-/// # use huskarl_pingora::resource::{AuthProxy, Guard, Rule};
+/// # use huskarl_pingora::resource::{AuthProxy, CaseSensitivity, Guard, Rule};
 /// # fn build<V, P>(my_proxy: P, validator: V)
 /// # where
 /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -44,7 +44,8 @@ use crate::{
 /// # {
 /// let guard = Guard::builder()
 ///     .validator(validator)
-///     .route("/public/*rest", Rule::public())
+///     .case_sensitivity(CaseSensitivity::Sensitive)
+///     .subtree("/public", Rule::public()) // /public and everything under it
 ///     .build()
 ///     .expect("route");
 /// let proxy = AuthProxy::new(my_proxy, guard);
@@ -353,7 +354,9 @@ mod tests {
         validator: MockValidator,
         routes: Vec<(&str, Rule<MockClaims>)>,
     ) -> AuthProxy<InnerProxy, MockValidator> {
-        let mut builder = Guard::builder().validator(validator);
+        let mut builder = Guard::builder()
+            .validator(validator)
+            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive);
         for (pattern, rule) in routes {
             builder = builder.route(pattern, rule);
         }
