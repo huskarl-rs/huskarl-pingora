@@ -45,10 +45,14 @@ fn append_header(
 /// Writes the RFC 9728 protected resource metadata JSON response.
 ///
 /// Returns 200 OK with `content-type: application/json` and
-/// `cache-control: max-age=3600`.
+/// `cache-control: max-age=3600`. `Content-Length` always reflects the body
+/// size, but the body itself is only written when `include_body` is `true` —
+/// pass `false` for `HEAD` requests, which must carry the headers without a
+/// body.
 pub(crate) async fn write_resource_metadata_response(
     session: &mut Session,
     body: &bytes::Bytes,
+    include_body: bool,
 ) -> Result<(), Box<Error>> {
     let mut resp = build_response(200, 3)?;
     insert_header(
@@ -70,10 +74,14 @@ pub(crate) async fn write_resource_metadata_response(
         "failed to set cache-control header",
     )?;
 
-    session.write_response_header(Box::new(resp), false).await?;
     session
-        .write_response_body(Some(body.clone()), true)
+        .write_response_header(Box::new(resp), !include_body)
         .await?;
+    if include_body {
+        session
+            .write_response_body(Some(body.clone()), true)
+            .await?;
+    }
 
     Ok(())
 }
@@ -183,7 +191,7 @@ mod tests {
             make_session("GET", "/.well-known/oauth-protected-resource").await;
         let body = Bytes::from_static(b"{\"resource\":\"https://api.example.com\"}");
 
-        write_resource_metadata_response(&mut session, &body)
+        write_resource_metadata_response(&mut session, &body, true)
             .await
             .unwrap();
 
@@ -197,6 +205,36 @@ mod tests {
         assert_eq!(
             resp.headers.get("content-length").unwrap(),
             &body.len().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_response_head_omits_body_but_keeps_content_length() {
+        let (mut session, mut client) =
+            make_session("HEAD", "/.well-known/oauth-protected-resource").await;
+        let body = Bytes::from_static(b"{\"resource\":\"https://api.example.com\"}");
+
+        write_resource_metadata_response(&mut session, &body, false)
+            .await
+            .unwrap();
+
+        let resp = session.response_written().unwrap();
+        assert_eq!(resp.status.as_u16(), 200);
+        // Content-Length still advertises the full body size, per HTTP HEAD semantics.
+        assert_eq!(
+            resp.headers.get("content-length").unwrap(),
+            &body.len().to_string()
+        );
+
+        // No body bytes are written for HEAD. Read whatever was sent to the
+        // client and assert the JSON document is absent.
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let sent = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            !sent.contains("\"resource\""),
+            "HEAD response must not include the body, got: {sent:?}"
         );
     }
 

@@ -137,7 +137,8 @@ where
         {
             let method = &session.req_header().method;
             if method == http::Method::GET || method == http::Method::HEAD {
-                write_resource_metadata_response(session, body).await?;
+                let include_body = method == http::Method::GET;
+                write_resource_metadata_response(session, body, include_body).await?;
             } else {
                 write_method_not_allowed(session, "GET, HEAD").await?;
             }
