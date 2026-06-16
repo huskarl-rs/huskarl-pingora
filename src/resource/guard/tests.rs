@@ -1,3 +1,6 @@
+// Mock trait impls satisfy `async fn` signatures without awaiting.
+#![allow(clippy::unused_async_trait_impl)]
+
 use std::sync::Mutex;
 
 use super::*;

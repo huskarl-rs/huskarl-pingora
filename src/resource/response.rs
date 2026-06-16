@@ -169,7 +169,7 @@ pub(crate) async fn write_method_not_allowed(
 mod tests {
     use bytes::Bytes;
     use pingora_proxy::Session as ProxySession;
-    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
 
@@ -228,7 +228,6 @@ mod tests {
 
         // No body bytes are written for HEAD. Read whatever was sent to the
         // client and assert the JSON document is absent.
-        use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 4096];
         let n = client.read(&mut buf).await.unwrap();
         let sent = String::from_utf8_lossy(&buf[..n]);

@@ -4,6 +4,9 @@
 //! loading, gating, and persistence. The OAuth flow itself (callback,
 //! refresh, expiry checks) is exercised in `huskarl-login`'s engine tests.
 
+// Mock trait impls satisfy `async fn` signatures without awaiting.
+#![allow(clippy::unused_async_trait_impl)]
+
 use std::{
     convert::Infallible,
     sync::{Arc, Mutex},
