@@ -106,9 +106,9 @@ impl<C> Rule<C> {
         self
     }
 
-    /// Requires that the token's `audience` contains at least one of the given values.
+    /// Adds multiple required audiences at once — like
+    /// [`audience`](Self::audience), but accepts an iterator.
     ///
-    /// Convenience method for adding multiple audiences at once.
     /// If none match, the request is denied with 401 `invalid_token`.
     pub fn audiences(mut self, audiences: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.audiences.extend(audiences.into_iter().map(Into::into));

@@ -22,6 +22,46 @@
 //! framework routes the decoded one has reintroduced the very same differential inside
 //! a single process. The guarantee is "one parser," not "one binary."
 //!
+//! # The guard never rewrites the path — and that is the point
+//!
+//! The guard only ever *denies* or *forwards the raw bytes unchanged*; it never
+//! normalizes the path it sends upstream. This is not a missing feature — normalizing
+//! would be **actively worse**, and for the same reason the topology is hard to reason
+//! about in the first place.
+//!
+//! Forwarding raw keeps the differential surface at exactly **one parser pair**: *how
+//! this layer routed these bytes* versus *how the backend parses these bytes*. Normalize
+//! before forwarding and you get **two**: *client bytes → your normalization*, then *your
+//! output → the backend's parse*. You have not removed the differential, you have added
+//! one — and the new one is between your normalizer and a backend you have already
+//! conceded you cannot fully characterize (that is why, e.g.,
+//! [`with_double_decode`](StructuralClasses::with_double_decode) is a declaration, not an
+//! inference). Picking a normalization is choosing how many times to decode *on the
+//! backend's behalf* without knowing how many decoders sit downstream; get it wrong by
+//! one and you have *built* the CVE-2025-0108 chain rather than detected it. The honest
+//! response to "I cannot count the layers" is to refuse ambiguous input
+//! ([`reject_non_canonical`](PathConfusion::reject_non_canonical)), never to guess a
+//! rewrite and hope it matches.
+//!
+//! Rewriting is also **non-local**: a guard that forwards raw is byte-transparent, so
+//! every other element in the chain — a downstream WAF, a cache keying on the URL, the
+//! origin's own path defenses, the audit log — reasons about exactly what the client
+//! sent, and this layer's presence is invisible to their analysis. The moment it
+//! normalizes, it becomes a transform every neighbour must now model: a downstream WAF
+//! tuned against client traffic sees a changed input distribution, a cache's key space
+//! shifts (the machinery of cache deception), and forensics logs the laundered path
+//! instead of the probe. Identity-on-the-bytes is the one transform that composes safely
+//! across an arbitrary chain — N transparent hops still equal one canonical input, rather
+//! than an N-deep pipeline whose every seam is a candidate bypass. (This is why a
+//! security parser must reject [Postel's law](https://en.wikipedia.org/wiki/Robustness_principle):
+//! being "helpful" by canonicalizing is the source of the bug class, not a mitigation.)
+//!
+//! Finally, detection preserves the lattice. Every knob here is safe in one direction —
+//! tightening can only ever deny *more* (see [the monotonicity note](#making-the-decision)).
+//! A rewrite breaks that: it can *change* which bytes reach the backend, not merely gate
+//! them, so it cannot sit anywhere on the deny-more axis. There is deliberately no rung
+//! that says "transform it for them."
+//!
 //! This module holds the *configuration*:
 //!
 //! - [`PathConfusion`] selects the mode (the default positional reject, the strict
@@ -175,8 +215,8 @@
 //!   [`StructuralClasses::with_probe`] for it or a release ships it.
 //! - **Path only.** Query and fragment are never examined; rules match on the path.
 //! - **Detection, not sanitisation.** The guard denies or forwards the **raw** bytes; it
-//!   never normalises the path it sends upstream. That is deliberate — normalising would
-//!   just introduce a fresh differential between the guard and the backend.
+//!   never normalises the path it sends upstream. This is deliberate and load-bearing,
+//!   not a gap — see [The guard never rewrites the path](#the-guard-never-rewrites-the-path--and-that-is-the-point).
 //! - **Not a WAF.** The guard equalises *routing* — it ensures the rule you authorized
 //!   is the rule the backend serves. It does not inspect content for injection, and it
 //!   does not protect the backend from its *own* path-handling bugs beyond denying the
@@ -226,6 +266,43 @@
 //! default — it refuses every non-canonical path outright, trading availability for
 //! certainty.
 //!
+//! # One configuration, because this layer cannot see the upstream
+//!
+//! The structural configuration is set once, for the whole guard, and that is a
+//! consequence of *where this layer sits*, not a missing knob. The guard runs at
+//! authorization time — **before** upstream selection, which happens lower down (the inner
+//! proxy's peer choice) and may key on the host, headers, or its own routing, not just the
+//! path. So this layer has an *authz* route table; it does **not** have, and cannot verify,
+//! the binding from a request to the backend that will actually serve it.
+//!
+//! That is exactly why a single configuration is the safe one: the global profile is
+//! correct over **every** upstream a request might reach — it is the worst case across all
+//! of them, and the worst case holds no matter where the request is routed. The required
+//! [`CaseSensitivity`] declaration and the [`StructuralClasses`] toggles are facts you
+//! assert about *the backends behind you, collectively*; the guard then applies them
+//! everywhere because it cannot tell which one any given request will hit.
+//!
+//! It is tempting to want per-route (≈ per-upstream) profiles — "stop applying IIS rules to
+//! my Unix zone" — but the line between safe and unsafe refinement is the line between
+//! tightening and relaxing, and it is drawn by this layer's blindness to the upstream:
+//!
+//! - **Tightening a specific rule is always sound.** Attaching *extra* strictness (or a
+//!   custom check) to one rule, as an approximate stand-in for "I think this area talks to
+//!   a nastier backend," can only ever deny more — so a wrong approximation costs
+//!   false-positive `400`s, never a bypass, whatever upstream the traffic truly hits.
+//! - **Relaxing a specific rule is the dangerous direction**, because it is the only one
+//!   that *depends* on the rule→upstream binding being what you assumed — and this layer
+//!   cannot confirm it. "This zone is Unix, stop checking `\`" becomes a clean relocation
+//!   bypass the moment any of that zone's traffic is routed to a Windows backend. Unlike
+//!   `blob_subtree` — whose relaxation is **bounded** (it still denies `..`, NUL, and case,
+//!   so even misuse cannot escape the blob) — a structural-class relaxation has no residual
+//!   floor: a wrong guess is a straight hole.
+//!
+//! So the global strict profile is not a limitation to be refined away; it is the only
+//! setting that does not rest on something this layer structurally cannot know. Refine
+//! *upward* per rule if you must (it stays within the deny-more lattice); never refine
+//! downward on the strength of an upstream you cannot see.
+//!
 //! Whether you register a rule with `subtree`, `blob_subtree`, or `route` is a related
 //! security decision, documented at [the crate root](crate) and on the builder methods.
 
@@ -253,10 +330,7 @@ pub enum PathConfusion {
     /// live (the table is not consulted). Strict hygiene / defense in depth: refuses
     /// `..`, `//`, encoded separators, etc. outright, even where they wouldn't change
     /// the matched rule — so it also rejects legitimate encoded content (e.g. blob
-    /// keys). Opt in deliberately. Denies the structural classes the configured
-    /// [`StructuralClasses`] enable — the default `%2F`/dot/`;` trio, plus the opt-in
-    /// classes (`\`, case, NUL) and alternate encodings (overlong UTF-8,
-    /// double-percent) when those are configured.
+    /// keys). Opt in deliberately. Honors the configured [`StructuralClasses`].
     RejectNonCanonical,
     /// Disable the guard entirely.
     Off,

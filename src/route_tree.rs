@@ -203,8 +203,9 @@ fn lower_segment(seg: &str) -> Result<SegLower, LowerError> {
     // Param names contain no braces, so the next `}` closes the group.
     let close = open
         + 1
-        + b[open + 1..]
+        + b
             .iter()
+            .skip(open + 1)
             .position(|&c| c == b'}')
             .ok_or(LowerError::MalformedParam)?;
     // A whole-segment param spans the entire segment; anything else is prefix/suffix.
@@ -229,10 +230,11 @@ fn unescape_braces(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        out.push(b[i]);
+        let Some(&cur) = b.get(i) else { break };
+        out.push(cur);
         i += usize::from(
-            (b[i] == b'{' && b.get(i + 1) == Some(&b'{'))
-                || (b[i] == b'}' && b.get(i + 1) == Some(&b'}')),
+            (cur == b'{' && b.get(i + 1) == Some(&b'{'))
+                || (cur == b'}' && b.get(i + 1) == Some(&b'}')),
         ) + 1;
     }
     String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
@@ -604,13 +606,11 @@ const MAX_PATH_LEN: usize = 8192;
 /// patterns are canonical, any structural byte in a matched path necessarily falls in a
 /// capture, so the no-opaque case needs no tree walk at all.
 ///
-/// Two checks compose, mirroring the existing guard: the **positional** verdict above and
-/// a **content-decode** verdict that decodes the path, re-routes it through the same
-/// [`Router`], and denies a relocation onto a different rule (`/%61dmin` → `/admin`).
-///
-/// Not yet ported from the legacy `RuleRouter` (deferred to integration): custom
-/// break-glass probes, and the build-time non-canonical-pattern / uppercase-pattern
-/// rejection.
+/// Two checks compose: the **positional** verdict above and a **content-decode** verdict
+/// that decodes the path, re-routes it through the same [`Router`], and denies a
+/// relocation onto a different rule (`/%61dmin` → `/admin`). Custom break-glass probes add
+/// a third check; the build-time non-canonical/uppercase-pattern rejection lives in
+/// `path_router`'s build step.
 pub(crate) struct StructuralGuard {
     router: Router,
     mode: PathConfusion,
@@ -654,7 +654,7 @@ impl StructuralGuard {
     }
 
     /// The deny reason for `path`, or `None` to allow — the message-returning core used
-    /// by the router. Mirrors the legacy guard's static reason strings.
+    /// by the router. The reason is a static string suitable for the denial response.
     pub(crate) fn verdict(&self, path: &str) -> Option<&'static str> {
         match self.mode {
             PathConfusion::Off => None,
@@ -808,11 +808,12 @@ fn percent_decode_once(path: &str) -> Option<String> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        let Some(&cur) = b.get(i) else { break };
         if let Some(byte) = crate::percent::byte_at(b, i) {
             out.push(byte);
             i += 3;
         } else {
-            out.push(b[i]);
+            out.push(cur);
             i += 1;
         }
     }

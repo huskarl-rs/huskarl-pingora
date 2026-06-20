@@ -740,6 +740,35 @@ async fn method_wildcard_fallback_is_per_terminal() {
     ));
 }
 
+#[tokio::test]
+async fn method_axis_falls_to_default_rule_not_the_method_rule() {
+    // Documented sharp edge (see `Rule::method`): a method-specific rule does NOT protect
+    // other methods on its path — they fall to the *default* rule, never inheriting the
+    // method rule's policy. Here the default is permissive, so scoping the protection to
+    // POST silently leaves GET open. This pins the fall-through target as the default (the
+    // dangerous direction the catch-all tests above don't exercise, since their default is
+    // the implicit `required`).
+    let guard = Guard::builder()
+        .validator(MockValidator::no_token())
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .default(Rule::public()) // permissive fallback
+        .route("/admin", Rule::required().method(http::Method::POST)) // only POST is protected
+        .build()
+        .unwrap();
+
+    // POST /admin → its method rule → required → 401 without a token.
+    assert!(matches!(
+        check(&guard, &http::Method::POST, "/admin").await,
+        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
+    ));
+    // GET /admin → no GET rule at /admin → the *default* (public), NOT the POST rule.
+    // The protection scoped to POST does not extend to GET.
+    assert!(matches!(
+        check(&guard, &http::Method::GET, "/admin").await,
+        Outcome::Forward { token: None, .. }
+    ));
+}
+
 #[test]
 fn blob_subtree_with_nested_route_is_build_error() {
     // A more-specific route under the blob would let a structural byte relocate into it.

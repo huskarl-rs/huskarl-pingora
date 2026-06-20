@@ -27,9 +27,10 @@ use crate::{
 /// A decorator that wraps a [`ProxyHttp`] implementation to add OAuth 2.0
 /// token validation via a [`Guard`].
 ///
-/// `AuthProxy` intercepts `request_filter` to validate tokens and
-/// `response_filter` to insert `DPoP-Nonce` headers. All other `ProxyHttp`
-/// methods delegate directly to the inner proxy.
+/// Build it with [`new`](Self::new) (and optionally
+/// [`resource_metadata`](Self::resource_metadata) to serve RFC 9728
+/// protected-resource metadata); all `ProxyHttp` methods not involved in
+/// validation delegate to the inner proxy.
 ///
 /// The inner proxy's context type must implement [`HasAuthState<V::Claims>`].
 ///

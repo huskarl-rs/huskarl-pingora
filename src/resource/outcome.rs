@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use crate::resource_server::validator::ValidatedRequest;
 
-/// The low-level result of [`Guard::check`](super::Guard::check).
+/// The low-level result of [`Guard::check`](super::Guard::check): forward the
+/// request, or deny it (the caller writes the deny response).
 ///
 /// The `Debug` impl intentionally omits token internals.
 pub enum Outcome<C> {

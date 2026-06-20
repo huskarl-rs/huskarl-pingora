@@ -1,7 +1,11 @@
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 #![warn(clippy::pedantic)]
-#![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! Pingora integration for huskarl.
@@ -61,8 +65,8 @@
 //! for your backend — see the
 //! [`path_confusion`](path_confusion#how-the-guard-decides) module.
 //!
-//! The guard, selected with [`PathConfusion`](path_confusion::PathConfusion), denies a
-//! structural byte wherever a wildcard or catch-all captures it. To proxy opaque keys
+//! The guard, whose mode is selected with [`PathConfusion`](path_confusion::PathConfusion),
+//! denies a structural byte wherever a wildcard or catch-all captures it. To proxy opaque keys
 //! that legitimately contain encoded separators, opt the tail in explicitly with
 //! `blob_subtree` (see below) — it is never inferred from table shape.
 //!

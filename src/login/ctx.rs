@@ -74,8 +74,9 @@ pub trait HasLoginSession<S> {
 /// Convenience context wrapper that bundles login state with an inner user
 /// context.
 ///
-/// Similar to `AuthCtx` for resource-server proxies. Access inner context
-/// fields via `ctx.inner`.
+/// Auto-implements [`HasLoginSession`] over the inner context — use it when your
+/// proxy needs no context of its own, or to add login to an existing type without
+/// implementing the trait yourself. Access the inner context via `ctx.inner`.
 pub struct LoginCtx<T, S> {
     /// The inner user-defined context.
     pub inner: T,

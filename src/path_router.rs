@@ -1,4 +1,4 @@
-//! Shared rule-id router and path-confusion guard.
+//! Shared rule-id router that owns the path-confusion guard.
 //!
 //! Both the resource [`Guard`](crate::resource::Guard) and the login
 //! [`LoginProxy`](crate::login::LoginProxy) map request paths to per-path rules and need
@@ -146,7 +146,11 @@ impl<R> RuleRouter<R> {
     /// rule and [`DEFAULT_RULE_ID`].
     pub(crate) fn match_rule(&self, path: &str, method: &http::Method) -> (u32, &R) {
         match self.guard.resolve(path, method) {
-            Some(id) => (id, &self.rules[id as usize]),
+            // Fail closed if an id ever falls outside `rules`, rather than panicking.
+            Some(id) => match self.rules.get(id as usize) {
+                Some(rule) => (id, rule),
+                None => (DEFAULT_RULE_ID, &self.default),
+            },
             None => (DEFAULT_RULE_ID, &self.default),
         }
     }

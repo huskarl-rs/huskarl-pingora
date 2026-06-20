@@ -194,6 +194,9 @@ pub(crate) fn classes_present(path: &str, enabled: ClassSet, enc: Encodings) -> 
     let b = path.as_bytes();
     let mut i = 0;
     while i < b.len() {
+        // `i < b.len()` is the loop invariant, so this never breaks; reading via
+        // `get` keeps the scan panic-free under `deny(clippy::indexing_slicing)`.
+        let Some(&cur) = b.get(i) else { break };
         // Fullwidth-form confusables (`／`·`．`·`；`·`＼`, raw or percent-encoded) flag the
         // class they NFKC-fold to, when the unicode encoding is enabled.
         if enc.unicode
@@ -207,7 +210,7 @@ pub(crate) fn classes_present(path: &str, enabled: ClassSet, enc: Encodings) -> 
                 _ => {}
             }
         }
-        match b[i] {
+        match cur {
             b';' => found.insert(ClassSet::PARAM),
             b'\\' => found.insert(ClassSet::BACKSLASH),
             b'A'..=b'Z' => found.insert(ClassSet::CASE),
@@ -304,12 +307,13 @@ fn has_dot_segment(path: &str, enabled: ClassSet, enc: Encodings) -> bool {
 
     let mut i = 0;
     while i < b.len() {
+        let Some(&cur) = b.get(i) else { break };
         // Classify this position: a literal `/` or `;` first (cheap), else any enabled
         // encoded separator / param / backslash form via `delimiter_at`. The byte returned
         // is always `/` (separator) or `;` (param introducer).
-        let delim = if b[i] == b'/' {
+        let delim = if cur == b'/' {
             Some((b'/', 1))
-        } else if param && b[i] == b';' {
+        } else if param && cur == b';' {
             Some((b';', 1))
         } else {
             delimiter_at(b, i, sep, back, param, enc)
@@ -334,7 +338,7 @@ fn has_dot_segment(path: &str, enabled: ClassSet, enc: Encodings) -> bool {
             _ => {
                 if !in_param {
                     bare_len += 1;
-                    bare_dots += usize::from(b[i] == b'.');
+                    bare_dots += usize::from(cur == b'.');
                 }
                 i += 1;
             }
@@ -397,7 +401,7 @@ fn delimiter_at(
         _ => {}
     }
     // Literal backslash.
-    if back && b[i] == b'\\' {
+    if back && b.get(i) == Some(&b'\\') {
         return Some((b'/', 1));
     }
     None

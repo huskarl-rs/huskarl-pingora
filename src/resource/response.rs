@@ -303,6 +303,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn challenge_with_crlf_does_not_split_response() {
+        // Header-injection safety. An application-supplied `CheckError` description flows
+        // into the `error_description` quoted-string of a WWW-Authenticate challenge; the
+        // upstream quoted-string escaper handles `"`/`\` but NOT CR/LF. The sole remaining
+        // line of defense is the `http` crate's `HeaderValue` validator, which rejects
+        // control bytes — so a challenge carrying a raw CRLF + a forged header must fail
+        // the write rather than split the response. This pins that guarantee at the crate
+        // boundary so an `http`-crate behavior change can't silently reopen it.
+        let (mut session, _client) = make_session("GET", "/admin").await;
+        let malicious = "Bearer error=\"insufficient_scope\", \
+             error_description=\"nope\r\nInjected-Header: evil\""
+            .to_owned();
+
+        let result = write_challenge_response(
+            &mut session,
+            http::StatusCode::FORBIDDEN,
+            &[malicious],
+            None,
+        )
+        .await;
+
+        // Fail closed: the CRLF value is rejected and nothing is committed downstream —
+        // no split, no injected header.
+        assert!(
+            result.is_err(),
+            "CRLF-bearing challenge must be rejected, not written"
+        );
+        assert!(
+            session.response_written().is_none(),
+            "no response header may reach the client"
+        );
+    }
+
+    #[tokio::test]
     async fn method_not_allowed_response() {
         let (mut session, _client) =
             make_session("POST", "/.well-known/oauth-protected-resource").await;

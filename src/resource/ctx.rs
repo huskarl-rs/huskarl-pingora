@@ -68,12 +68,10 @@ pub trait HasAuthState<C> {
 
 /// Convenience context wrapper that bundles auth state with an inner user context.
 ///
-/// [`AuthProxy`](super::AuthProxy) no longer requires this type — it works with
-/// any context implementing [`HasAuthState`] directly. This wrapper is provided
-/// for cases where you want to add auth to an existing context type without
-/// modifying it.
-///
-/// Access inner context fields via `ctx.inner`.
+/// Use it to add auth to an existing context type without implementing
+/// [`HasAuthState`] yourself: [`AuthProxy`](super::AuthProxy) accepts any context
+/// implementing [`HasAuthState`], and this wrapper provides it over `inner`.
+/// Access the inner context fields via `ctx.inner`.
 pub struct AuthCtx<T, C = ()> {
     token: Option<Arc<ValidatedRequest<C>>>,
     dpop_nonce: Option<String>,

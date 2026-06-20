@@ -16,7 +16,6 @@ cargo-reedme: info-end -->
 Pingora integration for huskarl.
 
 This crate provides two independent feature-gated modules:
-
 - **`resource`** — OAuth 2.0 resource-server (bearer token) protection via [`resource::AuthProxy`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/resource/proxy/struct.AuthProxy.html) and [`resource::Guard`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/resource/guard/struct.Guard.html).
 - **`login`** — OAuth 2.0 Authorization Code Grant login layer via [`login::LoginProxy`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/login/proxy/struct.LoginProxy.html).
 
@@ -62,8 +61,8 @@ algorithm — what each check covers, what it does **not**, and how to configure
 for your backend — see the
 [`path_confusion`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/) module.
 
-The guard, selected with [`PathConfusion`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.PathConfusion.html), denies a
-structural byte wherever a wildcard or catch-all captures it. To proxy opaque keys
+The guard, whose mode is selected with [`PathConfusion`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.PathConfusion.html),
+denies a structural byte wherever a wildcard or catch-all captures it. To proxy opaque keys
 that legitimately contain encoded separators, opt the tail in explicitly with
 `blob_subtree` (see below) — it is never inferred from table shape.
 

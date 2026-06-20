@@ -111,7 +111,7 @@ impl From<crate::path_router::RuleRouterError> for ConfigError {
     }
 }
 
-/// Helper for invalid request URI errors.
+/// Builds an RFC 6750 `invalid_request` client error from a static description.
 pub(crate) struct InvalidRequest(pub &'static str);
 
 impl ToRfc6750Error for InvalidRequest {
@@ -128,7 +128,7 @@ impl ToRfc6750Error for InvalidRequest {
     }
 }
 
-/// Helper for audience-mismatch errors.
+/// Builds an RFC 6750 `invalid_token` client error from a static description.
 pub(crate) struct InvalidToken(pub &'static str);
 
 impl ToRfc6750Error for InvalidToken {
@@ -145,7 +145,7 @@ impl ToRfc6750Error for InvalidToken {
     }
 }
 
-/// Helper for custom check errors.
+/// Builds a client error with a custom RFC 6750 code and description.
 pub(crate) struct CustomCheckError {
     pub code: TokenErrorCode,
     pub description: String,

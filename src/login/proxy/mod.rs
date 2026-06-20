@@ -66,6 +66,23 @@ mod tests;
 ///   inside [`LoginEngine::load_session`], so what's at stake here is an
 ///   activity touch or a retry of a failed eager persist.)
 ///
+/// # Session cookie forwarding (known limitation)
+///
+/// Unlike the resource side, which strips the `Authorization`/`DPoP` credentials
+/// before the upstream, this proxy forwards the inbound `Cookie` header
+/// **unchanged** — so the session cookie reaches the upstream. This is low
+/// severity: the session cookie is sealed with the proxy's AEAD cipher and marked
+/// `HttpOnly` / `__Host-`, so it is opaque to a backend that does not share the
+/// cipher, and identity is delivered to the application through the session object
+/// in the context, not the cookie. The cost is essentially bandwidth.
+///
+/// It is not stripped today only because, unlike a dedicated `Authorization`
+/// header, the session lives *inside* a shared `Cookie` header alongside the
+/// application's own cookies — and, for cookie-backed sessions, across a family of
+/// chunk (`{name}.N`) and kid-sidecar (`{name}.kid`) cookies — so removing it means
+/// parsing and rebuilding the header rather than dropping it. Revisit if the
+/// upstream is not fully trusted.
+///
 /// # Type parameters
 ///
 /// - `P` — inner proxy implementing [`ProxyHttp`]
@@ -127,6 +144,7 @@ where
     engine: Arc<LoginEngine<SD>>,
     routes: RuleRouter<LoginRule<SD::SessionType>>,
     persist_failure_policy: Box<dyn PersistFailurePolicy>,
+    cors_passthrough: bool,
 }
 
 #[bon::bon]
@@ -186,6 +204,24 @@ where
         /// body, so the request is failed with that status instead.
         #[builder(default = Box::new(DefaultPersistFailurePolicy) as Box<dyn PersistFailurePolicy>)]
         persist_failure_policy: Box<dyn PersistFailurePolicy>,
+        /// Whether to pass CORS preflight requests — `OPTIONS` carrying an
+        /// `Access-Control-Request-Method` header — straight to the inner proxy,
+        /// bypassing session loading, the per-route [`LoginRule`], and the
+        /// path-confusion guard.
+        ///
+        /// Defaults to `true`. A browser sends a preflight **without** credentials,
+        /// so no session cookie reaches us and there is no authorization decision to
+        /// make: the preflight only negotiates CORS, which belongs to the inner proxy
+        /// or a dedicated CORS filter, not this login layer. Path confusion likewise
+        /// has nothing to protect here — it equalizes which *authz rule* serves a path,
+        /// and a credential-less preflight selects no rule.
+        ///
+        /// Set to `false` to instead route preflights through the normal flow (engine
+        /// route handlers, rule lookup, path-confusion guard, session loading) — e.g.
+        /// when a `required` route should refuse them outright rather than let the
+        /// inner proxy answer.
+        #[builder(default = true)]
+        cors_passthrough: bool,
     ) -> Result<Self, RouteConfigError> {
         let routes = RuleRouter::build(
             routes,
@@ -199,6 +235,7 @@ where
             engine,
             routes,
             persist_failure_policy,
+            cors_passthrough,
         })
     }
 }
@@ -442,9 +479,11 @@ where
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let req = session.req_header();
 
-        // CORS preflight: browsers strip credentials, so a session cookie
-        // would never reach us. Let the inner proxy handle these directly.
-        if is_cors_preflight(&req.method, &req.headers) {
+        // CORS preflight: browsers strip credentials, so a session cookie would never
+        // reach us and there is no authz rule to select — path confusion has nothing to
+        // protect. Let the inner proxy handle these directly, unless the deployment opts
+        // out and wants preflights routed through the normal flow.
+        if self.cors_passthrough && is_cors_preflight(&req.method, &req.headers) {
             return self.inner.request_filter(session, ctx).await;
         }
 

@@ -514,6 +514,36 @@ async fn cors_preflight_passes_through() {
     assert!(proxy.inner.was_forwarded());
 }
 
+#[tokio::test]
+async fn cors_preflight_not_passed_through_when_disabled() {
+    // With cors_passthrough(false) a preflight is subject to the normal flow: the
+    // default `required` rule has no session, so the engine gates it instead of
+    // letting it reach the inner proxy.
+    let engine = Arc::new(
+        huskarl_login::engine::LoginEngine::builder()
+            .config(default_config())
+            .grant(test_grant().await)
+            .session_store(MockSessionDriver::default())
+            .cipher(test_cipher().await)
+            .build(),
+    );
+    let proxy = LoginProxy::builder()
+        .inner(InnerProxy::new())
+        .engine(engine)
+        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .cors_passthrough(false)
+        .build()
+        .expect("valid routes");
+    let (mut s, _c) =
+        make_session("OPTIONS", "/api", "Access-Control-Request-Method: POST\r\n").await;
+    let mut ctx = proxy.inner.new_ctx();
+
+    let handled = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
+
+    assert!(handled, "preflight gated by the required rule");
+    assert!(!proxy.inner.was_forwarded());
+}
+
 // ── Callback handling delegates to engine ────────────────────────
 
 #[tokio::test]
