@@ -314,10 +314,16 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
 
 impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// Builds a `400 Bad Request` deny outcome with an `invalid_request` challenge.
-    fn bad_request(&self, msg: &'static str, scope_param: Option<&str>) -> Outcome<V::Claims> {
+    ///
+    /// Deliberately carries no `scope` hint: the 400s built here are pre-auth,
+    /// rule-independent refusals (an ambiguous path, an unreconstructable URI), so the
+    /// matched rule's scope is a binding the guard has just declined to trust —
+    /// advertising it would misdirect clients into a futile re-auth and hand a prober
+    /// the route table's policy layout.
+    fn bad_request(&self, msg: &'static str) -> Outcome<V::Claims> {
         let challenges = self
             .metadata
-            .challenges(Some(&InvalidRequest(msg)), scope_param, None);
+            .challenges(Some(&InvalidRequest(msg)), None, None);
         Outcome::Deny {
             status: http::StatusCode::BAD_REQUEST,
             challenges,
@@ -411,7 +417,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 
         // 0. Path-confusion guard: reject ambiguous paths before any work.
         if let Some(msg) = self.routes.ambiguous(path) {
-            return self.bad_request(msg, scope_param);
+            return self.bad_request(msg);
         }
 
         // 1. Public routes skip validation entirely.
@@ -426,16 +432,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         // 2. Call the validator.
         let Some(full_uri) = request_uri(self.base_uri.as_ref(), self.strip_prefix.as_deref(), uri)
         else {
-            let challenges = self.metadata.challenges(
-                Some(&InvalidRequest("Invalid request URI")),
-                scope_param,
-                None,
-            );
-            return Outcome::Deny {
-                status: http::StatusCode::BAD_REQUEST,
-                challenges,
-                dpop_nonce: None,
-            };
+            return self.bad_request("Invalid request URI");
         };
 
         let result = self

@@ -656,6 +656,71 @@ async fn guard_denies_path_param_vector() {
 }
 
 #[tokio::test]
+async fn guard_400_challenges_carry_no_scope_hint() {
+    // The pre-auth 400s (ambiguous path, unreconstructable URI) are rule-independent
+    // refusals: the guard has just declined to trust the path→rule binding, so the
+    // matched rule's scope must not be advertised — no token will make the request
+    // acceptable, and the hint hands a prober the route table's policy layout. The
+    // scope hint belongs to post-routing denials, pinned here against the 403.
+    fn deny_parts(outcome: Outcome<MockClaims>) -> (Option<http::StatusCode>, Vec<String>) {
+        match outcome {
+            Outcome::Deny {
+                status, challenges, ..
+            } => (Some(status), challenges),
+            Outcome::Forward { .. } => (None, Vec::new()),
+        }
+    }
+
+    // Ambiguous path: the raw path matches the scoped /admin subtree, so a leak
+    // would surface as `scope="admin"` in the invalid_request challenge.
+    let guard = Guard::builder()
+        .validator(MockValidator::no_token())
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .subtree("/admin", Rule::required().scopes(["admin"]))
+        .build()
+        .unwrap();
+    let (status, challenges) =
+        deny_parts(check(&guard, &http::Method::GET, "/admin/..;/secret").await);
+    assert_eq!(status, Some(http::StatusCode::BAD_REQUEST));
+    assert!(!challenges.is_empty(), "400 still carries challenges");
+    assert!(
+        challenges.iter().all(|c| !c.contains("scope=")),
+        "ambiguous-path 400 must not advertise the matched rule's scope: {challenges:?}"
+    );
+
+    // Unreconstructable URI (strip_prefix mismatch): same rule-independent 400.
+    let guard = Guard::builder()
+        .validator(MockValidator::no_token())
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .resource("https://api.example.com".parse().unwrap())
+        .strip_prefix("/proxy")
+        .default(Rule::required().scopes(["admin"]))
+        .build()
+        .unwrap();
+    let (status, challenges) = deny_parts(check(&guard, &http::Method::GET, "/other/users").await);
+    assert_eq!(status, Some(http::StatusCode::BAD_REQUEST));
+    assert!(
+        challenges.iter().all(|c| !c.contains("scope=")),
+        "invalid-URI 400 must not advertise the rule's scope: {challenges:?}"
+    );
+
+    // Contrast: a post-routing insufficient-scope 403 keeps the hint — that is the
+    // attribute's canonical use (RFC 6750 §3), telling the client what to request.
+    let guard = Guard::builder()
+        .validator(MockValidator::valid(MockClaims { scopes: None }))
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .subtree("/admin", Rule::required().scopes(["admin"]))
+        .build()
+        .unwrap();
+    let (status, challenges) = deny_parts(check(&guard, &http::Method::GET, "/admin/x").await);
+    assert_eq!(status, Some(http::StatusCode::FORBIDDEN));
+    assert!(
+        challenges.iter().any(|c| c.contains(r#"scope="admin""#)),
+        "insufficient-scope 403 keeps its scope hint: {challenges:?}"
+    );
+}
+
+#[tokio::test]
 async fn guard_allows_non_structural_encoded_content() {
     // Non-structural encoded content (`%20`) decodes to a deeper path under the same
     // `/files/{*rest}` rule — no route change → allowed by the content-decode precision.
