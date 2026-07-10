@@ -93,9 +93,9 @@
 //! When a prefix proxies opaque identifiers whose keys legitimately contain encoded
 //! separators (object-store keys, …), register it with `blob_subtree` instead of
 //! `subtree`. Its catch-all tail then **tolerates** the boundary-shifting bytes
-//! (`%2F`, `;`, `\`) inside the key, so `/files/a%2Fb.txt` is allowed — but `..`, NUL
-//! truncation, and case folding are **still** denied even there, so traversal cannot
-//! escape the blob. Registering a more-specific route *under* a `blob_subtree` is a
+//! (`%2F`, `;`, `\`) inside the key, so `/files/a%2Fb.txt` is allowed — but `..` and
+//! NUL truncation are **still** denied even there, so traversal cannot escape the
+//! blob. Registering a more-specific route *under* a `blob_subtree` is a
 //! build error (a structural byte could then relocate into it), so the opt-in is safe
 //! by construction rather than dependent on table shape.
 //!
@@ -143,11 +143,13 @@
 //! - [`Sensitive`](path_confusion::CaseSensitivity::Sensitive) — the upstream distinguishes
 //!   case; routes differing only by case are genuinely distinct and allowed.
 //! - [`Insensitive`](path_confusion::CaseSensitivity::Insensitive) — the upstream folds
-//!   case. The guard then treats case as path structure (an uppercase request that
-//!   could reach another rule is denied), **route patterns must be registered in
-//!   lowercase** (an uppercase pattern is a build error — it is the form the backend
-//!   resolves to), and two routes differing only by case are rejected at build. Only
-//!   ASCII case is modeled.
+//!   case. The guard then runs a **precise case-fold check**: it lowercases the request
+//!   path, re-routes it, and denies only if the folded path lands on a *different* rule
+//!   — mixed-case content that folds within its own rule (`/files/ReadMe.TXT`) keeps
+//!   flowing, while `/ADMIN` folding onto a distinct `/admin` rule is denied. **Route
+//!   patterns must be registered in lowercase** (an uppercase pattern is a build error —
+//!   it is the form the backend resolves to), and two routes differing only by case are
+//!   rejected at build. Only ASCII case is modeled.
 //!
 //! ## Strict and off
 //!

@@ -93,16 +93,26 @@
 //! 1. **Positional structural reject** — deny a *structural byte* (encoded separator,
 //!    dot-segment, matrix-param, …) sitting anywhere a wildcard or catch-all captures
 //!    it. Models **no backend**.
-//! 2. **Content-decode reject** — percent-decode the path, re-route the decoded form,
-//!    and deny if it lands on a *different* rule. Models the one near-universal backend
-//!    behaviour: RFC 3986 percent-decoding.
-//! 3. **Custom probes** — any [`StructuralProbe`] you registered, denied on presence.
+//! 2. **Case-fold reject** (under [`CaseSensitivity::Insensitive`] only) — lowercase
+//!    the path, re-route the folded form, and deny if it lands on a *different* rule.
+//!    Models the declared case-folding backend, precisely: `/files/ReadMe.TXT` folds
+//!    within its own rule and is allowed; `/ADMIN` folding onto a distinct `/admin`
+//!    rule is denied.
+//! 3. **Content-decode reject** — percent-decode the path (lowercasing the result when
+//!    the backend folds case), re-route the decoded form, and deny if it lands on a
+//!    *different* rule. Models the one near-universal backend behaviour: RFC 3986
+//!    percent-decoding.
+//! 4. **Custom probes** — any [`StructuralProbe`] you registered, denied on presence.
 //!
-//! The first two are complementary. The positional check covers relocations that
-//! **shift segment boundaries or climb** the tree — there *where* a byte lands decides
-//! the outcome, not its value. The content-decode check covers relocations that
-//! **change which literal matches** — there the decoded *value* decides, not the
-//! position. Neither alone is sufficient; together they cover both axes.
+//! The checks are complementary along a principled line. The positional check covers
+//! relocations that **shift segment boundaries or climb** the tree — there *where* a
+//! byte lands decides the outcome, not its value; it over-approximates because those
+//! transforms (slash-merging, `;`-strip, dot-resolution) are an open-ended *family*
+//! the guard cannot enumerate per request. Case-fold and content-decode cover
+//! relocations that **change which literal matches** — each models a *deterministic
+//! declared transform* (fold, decode), so the guard simply applies it, re-routes, and
+//! compares rules: precise, never an over-approximation. No single check is
+//! sufficient; together they cover both axes.
 //!
 //! ## 1. Positional structural reject
 //!
@@ -114,18 +124,23 @@
 //! denies on the *presence* of such a byte: there is no per-table liveness to compute and
 //! no backend parser to guess.
 //!
-//! - `..` / encoded-dot (dot-segment), a `%00` NUL, and — under a case-folding backend —
-//!   ASCII case are denied **everywhere**: they climb, truncate, or fold onto another
-//!   rule from any position.
+//! - `..` / encoded-dot (dot-segment) and a `%00` NUL are denied **everywhere**: they
+//!   climb or truncate onto another rule from any position.
 //! - The **boundary-shifting** bytes — encoded separator (`%2F`, `//`), matrix-param
 //!   (`;`), and (opt-in) backslash — are denied in any capture, because a decoded one
 //!   could split the captured segment off its rule.
 //!
+//! ASCII case is **not** part of the positional check: under a case-folding backend it
+//! is handled by the precise case-fold reject above, so uppercase content that folds
+//! within its own rule is never denied.
+//!
 //! **Opaque key spaces.** A prefix that legitimately proxies opaque identifiers whose
 //! keys contain encoded separators (object-store keys, …) opts its catch-all tail out of
 //! the *boundary-shift* denial by registering it with `blob_subtree` instead of
-//! `subtree`. Inside such a blob `%2F`/`;`/`\` are tolerated — but `..`, NUL, and case
-//! folding are **still** denied, so traversal cannot escape the blob. The opt-in is
+//! `subtree`. Inside such a blob `%2F`/`;`/`\` are tolerated — but `..` and NUL are
+//! **still** denied, so traversal cannot escape the blob (and the case-fold reject
+//! still denies a fold that would relocate *out* of it, while a mixed-case key that
+//! folds within the blob is fine). The opt-in is
 //! **explicit and local**, never inferred from table shape: registering a more-specific
 //! route *under* a `blob_subtree` is a build error (a structural byte could then relocate
 //! into it), so the tolerance cannot be silently widened by an unrelated route.
@@ -294,9 +309,9 @@
 //!   that *depends* on the rule→upstream binding being what you assumed — and this layer
 //!   cannot confirm it. "This zone is Unix, stop checking `\`" becomes a clean relocation
 //!   bypass the moment any of that zone's traffic is routed to a Windows backend. Unlike
-//!   `blob_subtree` — whose relaxation is **bounded** (it still denies `..`, NUL, and case,
-//!   so even misuse cannot escape the blob) — a structural-class relaxation has no residual
-//!   floor: a wrong guess is a straight hole.
+//!   `blob_subtree` — whose relaxation is **bounded** (it still denies `..`, NUL, and any
+//!   fold that relocates out of the blob, so even misuse cannot escape it) — a
+//!   structural-class relaxation has no residual floor: a wrong guess is a straight hole.
 //!
 //! So the global strict profile is not a limitation to be refined away; it is the only
 //! setting that does not rest on something this layer structurally cannot know. Refine
@@ -320,8 +335,8 @@ pub enum PathConfusion {
     /// backend**: because route patterns are canonical, any structural byte necessarily
     /// lands in a capture, so it denies on *presence* alone — no backend parser to guess.
     /// To tolerate encoded separators inside a genuine opaque key space, register the
-    /// prefix with `blob_subtree` (an explicit, validated opt-in); `..`, NUL, and case
-    /// folding are denied even there, so traversal cannot escape the blob. **The default.**
+    /// prefix with `blob_subtree` (an explicit, validated opt-in); `..` and NUL are
+    /// denied even there, so traversal cannot escape the blob. **The default.**
     #[default]
     RejectStructural,
     /// Deny (`400`) any request carrying a structural byte (`%2F`, `..`, `//`, `;`)
@@ -373,11 +388,14 @@ impl PathConfusion {
 ///
 /// - [`Sensitive`](Self::Sensitive) — the upstream distinguishes case. Routes that
 ///   differ only by ASCII case are treated as genuinely distinct and allowed.
-/// - [`Insensitive`](Self::Insensitive) — the upstream folds ASCII case. The guard
-///   treats case as path structure (a differently-cased path that could reach another
-///   rule is denied), and two routes that differ only by case become a **hard config
-///   error** — the table would otherwise be ambiguous on that backend. Models ASCII
-///   case only.
+/// - [`Insensitive`](Self::Insensitive) — the upstream folds ASCII case. The guard runs
+///   the **precise case-fold check**: it lowercases the request path, re-routes it, and
+///   denies only if the folded path lands on a *different* rule — so mixed-case content
+///   that folds within its own rule (`/files/ReadMe.TXT`) keeps flowing, while `/ADMIN`
+///   folding onto a distinct `/admin` rule is denied. Route patterns must be registered
+///   in lowercase (uppercase is a build error — it is the form the backend resolves
+///   to), and two routes that differ only by case become a **hard config error** — the
+///   table would otherwise be ambiguous on that backend. Models ASCII case only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseSensitivity {
     /// The upstream distinguishes ASCII case (the typical Unix-style backend).

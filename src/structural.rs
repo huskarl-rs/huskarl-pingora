@@ -62,10 +62,13 @@ impl ClassSet {
     /// The **boundary-shifting** classes — `/`-separator, `;`-param, `\`-separator —
     /// whose liveness genuinely varies *per capture* (a lone `{*rest}` catch-all is
     /// inert to them; a `{param}` is live). These are the classes the precise
-    /// per-capture analysis localizes. The remaining classes are uniform:
-    /// [`DOT_SEGMENT`](Self::DOT_SEGMENT) is always live (`..` escapes upward) and
-    /// [`TRUNCATION`](Self::TRUNCATION)/[`CASE`](Self::CASE) are positional-global, so
-    /// all three stay rule-level.
+    /// per-capture analysis localizes. [`DOT_SEGMENT`](Self::DOT_SEGMENT) is always
+    /// live (`..` escapes upward) and [`TRUNCATION`](Self::TRUNCATION) is
+    /// positional-global, so both stay rule-level. [`CASE`](Self::CASE) is *not*
+    /// positional at all under the default mode: case folding is a deterministic
+    /// declared transform, so the guard handles it with a precise fold-and-reroute
+    /// check (like content-decode); the scanner's CASE bit serves as that check's
+    /// trigger and as the strict mode's presence-deny.
     pub(crate) const BOUNDARY_SHIFT: ClassSet = ClassSet((1 << 0) | (1 << 2) | (1 << 5));
 
     /// The empty set.
@@ -87,6 +90,12 @@ impl ClassSet {
     /// The intersection of two sets (e.g. live ∩ enabled).
     pub(crate) fn intersect(self, other: ClassSet) -> ClassSet {
         ClassSet(self.0 & other.0)
+    }
+
+    /// The set difference `self ∖ other` (e.g. enabled classes minus the ones a
+    /// precise check handles instead of the positional scan).
+    pub(crate) fn without(self, other: ClassSet) -> ClassSet {
+        ClassSet(self.0 & !other.0)
     }
 
     /// Whether the set is empty.
@@ -416,8 +425,10 @@ fn delimiter_at(
 /// [`BACKSLASH`](ClassSet::BACKSLASH),
 /// [`with_null_truncation`](crate::path_confusion::StructuralClasses::with_null_truncation) →
 /// [`TRUNCATION`](ClassSet::TRUNCATION). The [`CASE`](ClassSet::CASE) class is **not**
-/// derived here — it is added by [`RuleRouter`](crate::path_router) from the required
-/// [`CaseSensitivity`](crate::path_confusion::CaseSensitivity) declaration.
+/// derived here — the structural guard adds it from the required
+/// [`CaseSensitivity`](crate::path_confusion::CaseSensitivity) declaration, where it
+/// gates the strict mode's presence-deny and triggers the precise case-fold check
+/// (it is masked out of the default mode's positional scan).
 ///
 /// The *alternate encodings* those classes can also arrive in — overlong-UTF-8 and
 /// double-percent forms — are recognised by the scanner only when the matching toggle

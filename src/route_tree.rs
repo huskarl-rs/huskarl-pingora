@@ -602,14 +602,21 @@ const MAX_PATH_LEN: usize = 8192;
 /// This is the liveness runtime built on the **uniform-live** model: every wildcard /
 /// catch-all position is live (any enabled structural byte there denies), *except* a
 /// catch-all explicitly declared opaque, which tolerates boundary-shift bytes (`/`, `;`,
-/// `\`) inside its span — but never dot-segment, truncation, or case. Because registered
+/// `\`) inside its span — but never dot-segment or truncation. Because registered
 /// patterns are canonical, any structural byte in a matched path necessarily falls in a
 /// capture, so the no-opaque case needs no tree walk at all.
 ///
-/// Two checks compose: the **positional** verdict above and a **content-decode** verdict
-/// that decodes the path, re-routes it through the same [`Router`], and denies a
-/// relocation onto a different rule (`/%61dmin` → `/admin`). Custom break-glass probes add
-/// a third check; the build-time non-canonical/uppercase-pattern rejection lives in
+/// Three checks compose under the default mode: the **positional** verdict above, a
+/// **case-fold** verdict (under a [`CaseSensitivity::Insensitive`] backend) that
+/// lowercases the path, re-routes it, and denies a relocation onto a different rule —
+/// precise, so a mixed-case path that folds within its own rule keeps flowing — and a
+/// **content-decode** verdict that decodes the path (folding the result when the backend
+/// is case-insensitive), re-routes it, and denies a relocation (`/%61dmin` → `/admin`).
+/// Case-fold and content-decode share one shape — model a *deterministic declared
+/// transform*, apply it, re-route, compare rules — which is what distinguishes them from
+/// the positional over-approximation used for the open-ended transform families
+/// (slash-merging, `;`-strip, dot-resolution). Custom break-glass probes add a final
+/// check; the build-time non-canonical/uppercase-pattern rejection lives in
 /// `path_router`'s build step.
 pub(crate) struct StructuralGuard {
     router: Router,
@@ -660,6 +667,7 @@ impl StructuralGuard {
             PathConfusion::Off => None,
             PathConfusion::RejectStructural => self
                 .positional_deny(path)
+                .or_else(|| self.case_fold_deny(path))
                 .or_else(|| self.content_decode_deny(path))
                 .or_else(|| self.custom_probe_deny(path)),
             // Strict: every position live (opaque ignored) and any percent-escape is
@@ -699,8 +707,13 @@ impl StructuralGuard {
     /// Positional verdict for [`PathConfusion::RejectStructural`] (uniform-live + opaque
     /// exemption). A clean path (no enabled structural byte) is the fast path and never
     /// walks the tree.
+    ///
+    /// [`ClassSet::CASE`] is masked out here: case folding is handled by the precise
+    /// [`case_fold_deny`](Self::case_fold_deny) instead, so an uppercase byte alone
+    /// never denies positionally (only an actual fold relocation does).
     fn positional_deny(&self, path: &str) -> Option<&'static str> {
-        let present = classes_present(path, self.enabled, self.enc).intersect(self.enabled);
+        let enabled = self.enabled.without(ClassSet::CASE);
+        let present = classes_present(path, enabled, self.enc).intersect(enabled);
         if present.is_empty() {
             return None;
         }
@@ -711,8 +724,8 @@ impl StructuralGuard {
             // No opaque routes: every structural byte denies, no routing needed.
             return Some("Ambiguous request path");
         }
-        // dot-segment / truncation / case deny anywhere — even inside an opaque blob.
-        let uniform = ClassSet::DOT_SEGMENT | ClassSet::TRUNCATION | ClassSet::CASE;
+        // dot-segment / truncation deny anywhere — even inside an opaque blob.
+        let uniform = ClassSet::DOT_SEGMENT | ClassSet::TRUNCATION;
         match self.router.opaque_span(path) {
             None => Some("Ambiguous request path"), // matched a non-opaque rule, or the default
             Some((start, end)) => {
@@ -720,8 +733,8 @@ impl StructuralGuard {
                     return Some("Ambiguous request path");
                 }
                 // Boundary-shift bytes deny only *outside* the opaque span.
-                let outside = classes_present(&blank(path, start, end), self.enabled, self.enc)
-                    .intersect(self.enabled)
+                let outside = classes_present(&blank(path, start, end), enabled, self.enc)
+                    .intersect(enabled)
                     .intersect(ClassSet::BOUNDARY_SHIFT);
                 if outside.is_empty() {
                     None
@@ -730,6 +743,30 @@ impl StructuralGuard {
                 }
             }
         }
+    }
+
+    /// Case-fold verdict: model a case-folding backend (declared via
+    /// [`CaseSensitivity::Insensitive`]) and deny iff lowercasing the path **relocates**
+    /// it to a different rule than the raw path matched. Precise, like the
+    /// content-decode check — `/files/ReadMe.TXT` folds within its own rule and keeps
+    /// flowing; `/ADMIN` folding onto a distinct `/admin` rule is denied.
+    ///
+    /// Sound on two build-time invariants: patterns are all-lowercase under
+    /// `Insensitive` (uppercase is a build error), so the folded path re-routes through
+    /// the very table the backend resolves against; and folding composed with
+    /// percent-decoding is covered by [`content_decode_deny`](Self::content_decode_deny),
+    /// which folds the decoded path before re-routing. Only ASCII case is modeled,
+    /// mirroring [`CaseSensitivity`].
+    fn case_fold_deny(&self, path: &str) -> Option<&'static str> {
+        if !self.case_insensitive || !path.bytes().any(|b| b.is_ascii_uppercase()) {
+            return None;
+        }
+        if path.len() > MAX_PATH_LEN {
+            return Some("Request path too long");
+        }
+        let folded = path.to_ascii_lowercase();
+        (self.router.route_id(&folded) != self.router.route_id(path))
+            .then_some("Ambiguous request path")
     }
 
     /// Positional verdict for [`PathConfusion::RejectNonCanonical`]: every position live,
@@ -1402,6 +1439,81 @@ mod tests {
         assert!(
             !insensitive.ambiguous("/admin"),
             "lowercase clean path allowed"
+        );
+    }
+
+    /// The case-fold check is **precise** (fold-and-reroute, like content-decode), not a
+    /// presence deny: uppercase that folds *within its own rule* is allowed; uppercase
+    /// that folds onto a *different* rule is denied.
+    #[test]
+    fn case_fold_is_precise_not_presence() {
+        let g = guard(
+            &[
+                ("/files", 0, false),
+                ("/files/", 0, false),
+                ("/files/*", 0, false),
+                ("/users/*", 1, false),
+                ("/users/admin", 2, false),
+            ],
+            PathConfusion::RejectStructural,
+            StructuralClasses::new(),
+            CaseSensitivity::Insensitive,
+        );
+        // Same-rule folds keep flowing: the capital sits in a capture and the folded
+        // path lands on the same rule.
+        assert!(
+            !g.ambiguous("/files/ReadMe.TXT"),
+            "mixed-case content within one rule"
+        );
+        assert!(
+            !g.ambiguous("/users/Alice"),
+            "folds to /users/alice — same catch-all rule"
+        );
+        // Cross-rule folds deny: the folded path reaches a rule the raw path missed.
+        assert!(
+            g.ambiguous("/users/ADMIN"),
+            "folds onto the /users/admin literal — a different rule"
+        );
+        assert!(
+            g.ambiguous("/Files/x"),
+            "folds onto the /files subtree from the default rule"
+        );
+        // Strict mode stays blunt: any uppercase is non-canonical there.
+        let strict = guard(
+            &[("/files/*", 0, false)],
+            PathConfusion::RejectNonCanonical,
+            StructuralClasses::new(),
+            CaseSensitivity::Insensitive,
+        );
+        assert!(
+            strict.ambiguous("/files/ReadMe.TXT"),
+            "strict denies on presence"
+        );
+    }
+
+    /// A mixed-case key inside an opaque blob folds within the blob's own rule and is
+    /// allowed; folding can never *escape* the blob (a differently-cased prefix that
+    /// folds onto the blob is still denied — it relocates from the default rule).
+    #[test]
+    fn opaque_blob_allows_mixed_case_keys() {
+        let g = guard(
+            &[
+                ("/files", 0, false),
+                ("/files/", 0, false),
+                ("/files/*", 0, true),
+            ],
+            PathConfusion::RejectStructural,
+            StructuralClasses::new(),
+            CaseSensitivity::Insensitive,
+        );
+        assert!(!g.ambiguous("/files/Key%2FPart"), "mixed-case opaque key");
+        assert!(
+            g.ambiguous("/FILES/x"),
+            "folding prefix relocates into the blob"
+        );
+        assert!(
+            g.ambiguous("/files/A/../b"),
+            "dot-segment still denied in the blob"
         );
     }
 

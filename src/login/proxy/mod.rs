@@ -289,7 +289,8 @@ where
     /// Like [`subtree`](Self::subtree), but declares the subtree's catch-all tail an
     /// **opaque** key space: structural bytes (`%2F`, `;`, `\`) *inside the key* are
     /// tolerated rather than denied — for proxying opaque identifiers. Dot-segments
-    /// (`..`), NUL truncation, and case folding are **still** denied even in the blob.
+    /// (`..`) and NUL truncation are **still** denied even in the blob (and a case
+    /// fold that would relocate out of it).
     ///
     /// Registering a more-specific route or `subtree` *under* the blob is a build error.
     pub fn blob_subtree(mut self, path: &str, rule: LoginRule<SD::SessionType>) -> Self {

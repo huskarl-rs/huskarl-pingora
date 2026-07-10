@@ -281,8 +281,10 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
     /// Like [`subtree`](Self::subtree), but declares the subtree's catch-all tail an
     /// **opaque** key space: structural bytes (`%2F`, `;`, `\`) *inside the key* are
     /// tolerated rather than denied — for proxying opaque identifiers such as object-store
-    /// keys. Dot-segments (`..`), NUL truncation, and case folding are **still** denied
-    /// even in the blob, so traversal cannot escape it.
+    /// keys. Dot-segments (`..`) and NUL truncation are **still** denied even in the
+    /// blob, so traversal cannot escape it (and under a case-folding backend, a fold
+    /// that would relocate out of the blob is still denied — a mixed-case key that
+    /// folds within it is fine).
     ///
     /// Registering a more-specific [`route`](Self::route) or `subtree` *under* the blob is
     /// a build error: a structural byte in the key could then relocate into that nested
