@@ -128,7 +128,22 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         // method qualifier (wildcard by default).
         #[builder(field)] routes: Vec<RouteEntry<Rule<V::Claims>>>,
         validator: V,
-        /// the resource identifier for the validator metadata.
+        /// This resource server's own externally-visible base URL — its scheme,
+        /// authority, and base path (e.g. `https://api.example.com`). Used for two
+        /// things: the resource identifier in RFC 9728 metadata, and **`DPoP` `htu`
+        /// binding** — the guard reconstructs the client-facing request URL by combining
+        /// this authority (and base path) with the request path and passes it to the
+        /// validator to check against the proof's `htu` claim.
+        ///
+        /// # Security
+        ///
+        /// For `DPoP`, set this to a value *you* control. The guard never derives the
+        /// authority from the inbound `Host` header, so configuring `resource`
+        /// explicitly is what keeps `htu` bound to your real origin. If it is left unset,
+        /// `htu` is matched against the raw request URI — which from a downstream proxy is
+        /// origin-form (path only) and therefore no longer pins scheme/host, so a captured
+        /// proof could be replayed across origins. Set `resource` whenever you accept
+        /// DPoP-bound tokens.
         resource: Option<http::Uri>,
         /// Path prefix to strip from the request path before prepending the resource path during `DPoP` URI reconstruction.
         ///
@@ -328,7 +343,14 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 
         let path = format!("/.well-known/oauth-protected-resource{suffix}");
 
-        let mut value = serde_json::to_value(&self.metadata)?;
+        // RFC 9728 §2 requires the document's `resource` member, so
+        // `to_resource_metadata` yields `None` when no resource identifier is
+        // configured; fall back to an empty document and let the
+        // scopes_supported insertion below carry what we do know.
+        let mut value = match self.metadata.to_resource_metadata() {
+            Some(document) => serde_json::to_value(&document)?,
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        };
 
         if !self.scopes_supported.is_empty()
             && let Some(obj) = value.as_object_mut()
@@ -507,7 +529,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 if !validated.claims.has_scope(required) {
                     let challenges =
                         self.metadata
-                            .challenges(Some(&InsufficientScope), scope_param, None);
+                            .challenges(Some(&InsufficientScope::default()), scope_param, None);
                     return Some(Outcome::Deny {
                         status: http::StatusCode::FORBIDDEN,
                         challenges,

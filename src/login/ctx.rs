@@ -6,6 +6,7 @@
 //! [`LoginCtx`], a convenience wrapper that implements it automatically.
 
 use http::{HeaderMap, HeaderValue};
+use huskarl_login::engine::PendingPersist;
 
 /// State held on the proxy context across the request lifecycle.
 ///
@@ -22,11 +23,11 @@ pub struct LoginState<S> {
     /// Set to `true` by the inner proxy when it wants the session destroyed on
     /// this response (e.g. an inner-proxy-managed account-deletion endpoint).
     pub delete_requested: bool,
-    /// `true` when a post-response save is owed to the store: a token refresh
-    /// succeeded but the engine's eager save failed, so the re-sealed session
-    /// must be persisted after the inner proxy responds. `false` when the loaded
-    /// session was already fully persisted.
-    pub(crate) pending_save: bool,
+    /// `Some` when a post-response save is owed to the store: a token refresh
+    /// succeeded but the engine's eager save failed, so the owed persist must
+    /// be committed (via [`PendingPersist::commit`]) after the inner proxy
+    /// responds. `None` when the loaded session was already fully persisted.
+    pub(crate) pending: Option<PendingPersist<S>>,
     /// The request headers captured at load time. Cookie-backed stores need the
     /// original `Cookie` header to know which chunked slots the browser has so
     /// they can `Max-Age=0` the leftover ones.
@@ -41,7 +42,7 @@ impl<S> Default for LoginState<S> {
     fn default() -> Self {
         Self {
             session: None,
-            pending_save: false,
+            pending: None,
             request_headers: HeaderMap::new(),
             set_cookies: Vec::new(),
             delete_requested: false,
@@ -106,7 +107,7 @@ impl<T: std::fmt::Debug, S> std::fmt::Debug for LoginCtx<T, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginCtx")
             .field("session_loaded", &self.state.session.is_some())
-            .field("pending_save", &self.state.pending_save)
+            .field("pending_save", &self.state.pending.is_some())
             .field("delete_requested", &self.state.delete_requested)
             .field("inner", &self.inner)
             .finish()

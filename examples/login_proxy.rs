@@ -30,9 +30,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use huskarl::{
     core::{
-        jwk::JwksSource,
-        platform::MaybeSendBoxFuture,
-        secrets::{SecretBytes, SecretOutput},
+        jwk::{JwksSource, OctBytes},
+        secrets::{ProvidedSecret, Secret as _, SecretBytes},
         server_metadata::AuthorizationServerMetadata,
     },
     grant::authorization_code::AuthorizationCodeGrant,
@@ -40,7 +39,7 @@ use huskarl::{
 use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_pingora::login::{
     CaseSensitivity, CookieSession, CookieSessionStore, LoginConfig, LoginCtx, LoginEngine,
-    LoginProxy, LoginRule, LogoutConfig, PathConfusion,
+    LoginProxy, LoginRule, LogoutConfig, PathConfusion, SessionLifetime,
 };
 use huskarl_reqwest::ReqwestClient;
 use huskarl_resource_server::core::client_auth::NoAuth;
@@ -102,29 +101,6 @@ impl ProxyHttp for Upstream {
     }
 }
 
-// ── Secret helpers ────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct StaticBytesSecret(SecretBytes);
-
-impl huskarl::core::secrets::Secret for StaticBytesSecret {
-    type Output = SecretBytes;
-
-    fn get_secret_value(
-        &self,
-    ) -> MaybeSendBoxFuture<
-        '_,
-        Result<SecretOutput<SecretBytes>, huskarl_resource_server::core::Error>,
-    > {
-        Box::pin(async {
-            Ok(SecretOutput {
-                value: self.0.clone(),
-                identity: None,
-            })
-        })
-    }
-}
-
 // ── AES key ───────────────────────────────────────────────────────────────────
 
 /// Loads or generates the 32-byte AES-256 key for cookie encryption.
@@ -142,9 +118,11 @@ fn load_or_generate_key_bytes() -> Vec<u8> {
 }
 
 async fn aes_key_from_bytes(bytes: Vec<u8>) -> AesGcmKey {
-    AesGcmKey::from_secret(StaticBytesSecret(SecretBytes::new(bytes)), |_| None)
-        .await
-        .expect("failed to load AES-256 key (expected 32 bytes)")
+    AesGcmKey::from_secret(
+        ProvidedSecret::new(SecretBytes::new(bytes)).mapped(OctBytes::new("A256GCM")),
+    )
+    .await
+    .expect("failed to load AES-256 key (expected 32 bytes)")
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -206,8 +184,11 @@ fn main() {
 
         let login_config = LoginConfig::builder()
             .callback_path(parsed_redirect.path().to_owned())
-            .scopes(vec!["openid".to_owned()])
+            .scope(vec!["openid".to_owned()])
             .base_url(base_url.parse().expect("valid base URL"))
+            // Cookie sessions carry the refresh token, so bound the session
+            // lifetime crate-side rather than delegating to the auth server.
+            .session_lifetime(SessionLifetime::Bounded(std::time::Duration::from_hours(8)))
             .logout(
                 LogoutConfig::builder()
                     .path("/logout")

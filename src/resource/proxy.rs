@@ -254,13 +254,16 @@ mod tests {
         type Claims = MockClaims;
         type Error = MockError;
 
-        async fn validate_request(
-            &self,
-            _headers: &http::HeaderMap,
-            _method: &http::Method,
-            _uri: &http::Uri,
-            _client_cert_der: Option<&[u8]>,
-        ) -> ValidationResult<MockClaims, MockError> {
+        fn validate_request<'a>(
+            &'a self,
+            _headers: &'a http::HeaderMap,
+            _method: &'a http::Method,
+            _uri: &'a http::Uri,
+            _client_cert_der: Option<&'a [u8]>,
+        ) -> crate::resource_server::core::platform::MaybeSendBoxFuture<
+            'a,
+            ValidationResult<MockClaims, MockError>,
+        > {
             let outcome = match &self.0 {
                 MockOutcome::Missing => Ok(None),
                 MockOutcome::Valid(claims) => Ok(Some(ValidatedRequest {
@@ -276,10 +279,12 @@ mod tests {
                 })),
                 MockOutcome::Invalid => Err(MockError),
             };
-            ValidationResult {
-                outcome,
-                dpop_nonce: None,
-            }
+            Box::pin(async move {
+                ValidationResult {
+                    outcome,
+                    dpop_nonce: None,
+                }
+            })
         }
     }
 

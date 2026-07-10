@@ -21,14 +21,16 @@ use huskarl::{
     core::{
         client_auth::NoAuth,
         http::{HttpClient, HttpResponse, Idempotency},
+        jwk::OctBytes,
         platform::MaybeSendBoxFuture,
-        secrets::{Secret, SecretBytes, SecretOutput},
+        secrets::{ProvidedSecret, Secret as _, SecretBytes},
     },
     grant::authorization_code::AuthorizationCodeGrant,
 };
 use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_login::{
-    CompletedLogin, LoginConfig, SessionDriver, SessionError, SessionErrorKind, SessionState,
+    CompletedLogin, LoginConfig, SessionDriver, SessionError, SessionErrorKind, SessionLifetime,
+    SessionState,
 };
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::{ProxyHttp, Session};
@@ -52,6 +54,23 @@ fn default_session_state() -> SessionState {
         .token_expiry(now + Duration::from_hours(1))
         .created_at(now)
         .build()
+}
+
+/// A fabricated owed persist pairing `session` with a minimal refresh
+/// response — the deferred save a post-response commit retries (a failed
+/// eager refresh persist; see [`LoadedSession::ActivePending`]).
+fn owed_persist_for<S>(session: S) -> huskarl_login::engine::PendingPersist<S> {
+    let token_response = huskarl::grant::core::RawTokenResponse::builder()
+        .access_token(huskarl::core::secrets::SecretString::new("access-token"))
+        .token_type("Bearer")
+        .build()
+        .into_token_response(None, SystemTime::now())
+        .unwrap();
+    huskarl_login::engine::PendingPersist::new(session, token_response)
+}
+
+fn owed_persist() -> huskarl_login::engine::PendingPersist<MockSession> {
+    owed_persist_for(MockSession::default())
 }
 
 impl Default for MockSession {
@@ -102,7 +121,13 @@ impl SessionDriver for MockSessionDriver {
     type SessionType = MockSession;
     type LoadError = Infallible;
 
-    fn apply_cookie_secure(&mut self, _secure: bool) {}
+    fn apply_session_policy(
+        &mut self,
+        _secure: bool,
+        _max_lifetime: Option<Duration>,
+        _metrics_name: Option<&str>,
+    ) {
+    }
 
     async fn create(
         &self,
@@ -188,37 +213,20 @@ impl ProxyHttp for InnerProxy {
 
 // ── Test fixtures ────────────────────────────────────────────────
 
-#[derive(Clone)]
-struct TestSecret(SecretBytes);
-
-impl Secret for TestSecret {
-    type Output = SecretBytes;
-    fn get_secret_value(
-        &self,
-    ) -> MaybeSendBoxFuture<
-        '_,
-        Result<SecretOutput<SecretBytes>, huskarl_resource_server::core::Error>,
-    > {
-        Box::pin(async {
-            Ok(SecretOutput {
-                value: self.0.clone(),
-                identity: None,
-            })
-        })
-    }
-}
-
 async fn test_cipher() -> AesGcmKey {
-    AesGcmKey::from_secret(TestSecret(SecretBytes::new(vec![0u8; 32])), |_| None)
-        .await
-        .unwrap()
+    AesGcmKey::from_secret(
+        ProvidedSecret::new(SecretBytes::new(vec![0u8; 32])).mapped(OctBytes::new("A256GCM")),
+    )
+    .await
+    .unwrap()
 }
 
 fn default_config() -> LoginConfig {
     LoginConfig::builder()
-        .callback_path("/callback".into())
-        .scopes(vec![])
+        .callback_path("/callback")
+        .scope(vec![])
         .base_url("https://app.example.com".parse().unwrap())
+        .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(8)))
         .build()
         .unwrap()
 }
@@ -573,7 +581,7 @@ async fn response_filter_save_on_dirty_persistence() {
     proxy.request_filter(&mut s, &mut ctx).await.unwrap();
     // A normal load owes nothing; force a pending save to exercise the branch
     // (in the wild this is the retry of a failed eager refresh persist).
-    ctx.login_state_mut().pending_save = true;
+    ctx.login_state_mut().pending = Some(owed_persist());
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     proxy
@@ -716,7 +724,7 @@ async fn persist_save_failure_fails_closed_with_policy_status() {
     let mut ctx = proxy.inner.new_ctx();
 
     proxy.request_filter(&mut s, &mut ctx).await.unwrap();
-    ctx.login_state_mut().pending_save = true;
+    ctx.login_state_mut().pending = Some(owed_persist());
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     let result = proxy
@@ -778,7 +786,7 @@ async fn logging_fallback_persists_when_response_not_proxied() {
     let mut ctx = proxy.inner.new_ctx();
 
     proxy.request_filter(&mut s, &mut ctx).await.unwrap();
-    ctx.login_state_mut().pending_save = true;
+    ctx.login_state_mut().pending = Some(owed_persist());
     proxy.logging(&mut s, None, &mut ctx).await;
 
     assert!(proxy.engine().session_store.was_save_called());
@@ -794,7 +802,7 @@ async fn logging_after_response_filter_does_not_double_persist() {
     let mut ctx = proxy.inner.new_ctx();
 
     proxy.request_filter(&mut s, &mut ctx).await.unwrap();
-    ctx.login_state_mut().pending_save = true;
+    ctx.login_state_mut().pending = Some(owed_persist());
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     proxy
@@ -1033,6 +1041,7 @@ mod store_backed {
         map: HashMap<Uuid, PersistedSessionState>,
         inserts: usize,
         saves: usize,
+        swaps: usize,
         deletes: usize,
     }
 
@@ -1047,6 +1056,7 @@ mod store_backed {
 
     impl ExternalSessionStore for InMemoryStore {
         type SessionType = PersistedSessionState;
+        type Version = i32;
         type Error = Infallible;
 
         async fn insert(&self, session: &PersistedSessionState) -> Result<(), Infallible> {
@@ -1058,8 +1068,9 @@ mod store_backed {
         async fn load(
             &self,
             session_key: Uuid,
-        ) -> Result<Option<PersistedSessionState>, Infallible> {
-            Ok(self.state().map.get(&session_key).cloned())
+        ) -> Result<Option<(PersistedSessionState, i32)>, Infallible> {
+            // The proxy never drives OCC; a constant version suffices.
+            Ok(self.state().map.get(&session_key).cloned().map(|s| (s, 0)))
         }
         async fn save(&self, session: &PersistedSessionState) -> Result<(), Infallible> {
             let mut st = self.state();
@@ -1073,9 +1084,9 @@ mod store_backed {
             _expected: i32,
         ) -> Result<SaveOutcome, Infallible> {
             // The proxy never drives OCC; a trivial unconditional write suffices.
-            self.state()
-                .map
-                .insert(session.session_key, session.clone());
+            let mut st = self.state();
+            st.swaps += 1;
+            st.map.insert(session.session_key, session.clone());
             Ok(SaveOutcome::Committed)
         }
         async fn delete(&self, session: &PersistedSessionState) -> Result<(), Infallible> {
@@ -1257,9 +1268,11 @@ mod store_backed {
         let (mut s, _c) = make_session("GET", "/api", "Accept: application/json\r\n").await;
         let mut ctx = proxy.inner.new_ctx();
         // Stand in for a request that loaded this session and owes the store a
-        // `Save` (e.g. the retry of a failed eager refresh persist).
-        ctx.login_state_mut().session = Some(session);
-        ctx.login_state_mut().pending_save = true;
+        // persist of an eager refresh whose initial save failed. The store-backed
+        // driver re-commits it through compare-and-swap (merge-safe), not a plain
+        // last-writer-wins `save`.
+        ctx.login_state_mut().session = Some(session.clone());
+        ctx.login_state_mut().pending = Some(super::owed_persist_for(session));
 
         let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
         proxy
@@ -1267,7 +1280,8 @@ mod store_backed {
             .await
             .unwrap();
 
-        assert_eq!(external.state().saves, 1);
+        assert_eq!(external.state().swaps, 1);
+        assert_eq!(external.state().saves, 0);
         assert_eq!(external.state().deletes, 0);
     }
 

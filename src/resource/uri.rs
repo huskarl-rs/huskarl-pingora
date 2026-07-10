@@ -4,6 +4,11 @@
 //! [`Guard`](super::Guard), the request path is rewritten to the client-facing
 //! URI so that `DPoP` `htu` (HTTP URI) binding works correctly behind a reverse
 //! proxy.
+//!
+//! `base_uri` must be an origin you configure, not one taken from the inbound `Host`
+//! header. When it is **absent**, reconstruction returns the raw request URI unchanged —
+//! behind a proxy that is origin-form (path only), so `htu` no longer pins scheme/host.
+//! Configure `base_uri` (the guard's `resource`) whenever DPoP-bound tokens are accepted.
 
 /// Reconstructs the client-facing URI for `DPoP` `htu` matching.
 ///

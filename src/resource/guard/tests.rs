@@ -60,13 +60,16 @@ impl AccessTokenValidator for MockValidator {
     type Claims = MockClaims;
     type Error = MockError;
 
-    async fn validate_request(
-        &self,
-        _headers: &http::HeaderMap,
-        _method: &http::Method,
-        uri: &http::Uri,
-        _client_cert_der: Option<&[u8]>,
-    ) -> ValidationResult<MockClaims, MockError> {
+    fn validate_request<'a>(
+        &'a self,
+        _headers: &'a http::HeaderMap,
+        _method: &'a http::Method,
+        uri: &'a http::Uri,
+        _client_cert_der: Option<&'a [u8]>,
+    ) -> crate::resource_server::core::platform::MaybeSendBoxFuture<
+        'a,
+        ValidationResult<MockClaims, MockError>,
+    > {
         *self.captured_uri.lock().unwrap() = Some(uri.clone());
 
         let outcome = match &self.outcome {
@@ -85,10 +88,12 @@ impl AccessTokenValidator for MockValidator {
             MockOutcome::Invalid => Err(MockError),
         };
 
-        ValidationResult {
-            outcome,
-            dpop_nonce: None,
-        }
+        Box::pin(async move {
+            ValidationResult {
+                outcome,
+                dpop_nonce: None,
+            }
+        })
     }
 }
 

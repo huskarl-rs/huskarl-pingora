@@ -49,7 +49,8 @@ pub use huskarl_login::{
 // directly.
 pub use huskarl_login::{
     ConfigError, CookieSession, CookieSessionStore, DefaultPersistFailurePolicy, LoginConfig,
-    LogoutConfig, PersistFailurePolicy, SessionError, StoreBackedSessionStore, engine::LoginEngine,
+    LogoutConfig, PersistFailurePolicy, SessionError, SessionLifetime, StoreBackedSessionStore,
+    engine::LoginEngine,
 };
 pub use proxy::{LoginProxy, LoginProxyBuilder, RouteConfigError};
 pub use rule::{CheckError, LoginRule};

@@ -93,7 +93,6 @@ mod tests;
 ///
 /// ```no_run
 /// # use std::sync::Arc;
-/// # use huskarl::core::crypto::cipher::AeadCipher;
 /// # use huskarl::grant::authorization_code::AuthorizationCodeGrant;
 /// # use huskarl_pingora::login::{
 /// #     CaseSensitivity, HasLoginSession, LoginConfig, LoginEngine, LoginProxy, LoginRule,
@@ -105,18 +104,19 @@ mod tests;
 /// #     login_config: LoginConfig,
 /// #     grant: AuthorizationCodeGrant,
 /// #     store: SD,
-/// #     cipher: impl AeadCipher + 'static,
 /// # ) where
 /// #     P: ProxyHttp + Send + Sync,
 /// #     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
 /// #     SD: SessionDriver + Send + Sync,
 /// # {
+/// // The login-state cipher is optional: omitted, it defaults to the session
+/// // store's own AEAD cipher (the two seals are AAD-domain-separated, so
+/// // sharing one key is safe). Pass `.cipher(...)` only to use a distinct key.
 /// let engine = Arc::new(
 ///     LoginEngine::builder()
 ///         .config(login_config)
 ///         .grant(grant)
 ///         .session_store(store)
-///         .cipher(cipher)
 ///         .build(),
 /// );
 ///
@@ -328,6 +328,19 @@ where
     pub fn engine(&self) -> &Arc<LoginEngine<SD>> {
         &self.engine
     }
+
+    /// Serves a retryable `503` for a [`LoadedSession::RefreshUnavailable`]: the
+    /// access token expired and its refresh is transiently failing, so the
+    /// request is failed (not treated as anonymous) until the authorization
+    /// server recovers.
+    async fn serve_refresh_unavailable(&self, session: &mut Session) -> Result<bool> {
+        let resp = self.engine.render_error(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "session refresh temporarily unavailable",
+        );
+        write_login_response(session, resp, Vec::new()).await?;
+        Ok(true)
+    }
 }
 
 /// Errors that can occur when building a [`LoginProxy`]'s route table.
@@ -473,6 +486,10 @@ where
     P: ProxyHttp + Send + Sync,
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
     SD: SessionDriver + Send + Sync,
+    // `Clone` backs the deferred-persist path: the rare `ActivePending` load
+    // clones the session into `LoginState` for the inner proxy, and
+    // `PendingPersist::commit` requires it.
+    SD::SessionType: Clone,
 {
     type CTX = P::CTX;
 
@@ -538,14 +555,27 @@ where
         // Flatten the session state once, exhaustively: which session (if
         // any), what the response still owes the store, and which Set-Cookie
         // headers must reach the client.
-        let (maybe_sess, pending_save, set_cookies) = match loaded {
-            LoadedSession::Missing => (None, false, Vec::new()),
-            LoadedSession::Cleared { clears, .. } => (None, false, clears),
+        let (maybe_sess, pending, set_cookies) = match loaded {
+            LoadedSession::Missing => (None, None, Vec::new()),
+            LoadedSession::Cleared { clears, .. } => (None, None, clears.into_headers()),
             LoadedSession::Active {
                 session: sess,
                 set_cookies,
-            } => (Some(sess), false, set_cookies),
-            LoadedSession::ActivePending { session: sess } => (Some(sess), true, Vec::new()),
+            } => (Some(sess), None, set_cookies.into_headers()),
+            // The serving copy is cloned out of the pending persist so the
+            // inner proxy sees the session in `LoginState` as usual; the
+            // commit after the response carries its own copy.
+            LoadedSession::ActivePending { pending } => {
+                (Some(pending.session().clone()), Some(pending), Vec::new())
+            }
+            // The access token expired and the refresh is transiently
+            // unavailable — authentication can be neither confirmed nor refuted
+            // right now. Serve a retryable error rather than bouncing the user
+            // into a login flow against the same unavailable authorization
+            // server, or leaking anonymous state into a per-user cache.
+            LoadedSession::RefreshUnavailable => {
+                return self.serve_refresh_unavailable(session).await;
+            }
         };
 
         let Some(sess) = maybe_sess else {
@@ -558,7 +588,7 @@ where
             }
             let state = ctx.login_state_mut();
             state.session = None;
-            state.pending_save = false;
+            state.pending = None;
             state.request_headers = headers;
             state.set_cookies = set_cookies;
             state.delete_requested = false;
@@ -575,8 +605,8 @@ where
             // the retry of an eager refresh persist that failed. Best-effort —
             // the user is denied either way.
             let mut cookies = set_cookies;
-            if pending_save {
-                match self.engine.persist_session(&sess, &headers).await {
+            if let Some(pending) = pending {
+                match pending.commit(&self.engine, &headers).await {
                     Ok(more) => cookies.extend(more),
                     Err(e) => log::error!(
                         "failed to persist session on denied request: {}",
@@ -591,7 +621,7 @@ where
 
         let state = ctx.login_state_mut();
         state.session = Some(sess);
-        state.pending_save = pending_save;
+        state.pending = pending;
         state.request_headers = headers;
         state.set_cookies = set_cookies;
         state.delete_requested = false;
@@ -613,7 +643,7 @@ where
         let maybe_sess = state.session.take();
         let request_headers = std::mem::take(&mut state.request_headers);
         let set_cookies = std::mem::take(&mut state.set_cookies);
-        let pending_save = std::mem::replace(&mut state.pending_save, false);
+        let pending = state.pending.take();
         let delete_requested = std::mem::replace(&mut state.delete_requested, false);
 
         append_set_cookies(upstream_response, set_cookies)?;
@@ -623,8 +653,12 @@ where
         };
 
         if delete_requested {
+            // The owed persist (if any) is moot for a session being deleted.
+            if let Some(pending) = pending {
+                pending.abandon();
+            }
             return match self.engine.delete_session(&sess, &request_headers).await {
-                Ok(cookies) => append_set_cookies(upstream_response, cookies),
+                Ok(cookies) => append_set_cookies(upstream_response, cookies.into_headers()),
                 Err(e) => {
                     // A failed delete means the session is still live;
                     // sending the response without its cookie clears would
@@ -639,11 +673,11 @@ where
         }
 
         // Fully persisted at load time — nothing owed.
-        if !pending_save {
+        let Some(pending) = pending else {
             return Ok(());
-        }
-        match self.engine.persist_session(&sess, &request_headers).await {
-            Ok(cookies) => append_set_cookies(upstream_response, cookies),
+        };
+        match pending.commit(&self.engine, &request_headers).await {
+            Ok(cookies) => append_set_cookies(upstream_response, cookies.into_headers()),
             Err(e) => {
                 log::error!("failed to persist session: {}", error_chain(&e));
                 match self.persist_failure_policy.handle(&e) {
@@ -671,30 +705,41 @@ where
         let state = ctx.login_state_mut();
         if let Some(sess) = state.session.take() {
             let request_headers = std::mem::take(&mut state.request_headers);
-            let pending_save = std::mem::replace(&mut state.pending_save, false);
+            let pending = state.pending.take();
             let delete_requested = std::mem::replace(&mut state.delete_requested, false);
             state.set_cookies.clear();
 
             let result = if delete_requested {
+                // The owed persist (if any) is moot for a session being deleted.
+                if let Some(pending) = pending {
+                    pending.abandon();
+                }
                 Some(self.engine.delete_session(&sess, &request_headers).await)
-            } else if pending_save {
-                Some(self.engine.persist_session(&sess, &request_headers).await)
+            } else if let Some(pending) = pending {
+                Some(pending.commit(&self.engine, &request_headers).await)
             } else {
                 // Fully persisted at load time — nothing owed.
                 None
             };
             match result {
-                Some(Ok(cookies)) if !cookies.is_empty() => {
-                    log::warn!(
-                        "session persisted after the response was sent — {} Set-Cookie header(s) could not be delivered",
-                        cookies.len()
-                    );
+                Some(Ok(cookies)) => {
+                    // The response is already gone, so these cookies can't be
+                    // delivered — report what was stranded, then `discard` to
+                    // consume the guard without logging (non-delivery here is a
+                    // fact, not a dropped-cookie bug).
+                    if !cookies.is_empty() {
+                        log::warn!(
+                            "session persisted after the response was sent — {} Set-Cookie header(s) could not be delivered",
+                            cookies.len()
+                        );
+                    }
+                    cookies.discard();
                 }
                 Some(Err(err)) => log::error!(
                     "failed to persist session in logging fallback: {}",
                     error_chain(&err)
                 ),
-                Some(Ok(_)) | None => {}
+                None => {}
             }
         }
 

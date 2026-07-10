@@ -36,12 +36,5 @@ impl ToRfc6750Error for MockError {
 
 /// Convenience implementation for any validator built on [`MockClaims`]/[`MockError`].
 pub(crate) fn mock_validator_metadata(resource: Option<&str>) -> ValidatorMetadata {
-    ValidatorMetadata {
-        realm: None,
-        authorization_servers: None,
-        dpop_signing_alg_values_supported: None,
-        dpop_bound_access_tokens_required: None,
-        resource: resource.map(String::from),
-        bearer_methods_supported: None,
-    }
+    ValidatorMetadata::builder().maybe_resource(resource).build()
 }
