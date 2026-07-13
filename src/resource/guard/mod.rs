@@ -13,6 +13,7 @@ use bon::bon;
 use pingora_proxy::Session;
 
 use crate::{
+    metrics::CheckOutcome,
     path_confusion::{CaseSensitivity, PathConfusion, StructuralClasses},
     path_router::{RouteEntry, RuleRouter, next_rule_id},
     resource::{
@@ -96,6 +97,9 @@ pub struct Guard<V: AccessTokenValidator + ProvideValidatorMetadata> {
     scopes_supported: Vec<String>,
     base_uri: Option<http::Uri>,
     strip_prefix: Option<String>,
+    /// Optional value for the `name` label on emitted metrics, distinguishing guard
+    /// instances when one process runs several. `None` omits the label.
+    metrics_name: Option<String>,
 }
 
 impl<V: AccessTokenValidator + ProvideValidatorMetadata> std::fmt::Debug for Guard<V> {
@@ -104,6 +108,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> std::fmt::Debug for Gua
             .field("scopes_supported", &self.scopes_supported)
             .field("base_uri", &self.base_uri)
             .field("strip_prefix", &self.strip_prefix)
+            .field("metrics_name", &self.metrics_name)
             .finish_non_exhaustive()
     }
 }
@@ -169,6 +174,11 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         /// always-on trio. Defaults to [`StructuralClasses::new`].
         #[builder(default)]
         structural_classes: StructuralClasses,
+        /// Optional value for the `name` label on emitted metrics (the
+        /// `huskarl.resource.check` counter). Set it to tell guard instances apart when
+        /// one process runs several; leave unset to omit the label.
+        #[builder(into)]
+        metrics_name: Option<String>,
     ) -> Result<Self, ConfigError> {
         // Reject public rules with audience or scope constraints — they can never
         // be enforced because the token validator is skipped for public routes.
@@ -215,6 +225,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             scopes_supported,
             base_uri: resource,
             strip_prefix,
+            metrics_name,
         })
     }
 }
@@ -399,6 +410,11 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     ///
     /// Returns an [`Outcome`] describing whether the request should be
     /// forwarded or denied.
+    ///
+    /// Emits the `huskarl.resource.check` counter once, with an `outcome` label naming
+    /// what this call resolved to — `forward` for a success, or the specific deny reason
+    /// (`path_confusion`, `unauthenticated`, `invalid_token`, `insufficient_scope`,
+    /// `invalid_request`). The label set is closed; the request path is never a label.
     pub async fn check_request(
         &self,
         headers: &http::HeaderMap,
@@ -406,6 +422,26 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         uri: &http::Uri,
         client_cert_der: Option<&[u8]>,
     ) -> Outcome<V::Claims>
+    where
+        V::Claims: HasScopes,
+    {
+        let (outcome, category) = self
+            .check_request_categorized(headers, method, uri, client_cert_der)
+            .await;
+        category.emit(self.metrics_name.as_deref());
+        outcome
+    }
+
+    /// The body of [`check_request`](Self::check_request), returning the [`Outcome`]
+    /// alongside the [`CheckOutcome`] category for metrics. Split out so the counter is
+    /// emitted exactly once, at the single wrapper exit, rather than at each branch.
+    async fn check_request_categorized(
+        &self,
+        headers: &http::HeaderMap,
+        method: &http::Method,
+        uri: &http::Uri,
+        client_cert_der: Option<&[u8]>,
+    ) -> (Outcome<V::Claims>, CheckOutcome)
     where
         V::Claims: HasScopes,
     {
@@ -417,22 +453,28 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 
         // 0. Path-confusion guard: reject ambiguous paths before any work.
         if let Some(msg) = self.routes.ambiguous(path) {
-            return self.bad_request(msg);
+            return (self.bad_request(msg), CheckOutcome::PathConfusion);
         }
 
         // 1. Public routes skip validation entirely.
         if rule.token == TokenRequirement::None {
-            return Outcome::Forward {
-                token: None,
-                dpop_nonce: None,
-                strip_credentials: rule.strip_credentials,
-            };
+            return (
+                Outcome::Forward {
+                    token: None,
+                    dpop_nonce: None,
+                    strip_credentials: rule.strip_credentials,
+                },
+                CheckOutcome::Forward,
+            );
         }
 
         // 2. Call the validator.
         let Some(full_uri) = request_uri(self.base_uri.as_ref(), self.strip_prefix.as_deref(), uri)
         else {
-            return self.bad_request("Invalid request URI");
+            return (
+                self.bad_request("Invalid request URI"),
+                CheckOutcome::InvalidRequest,
+            );
         };
 
         let result = self
@@ -447,56 +489,68 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 // Token present but invalid.
                 let status = err.token_error().suggested_status();
                 let challenges = self.metadata.challenges(Some(&err), scope_param, None);
-                Outcome::Deny {
-                    status,
-                    challenges,
-                    dpop_nonce,
-                }
+                (
+                    Outcome::Deny {
+                        status,
+                        challenges,
+                        dpop_nonce,
+                    },
+                    CheckOutcome::InvalidToken,
+                )
             }
             Ok(None) => {
                 // No token present.
                 match rule.token {
                     TokenRequirement::Required => {
                         let challenges = self.metadata.unauthenticated_challenges(scope_param);
-                        Outcome::Deny {
-                            status: http::StatusCode::UNAUTHORIZED,
-                            challenges,
-                            dpop_nonce,
-                        }
+                        (
+                            Outcome::Deny {
+                                status: http::StatusCode::UNAUTHORIZED,
+                                challenges,
+                                dpop_nonce,
+                            },
+                            CheckOutcome::Unauthenticated,
+                        )
                     }
-                    TokenRequirement::Optional | TokenRequirement::None => Outcome::Forward {
-                        token: None,
-                        dpop_nonce,
-                        strip_credentials: rule.strip_credentials,
-                    },
+                    TokenRequirement::Optional | TokenRequirement::None => (
+                        Outcome::Forward {
+                            token: None,
+                            dpop_nonce,
+                            strip_credentials: rule.strip_credentials,
+                        },
+                        CheckOutcome::Forward,
+                    ),
                 }
             }
             Ok(Some(validated)) => {
                 // Token present and valid — run rule checks.
-                if let Some(outcome) =
+                if let Some((outcome, category)) =
                     self.check_rule(rule, &validated, scope_param, dpop_nonce.as_deref())
                 {
-                    return outcome;
+                    return (outcome, category);
                 }
 
-                Outcome::Forward {
-                    token: Some(Arc::new(validated)),
-                    dpop_nonce,
-                    strip_credentials: rule.strip_credentials,
-                }
+                (
+                    Outcome::Forward {
+                        token: Some(Arc::new(validated)),
+                        dpop_nonce,
+                        strip_credentials: rule.strip_credentials,
+                    },
+                    CheckOutcome::Forward,
+                )
             }
         }
     }
 
     /// Runs audience, scope, and custom check against the rule.
-    /// Returns `Some(Outcome::Deny)` if any check fails, `None` if all pass.
+    /// Returns `Some((Outcome::Deny, category))` if any check fails, `None` if all pass.
     fn check_rule(
         &self,
         rule: &Rule<V::Claims>,
         validated: &ValidatedRequest<V::Claims>,
         scope_param: Option<&str>,
         dpop_nonce: Option<&str>,
-    ) -> Option<Outcome<V::Claims>>
+    ) -> Option<(Outcome<V::Claims>, CheckOutcome)>
     where
         V::Claims: HasScopes,
     {
@@ -515,25 +569,33 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 scope_param,
                 None,
             );
-            return Some(Outcome::Deny {
-                status: http::StatusCode::UNAUTHORIZED,
-                challenges,
-                dpop_nonce: dpop_nonce.map(String::from),
-            });
+            return Some((
+                Outcome::Deny {
+                    status: http::StatusCode::UNAUTHORIZED,
+                    challenges,
+                    dpop_nonce: dpop_nonce.map(String::from),
+                },
+                CheckOutcome::InvalidToken,
+            ));
         }
 
         // Scope check.
         if !rule.scopes.is_empty() {
             for required in &rule.scopes {
                 if !validated.claims.has_scope(required) {
-                    let challenges =
-                        self.metadata
-                            .challenges(Some(&InsufficientScope::default()), scope_param, None);
-                    return Some(Outcome::Deny {
-                        status: http::StatusCode::FORBIDDEN,
-                        challenges,
-                        dpop_nonce: dpop_nonce.map(String::from),
-                    });
+                    let challenges = self.metadata.challenges(
+                        Some(&InsufficientScope::default()),
+                        scope_param,
+                        None,
+                    );
+                    return Some((
+                        Outcome::Deny {
+                            status: http::StatusCode::FORBIDDEN,
+                            challenges,
+                            dpop_nonce: dpop_nonce.map(String::from),
+                        },
+                        CheckOutcome::InsufficientScope,
+                    ));
                 }
             }
         }
@@ -548,11 +610,14 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                         description: desc,
                     };
                     let challenges = self.metadata.challenges(Some(&err), None, None);
-                    return Some(Outcome::Deny {
-                        status: http::StatusCode::FORBIDDEN,
-                        challenges,
-                        dpop_nonce: dpop_nonce.map(String::from),
-                    });
+                    return Some((
+                        Outcome::Deny {
+                            status: http::StatusCode::FORBIDDEN,
+                            challenges,
+                            dpop_nonce: dpop_nonce.map(String::from),
+                        },
+                        CheckOutcome::InsufficientScope,
+                    ));
                 }
                 Err(CheckError::InvalidToken(desc)) => {
                     let err = CustomCheckError {
@@ -560,11 +625,14 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                         description: desc,
                     };
                     let challenges = self.metadata.challenges(Some(&err), None, None);
-                    return Some(Outcome::Deny {
-                        status: http::StatusCode::UNAUTHORIZED,
-                        challenges,
-                        dpop_nonce: dpop_nonce.map(String::from),
-                    });
+                    return Some((
+                        Outcome::Deny {
+                            status: http::StatusCode::UNAUTHORIZED,
+                            challenges,
+                            dpop_nonce: dpop_nonce.map(String::from),
+                        },
+                        CheckOutcome::InvalidToken,
+                    ));
                 }
             }
         }

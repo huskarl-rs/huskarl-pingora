@@ -203,8 +203,7 @@ fn lower_segment(seg: &str) -> Result<SegLower, LowerError> {
     // Param names contain no braces, so the next `}` closes the group.
     let close = open
         + 1
-        + b
-            .iter()
+        + b.iter()
             .skip(open + 1)
             .position(|&c| c == b'}')
             .ok_or(LowerError::MalformedParam)?;

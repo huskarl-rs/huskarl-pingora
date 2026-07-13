@@ -1266,3 +1266,132 @@ async fn cve_forwarded_uri_header_is_not_trusted() {
         Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
     ));
 }
+
+// --- metrics: the `huskarl.resource.check` outcome counter ---
+
+/// Runs `fut` on a current-thread runtime with a thread-local debugging recorder
+/// installed, returning the captured counters as `(name, sorted (label, value) pairs,
+/// count)`. Mirrors the harness in `huskarl-login`.
+fn with_metrics<T>(fut: impl Future<Output = T>) -> (T, Vec<(String, Vec<(String, String)>, u64)>) {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let out = metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    });
+    let counters = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _unit, _desc, value)| {
+            let DebugValue::Counter(count) = value else {
+                return None;
+            };
+            let key = key.key();
+            let mut labels: Vec<(String, String)> = key
+                .labels()
+                .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                .collect();
+            labels.sort();
+            Some((key.name().to_owned(), labels, count))
+        })
+        .collect();
+    (out, counters)
+}
+
+/// The value of `huskarl.resource.check` with exactly the `outcome` label, or 0.
+fn check_outcome_count(counters: &[(String, Vec<(String, String)>, u64)], outcome: &str) -> u64 {
+    counters
+        .iter()
+        .find(|(name, labels, _)| {
+            name == "huskarl.resource.check"
+                && labels.as_slice() == [("outcome".to_owned(), outcome.to_owned())]
+        })
+        .map_or(0, |(_, _, count)| *count)
+}
+
+#[test]
+fn metrics_forward_on_public_route() {
+    let (_, counters) = with_metrics(async {
+        let guard = build_guard(MockValidator::no_token(), vec![("/health", Rule::public())]);
+        check(&guard, &http::Method::GET, "/health").await
+    });
+    assert_eq!(check_outcome_count(&counters, "forward"), 1);
+    assert_eq!(check_outcome_count(&counters, "unauthenticated"), 0);
+}
+
+#[test]
+fn metrics_unauthenticated_on_required_no_token() {
+    let (_, counters) = with_metrics(async {
+        let guard = build_guard(MockValidator::no_token(), vec![]);
+        check(&guard, &http::Method::GET, "/api").await
+    });
+    assert_eq!(check_outcome_count(&counters, "unauthenticated"), 1);
+    assert_eq!(check_outcome_count(&counters, "forward"), 0);
+}
+
+#[test]
+fn metrics_path_confusion_on_ambiguous_path() {
+    let (_, counters) = with_metrics(async {
+        let guard = build_guard(
+            MockValidator::no_token(),
+            vec![("/admin", Rule::required())],
+        );
+        // `/x/../admin` climbs onto the protected rule under a normalizing backend.
+        check(&guard, &http::Method::GET, "/x/../admin").await
+    });
+    assert_eq!(check_outcome_count(&counters, "path_confusion"), 1);
+}
+
+#[test]
+fn metrics_invalid_token_on_bad_token() {
+    let (_, counters) = with_metrics(async {
+        let guard = build_guard(MockValidator::invalid(), vec![("/api", Rule::required())]);
+        check(&guard, &http::Method::GET, "/api").await
+    });
+    assert_eq!(check_outcome_count(&counters, "invalid_token"), 1);
+}
+
+#[test]
+fn metrics_insufficient_scope_on_missing_scope() {
+    let (_, counters) = with_metrics(async {
+        let guard = build_guard(
+            MockValidator::valid(MockClaims { scopes: None }),
+            vec![("/admin", Rule::required().scopes(["admin"]))],
+        );
+        check(&guard, &http::Method::GET, "/admin").await
+    });
+    assert_eq!(check_outcome_count(&counters, "insufficient_scope"), 1);
+}
+
+#[test]
+fn metrics_name_label_present_when_configured() {
+    let (_, counters) = with_metrics(async {
+        let guard = Guard::builder()
+            .validator(MockValidator::no_token())
+            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+            .metrics_name("edge")
+            .route("/health", Rule::public())
+            .build()
+            .unwrap();
+        check(&guard, &http::Method::GET, "/health").await
+    });
+    // The counter carries both the `outcome` and the instance `name` label.
+    let hit = counters
+        .iter()
+        .find(|(name, _, _)| name == "huskarl.resource.check");
+    let (_, labels, count) = hit.expect("counter emitted");
+    assert_eq!(*count, 1);
+    assert_eq!(
+        labels.as_slice(),
+        [
+            ("name".to_owned(), "edge".to_owned()),
+            ("outcome".to_owned(), "forward".to_owned()),
+        ]
+    );
+}

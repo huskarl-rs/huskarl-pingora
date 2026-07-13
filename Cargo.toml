@@ -13,7 +13,7 @@ categories = ["authentication"]
 
 [features]
 default = ["resource", "login", "default-jws-verifier-platform"]
-resource = ["dep:bon", "dep:huskarl-resource-server", "dep:pingora-core", "dep:serde_json"]
+resource = ["dep:bon", "dep:huskarl-resource-server", "dep:pingora-core", "dep:serde_json", "dep:metrics", "dep:strum"]
 login = ["dep:bon", "dep:huskarl", "dep:huskarl-login", "dep:pingora-core"]
 default-jws-verifier-platform = [
     "huskarl?/default-jws-verifier-platform",
@@ -36,10 +36,12 @@ bon = { version = "3.9", optional = true }
 huskarl-resource-server = { version = "0.9", default-features = false, optional = true }
 pingora-core = { version = "0.8", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
+metrics = { version = "0.24", default-features = false, optional = true }
+strum = { version = "0.27", default-features = false, features = ["derive"], optional = true }
 
 # login feature
 huskarl = { version = "0.9", default-features = false, optional = true }
-huskarl-login = { version = "0.4", path = "../huskarl-login", optional = true }
+huskarl-login = { version = "0.3", path = "../huskarl-login", optional = true }
 pingora-cache = "0.8.0"
 
 [dev-dependencies]
@@ -56,6 +58,7 @@ proptest = "1"
 rand = "0.10"
 uuid = "1"
 bolero = "0.13.4"
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 
 [[example]]
 name = "jwt_proxy"

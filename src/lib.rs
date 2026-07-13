@@ -256,6 +256,8 @@
 
 #[cfg(feature = "login")]
 pub mod login;
+#[cfg(feature = "resource")]
+pub(crate) mod metrics;
 #[cfg(any(feature = "resource", feature = "login"))]
 pub mod path_confusion;
 #[cfg(test)]
