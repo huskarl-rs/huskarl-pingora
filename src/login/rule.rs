@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use crate::route_tree::MethodMatch;
+use huskarl_route_guard::MethodMatch;
 
 /// An error returned by a custom [`LoginRule::check`] function.
 #[derive(Debug)]

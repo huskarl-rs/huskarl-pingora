@@ -1,5 +1,1 @@
 /target
-
-# bolero writes its fuzzing corpus here; a found crash should be promoted to an explicit
-# regression test (as with proptest-regressions/) rather than committed as a raw blob.
-/src/__fuzz__

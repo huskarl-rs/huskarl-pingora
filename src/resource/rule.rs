@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use crate::{resource_server::validator::ValidatedRequest, route_tree::MethodMatch};
+use huskarl_route_guard::MethodMatch;
+
+use crate::resource_server::validator::ValidatedRequest;
 
 /// What level of authentication a route requires.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl_pingora::{
-    resource::{AuthCtx, AuthProxy, CaseSensitivity, Guard, PathConfusion, Rule},
+    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeLayers, Guard, PathConfusion, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
         validator::rfc9068::Rfc9068Validator,
@@ -118,6 +118,7 @@ async fn main() {
     let guard = Guard::builder()
         .validator(validator)
         .case_sensitivity(case_sensitivity)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/public", Rule::public()) // /public and everything under it
         .route("/health", Rule::public()) // exactly /health
         // RejectStructural is the default; PathConfusion::off() disables the guard.

@@ -168,22 +168,10 @@ pub(crate) async fn write_method_not_allowed(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use pingora_proxy::Session as ProxySession;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::io::AsyncReadExt;
 
     use super::*;
-
-    /// Creates a test session. Returns both the session and the client half of
-    /// the duplex stream — the client half must be kept alive until after
-    /// response writing completes.
-    async fn make_session(method: &str, path: &str) -> (ProxySession, DuplexStream) {
-        let raw = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        let (mut client, server) = tokio::io::duplex(4096);
-        client.write_all(raw.as_bytes()).await.unwrap();
-        let mut session = ProxySession::new_h1(Box::new(server));
-        session.downstream_session.read_request().await.unwrap();
-        (session, client)
-    }
+    use crate::resource::test_support::make_session;
 
     #[tokio::test]
     async fn metadata_response_sets_json_and_cache() {

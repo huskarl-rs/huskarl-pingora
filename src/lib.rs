@@ -101,24 +101,16 @@
 //!
 //! ## Opt-in classes and encodings
 //!
-//! The always-on alphabet is the standard RFC 3986 surface — encoded slash,
-//! dot-segments, and `;`-matrix-params — sound for a conventional standards-conforming
-//! backend. A backend that considers *more* paths equivalent needs the matching toggle
-//! on [`StructuralClasses`](path_confusion::StructuralClasses), passed via the builder's
+//! The always-on alphabet is encoded slash, dot-segments, `;`-matrix-params, and
+//! `%00`/raw-NUL truncation — the forms whose legitimate-traffic cost is near nil. A
+//! backend that considers *more* paths equivalent needs the matching toggle on
+//! [`StructuralClasses`](path_confusion::StructuralClasses), passed via the builder's
 //! `structural_classes`:
 //!
 //! - [`with_backslash()`](path_confusion::StructuralClasses::with_backslash) — `\`/`%5C`
 //!   as a separator (Windows/IIS);
-//! - [`with_null_truncation()`](path_confusion::StructuralClasses::with_null_truncation) —
-//!   `%00` as a C-string terminator;
-//! - [`with_overlong([…])`](path_confusion::StructuralClasses::with_overlong) and
-//!   [`with_double_decode()`](path_confusion::StructuralClasses::with_double_decode) —
-//!   recognise overlong-UTF-8 (`%C0%AF`) and double-percent (`%252F`) forms. Enable
-//!   `with_double_decode()` — or the topology-named
-//!   [`behind_decoding_proxy()`](path_confusion::StructuralClasses::behind_decoding_proxy)
-//!   preset — whenever two layers each decode (CDN/WAF → origin, or proxy → proxy):
-//!   that is **CVE-2025-0108** (PAN-OS), where nginx decoded `%252e%252e` once and
-//!   passed it, then Apache decoded again to `..` and traversed into a protected path;
+//! - [`with_overlong([…])`](path_confusion::StructuralClasses::with_overlong) —
+//!   recognise overlong-UTF-8 forms (`%C0%AF`) accepted by legacy decoders;
 //! - [`with_probe(p)`](path_confusion::StructuralClasses::with_probe) — a custom
 //!   [`StructuralProbe`](path_confusion::StructuralProbe) **break-glass** for a structural
 //!   form the built-in alphabet doesn't ship (e.g. a fresh CVE), denied on presence
@@ -126,8 +118,22 @@
 //!
 //! Each toggle is a per-deployment security decision: it is how you tell the guard
 //! which paths your backend considers equivalent. Example:
-//! `StructuralClasses::new().with_backslash()`. (Case is **not** here — it is a
-//! separate, required builder declaration; see below.)
+//! `StructuralClasses::new().with_backslash()`. (Case and decode depth are **not**
+//! here — they are separate, required builder declarations; see below.)
+//!
+//! ## Decoding layers in front of the upstream
+//!
+//! The builder **requires** a [`DecodeLayers`](path_confusion::DecodeLayers)
+//! declaration; there is no default. Declare
+//! [`Layered`](path_confusion::DecodeLayers::Layered) whenever more than one layer
+//! percent-decodes the path before it is finally routed — a CDN or WAF in front of the
+//! origin, or proxy-in-front-of-proxy. That topology is **CVE-2025-0108** (PAN-OS):
+//! nginx decoded `%252e%252e` once and passed it, then Apache decoded again to `..`
+//! and traversed into a protected path. Under `Layered`, double-percent forms
+//! (`%252F`, `%252E`) are treated as structure and the content-decode check applies
+//! two passes. Declare [`Single`](path_confusion::DecodeLayers::Single) for a lone
+//! backend with nothing decoding in front; when unsure, `Layered` is the safe,
+//! deny-more direction.
 //!
 //! ## Case-insensitive backends
 //!
@@ -179,7 +185,7 @@
 //!
 //! use async_trait::async_trait;
 //! use huskarl_pingora::{
-//!     resource::{AuthCtx, AuthProxy, CaseSensitivity, Guard, Rule},
+//!     resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeLayers, Guard, Rule},
 //!     resource_server::{
 //!         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
 //!         validator::rfc9068::Rfc9068Validator,
@@ -244,6 +250,7 @@
 //!     let guard = Guard::builder()
 //!         .validator(validator)
 //!         .case_sensitivity(CaseSensitivity::Sensitive) // required: declare backend case behavior
+//!         .decode_layers(DecodeLayers::Single) // required: declare decode depth behind this layer
 //!         .subtree("/api", Rule::required().scopes(["api"])) // /api and below
 //!         .route("/health", Rule::public()) // exactly /health
 //!         .build()
@@ -258,78 +265,13 @@
 pub mod login;
 #[cfg(feature = "resource")]
 pub(crate) mod metrics;
-#[cfg(any(feature = "resource", feature = "login"))]
-pub mod path_confusion;
-#[cfg(test)]
-#[cfg(any(feature = "resource", feature = "login"))]
-mod path_confusion_proptest;
-#[cfg(any(feature = "resource", feature = "login"))]
-pub(crate) mod path_router;
-#[cfg(any(feature = "resource", feature = "login"))]
-pub(crate) mod percent;
 #[cfg(feature = "resource")]
 pub mod resource;
-#[cfg(any(feature = "resource", feature = "login"))]
-pub(crate) mod route_tree;
-#[cfg(any(feature = "resource", feature = "login"))]
-pub(crate) mod structural;
-
-/// Expands a path into the `matchit` patterns that cover that path
-/// and everything beneath it, for the `subtree` builder methods.
-///
-/// - `/blah`  → `/blah`, `/blah/`, `/blah/{*rest}`
-/// - `/blah/` → `/blah/`, `/blah/{*rest}` (the bare `/blah` is *not* included)
-/// - `/`      → `/`, `/{*rest}` (the whole tree)
-///
-/// A trailing slash on the input therefore means "this directory and its
-/// contents, but not the bare name". `matchit`'s catch-all matches neither the
-/// empty remainder nor the bare path, so the literal and trailing-slash
-/// patterns must be inserted explicitly alongside it.
-#[cfg(any(feature = "resource", feature = "login"))]
-pub(crate) fn subtree_patterns(path: &str) -> Vec<String> {
-    if path.ends_with('/') {
-        vec![path.to_owned(), format!("{path}{{*rest}}")]
-    } else {
-        vec![
-            path.to_owned(),
-            format!("{path}/"),
-            format!("{path}/{{*rest}}"),
-        ]
-    }
-}
 
 /// Re-export of [`huskarl_resource_server`] for convenience.
 #[cfg(feature = "resource")]
 pub use huskarl_resource_server as resource_server;
-
-#[cfg(test)]
+/// Re-export of [`huskarl_route_guard`]'s path-confusion configuration — the
+/// routing and path-confusion engine both proxies are built on.
 #[cfg(any(feature = "resource", feature = "login"))]
-mod subtree_patterns_tests {
-    use super::subtree_patterns;
-
-    #[test]
-    fn no_trailing_slash_expands_to_three() {
-        assert_eq!(
-            subtree_patterns("/blah"),
-            vec!["/blah", "/blah/", "/blah/{*rest}"]
-        );
-    }
-
-    #[test]
-    fn trailing_slash_omits_bare_path() {
-        assert_eq!(subtree_patterns("/blah/"), vec!["/blah/", "/blah/{*rest}"]);
-    }
-
-    #[test]
-    fn root_covers_whole_tree() {
-        assert_eq!(subtree_patterns("/"), vec!["/", "/{*rest}"]);
-    }
-
-    #[test]
-    fn nested_path() {
-        assert_eq!(
-            subtree_patterns("/a/b"),
-            vec!["/a/b", "/a/b/", "/a/b/{*rest}"]
-        );
-    }
-}
+pub use huskarl_route_guard::path_confusion;

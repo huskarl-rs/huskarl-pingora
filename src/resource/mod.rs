@@ -46,6 +46,7 @@ pub(crate) mod uri;
 pub use ctx::{AuthCtx, HasAuthState};
 pub use error::ConfigError;
 pub use guard::{ClientCertDer, Guard, GuardBuilder};
+pub use huskarl_route_guard::MethodMatch;
 pub use outcome::Outcome;
 pub use proxy::AuthProxy;
 pub use rule::{CheckError, Rule, TokenRequirement};
@@ -53,6 +54,6 @@ pub use scopes::HasScopes;
 
 #[doc(no_inline)]
 pub use crate::path_confusion::{
-    CaseSensitivity, PathConfusion, StructuralChar, StructuralClasses, StructuralProbe,
+    CaseSensitivity, DecodeLayers, DenyReason, PathConfusion, StructuralChar, StructuralClass,
+    StructuralClasses, StructuralProbe,
 };
-pub use crate::route_tree::MethodMatch;

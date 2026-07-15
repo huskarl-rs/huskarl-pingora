@@ -98,15 +98,19 @@ impl From<serde_json::Error> for ConfigError {
     }
 }
 
-impl From<crate::path_router::RuleRouterError> for ConfigError {
-    fn from(e: crate::path_router::RuleRouterError) -> Self {
-        use crate::path_router::RuleRouterError;
+impl From<huskarl_route_guard::RuleRouterError> for ConfigError {
+    fn from(e: huskarl_route_guard::RuleRouterError) -> Self {
+        use huskarl_route_guard::RuleRouterError;
         match e {
             RuleRouterError::Route { pattern, reason } => Self::Route { pattern, reason },
             RuleRouterError::NonCanonical { pattern } => Self::NonCanonicalPattern { pattern },
             RuleRouterError::NonCanonicalCase { pattern } => {
                 Self::NonCanonicalCasePattern { pattern }
             }
+            RuleRouterError::RuleIdOutOfOrder { pattern, .. } => Self::Route {
+                pattern,
+                reason: "internal error: rule-id ordering invariant violated",
+            },
         }
     }
 }

@@ -87,105 +87,107 @@ mod tests {
     }
 
     #[test]
-    fn no_base_returns_original() {
-        let req = uri("/api/data?q=1");
-        let result = request_uri(None, None, &req).unwrap();
-        assert_eq!(result.to_string(), "/api/data?q=1");
+    fn reconstructs_expected_uri() {
+        // (base_uri, strip_prefix, request_uri, expected reconstruction)
+        let cases: &[(Option<&str>, Option<&str>, &str, &str)] = &[
+            // No base → the raw request URI is returned unchanged.
+            (None, None, "/api/data?q=1", "/api/data?q=1"),
+            // Base contributes scheme + authority + path.
+            (
+                Some("https://api.example.com/v1"),
+                None,
+                "/users",
+                "https://api.example.com/v1/users",
+            ),
+            // A trailing slash on the base path is trimmed before joining.
+            (
+                Some("https://api.example.com/v1/"),
+                None,
+                "/users",
+                "https://api.example.com/v1/users",
+            ),
+            // A root base path adds no prefix.
+            (
+                Some("https://api.example.com"),
+                None,
+                "/users",
+                "https://api.example.com/users",
+            ),
+            // The query string is preserved.
+            (
+                Some("https://api.example.com"),
+                None,
+                "/users?page=2&limit=10",
+                "https://api.example.com/users?page=2&limit=10",
+            ),
+            // strip_prefix removes the matched leading segment.
+            (
+                Some("https://api.example.com"),
+                Some("/proxy"),
+                "/proxy/users",
+                "https://api.example.com/users",
+            ),
+            // strip_prefix composes with a base path.
+            (
+                Some("https://api.example.com/v1"),
+                Some("/proxy"),
+                "/proxy/users",
+                "https://api.example.com/v1/users",
+            ),
+            // strip_prefix keeps the query string.
+            (
+                Some("https://api.example.com"),
+                Some("/proxy"),
+                "/proxy/users?q=test",
+                "https://api.example.com/users?q=test",
+            ),
+            // `/proxy/X` strips at the segment boundary — contrast the `/proxyX`
+            // none-case below: the two must not reconstruct to the same URI.
+            (
+                Some("https://api.example.com"),
+                Some("/proxy"),
+                "/proxy/X",
+                "https://api.example.com/X",
+            ),
+        ];
+        for &(base, strip, req, expected) in cases {
+            let base = base.map(uri);
+            assert_eq!(
+                request_uri(base.as_ref(), strip, &uri(req))
+                    .map(|u| u.to_string())
+                    .as_deref(),
+                Some(expected),
+                "base {base:?} strip {strip:?} req {req}",
+            );
+        }
     }
 
     #[test]
-    fn base_prepends_scheme_authority_and_path() {
-        let base = uri("https://api.example.com/v1");
-        let req = uri("/users");
-        let result = request_uri(Some(&base), None, &req).unwrap();
-        assert_eq!(result.to_string(), "https://api.example.com/v1/users");
-    }
-
-    #[test]
-    fn base_with_trailing_slash() {
-        let base = uri("https://api.example.com/v1/");
-        let req = uri("/users");
-        let result = request_uri(Some(&base), None, &req).unwrap();
-        assert_eq!(result.to_string(), "https://api.example.com/v1/users");
-    }
-
-    #[test]
-    fn base_root_path() {
+    fn returns_none_when_strip_prefix_does_not_match_at_a_boundary() {
+        // A raw byte-prefix match would collapse `/proxyX` onto the same htu as
+        // `/proxy/X`; stripping only at a segment boundary keeps them distinct, so
+        // a non-boundary or absent prefix must fail reconstruction (fail closed).
         let base = uri("https://api.example.com");
-        let req = uri("/users");
-        let result = request_uri(Some(&base), None, &req).unwrap();
-        assert_eq!(result.to_string(), "https://api.example.com/users");
-    }
-
-    #[test]
-    fn preserves_query_string() {
-        let base = uri("https://api.example.com");
-        let req = uri("/users?page=2&limit=10");
-        let result = request_uri(Some(&base), None, &req).unwrap();
-        assert_eq!(
-            result.to_string(),
-            "https://api.example.com/users?page=2&limit=10"
-        );
-    }
-
-    #[test]
-    fn strip_prefix_removes_prefix() {
-        let base = uri("https://api.example.com");
-        let req = uri("/proxy/users");
-        let result = request_uri(Some(&base), Some("/proxy"), &req).unwrap();
-        assert_eq!(result.to_string(), "https://api.example.com/users");
-    }
-
-    #[test]
-    fn strip_prefix_mismatch_returns_none() {
-        let base = uri("https://api.example.com");
-        let req = uri("/other/users");
-        assert!(request_uri(Some(&base), Some("/proxy"), &req).is_none());
-    }
-
-    #[test]
-    fn strip_prefix_requires_segment_boundary() {
-        // `/proxyX` shares a byte prefix with `/proxy` but is a different path
-        // segment — it must NOT be stripped (a raw byte-prefix match would
-        // collapse it onto the same htu as `/proxy/X`).
-        let base = uri("https://api.example.com");
-        let req = uri("/proxyusers");
-        assert!(request_uri(Some(&base), Some("/proxy"), &req).is_none());
-    }
-
-    #[test]
-    fn strip_prefix_boundary_does_not_collide() {
-        // `/proxyX` is rejected, while `/proxy/X` reconstructs to `.../X`, so the
-        // two no longer map to the same reconstructed URI.
-        let base = uri("https://api.example.com");
-        assert!(request_uri(Some(&base), Some("/proxy"), &uri("/proxyX")).is_none());
-        let collide = request_uri(Some(&base), Some("/proxy"), &uri("/proxy/X")).unwrap();
-        assert_eq!(collide.to_string(), "https://api.example.com/X");
-    }
-
-    #[test]
-    fn strip_prefix_with_base_path() {
-        let base = uri("https://api.example.com/v1");
-        let req = uri("/proxy/users");
-        let result = request_uri(Some(&base), Some("/proxy"), &req).unwrap();
-        assert_eq!(result.to_string(), "https://api.example.com/v1/users");
-    }
-
-    #[test]
-    fn strip_prefix_with_query() {
-        let base = uri("https://api.example.com");
-        let req = uri("/proxy/users?q=test");
-        let result = request_uri(Some(&base), Some("/proxy"), &req).unwrap();
-        assert_eq!(result.to_string(), "https://api.example.com/users?q=test");
+        // (strip_prefix, request_uri) pairs that must NOT reconstruct.
+        let cases: &[(&str, &str)] = &[
+            ("/proxy", "/other/users"), // prefix absent
+            ("/proxy", "/proxyusers"),  // shares bytes but not a segment boundary
+            ("/proxy", "/proxyX"),      // ditto — must not collide with `/proxy/X`
+        ];
+        for &(strip, req) in cases {
+            assert!(
+                request_uri(Some(&base), Some(strip), &uri(req)).is_none(),
+                "strip {strip:?} req {req} must not reconstruct",
+            );
+        }
     }
 
     #[test]
     fn strip_prefix_exact_match_leaves_empty_path() {
         let base = uri("https://api.example.com");
-        let req = uri("/proxy");
-        let result = request_uri(Some(&base), Some("/proxy"), &req).unwrap();
+        let result = request_uri(Some(&base), Some("/proxy"), &uri("/proxy")).unwrap();
         // After stripping "/proxy" from "/proxy" we get "", base path is ""
-        // so result path is "/" (from "/"  being added).
+        // so result path is "/" (from "/" being added).
         assert!(result.to_string().starts_with("https://api.example.com/"));
     }
 }

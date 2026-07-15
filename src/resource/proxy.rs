@@ -37,7 +37,7 @@ use crate::{
 /// # Example
 ///
 /// ```
-/// # use huskarl_pingora::resource::{AuthProxy, CaseSensitivity, Guard, Rule};
+/// # use huskarl_pingora::resource::{AuthProxy, CaseSensitivity, DecodeLayers, Guard, Rule};
 /// # fn build<V, P>(my_proxy: P, validator: V)
 /// # where
 /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -46,6 +46,7 @@ use crate::{
 /// let guard = Guard::builder()
 ///     .validator(validator)
 ///     .case_sensitivity(CaseSensitivity::Sensitive)
+///     .decode_layers(DecodeLayers::Single)
 ///     .subtree("/public", Rule::public()) // /public and everything under it
 ///     .build()
 ///     .expect("route");
@@ -223,8 +224,6 @@ mod tests {
 
     use async_trait::async_trait;
     use pingora_core::upstreams::peer::HttpPeer;
-    use pingora_proxy::Session as ProxySession;
-    use tokio::io::AsyncWriteExt;
 
     use super::*;
     use crate::{
@@ -232,7 +231,10 @@ mod tests {
             ctx::{AuthCtx, HasAuthState},
             guard::Guard,
             rule::Rule,
-            test_support::{MockClaims, MockError, mock_validator_metadata},
+            test_support::{
+                MockClaims, MockError, make_session, make_session_with_headers,
+                mock_validator_metadata,
+            },
         },
         resource_server::validator::{
             AccessTokenValidator, ValidatedRequest, ValidationResult,
@@ -337,32 +339,14 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────
 
-    use tokio::io::DuplexStream;
-
-    async fn make_session_with_headers(
-        method: &str,
-        path: &str,
-        extra_headers: &str,
-    ) -> (ProxySession, DuplexStream) {
-        let raw = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{extra_headers}\r\n");
-        let (mut client, server) = tokio::io::duplex(4096);
-        client.write_all(raw.as_bytes()).await.unwrap();
-        let mut session = ProxySession::new_h1(Box::new(server));
-        session.downstream_session.read_request().await.unwrap();
-        (session, client)
-    }
-
-    async fn make_session(method: &str, path: &str) -> (ProxySession, DuplexStream) {
-        make_session_with_headers(method, path, "").await
-    }
-
     fn build_auth_proxy(
         validator: MockValidator,
         routes: Vec<(&str, Rule<MockClaims>)>,
     ) -> AuthProxy<InnerProxy, MockValidator> {
         let mut builder = Guard::builder()
             .validator(validator)
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive);
+            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+            .decode_layers(crate::resource::DecodeLayers::Single);
         for (pattern, rule) in routes {
             builder = builder.route(pattern, rule);
         }

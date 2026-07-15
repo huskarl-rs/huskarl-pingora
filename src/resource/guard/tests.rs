@@ -111,7 +111,8 @@ fn build_guard(
 ) -> Guard<MockValidator> {
     let mut builder = Guard::builder()
         .validator(validator)
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive);
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(crate::resource::DecodeLayers::Single);
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
@@ -127,6 +128,7 @@ fn build_guard_with_resource(
     let mut builder = Guard::builder()
         .validator(validator)
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .resource(resource.parse().unwrap())
         .maybe_strip_prefix(strip_prefix);
     for (pattern, rule) in routes {
@@ -143,6 +145,51 @@ async fn check(
     guard
         .check_request(&http::HeaderMap::new(), method, &uri.parse().unwrap(), None)
         .await
+}
+
+/// Builds a guard with a single `subtree` route, case-sensitive backend, and the
+/// default path-confusion guard — the shape most path-confusion tests need.
+fn subtree_guard(
+    validator: MockValidator,
+    pattern: &str,
+    rule: Rule<MockClaims>,
+) -> Guard<MockValidator> {
+    Guard::builder()
+        .validator(validator)
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
+        .subtree(pattern, rule)
+        .build()
+        .unwrap()
+}
+
+// --- Outcome assertions ---
+
+/// Asserts `outcome` is a `Deny` carrying `status`.
+#[track_caller]
+fn assert_deny(outcome: &Outcome<MockClaims>, status: http::StatusCode) {
+    assert!(
+        matches!(outcome, Outcome::Deny { status: s, .. } if *s == status),
+        "expected Deny {status}, got {outcome:?}",
+    );
+}
+
+/// Asserts `outcome` forwards **without** a token (public or optional-no-token).
+#[track_caller]
+fn assert_forward(outcome: &Outcome<MockClaims>) {
+    assert!(
+        matches!(outcome, Outcome::Forward { token: None, .. }),
+        "expected Forward without a token, got {outcome:?}",
+    );
+}
+
+/// Asserts `outcome` forwards carrying a validated token.
+#[track_caller]
+fn assert_forward_authed(outcome: &Outcome<MockClaims>) {
+    assert!(
+        matches!(outcome, Outcome::Forward { token: Some(_), .. }),
+        "expected Forward with a token, got {outcome:?}",
+    );
 }
 
 // --- resource_metadata tests ---
@@ -209,7 +256,7 @@ fn resource_metadata_no_scopes_omits_field() {
 async fn public_route_skips_validation() {
     let guard = build_guard(MockValidator::no_token(), vec![("/health", Rule::public())]);
     let outcome = check(&guard, &http::Method::GET, "/health").await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
     // Validator must not have been called.
     assert!(guard.validator.captured_uri.lock().unwrap().is_none());
 }
@@ -218,10 +265,7 @@ async fn public_route_skips_validation() {
 async fn required_route_no_token_denies_401() {
     let guard = build_guard(MockValidator::no_token(), vec![]);
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -229,7 +273,7 @@ async fn required_route_valid_token_forwards() {
     let claims = MockClaims { scopes: None };
     let guard = build_guard(MockValidator::valid(claims), vec![]);
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(outcome, Outcome::Forward { token: Some(_), .. }));
+    assert_forward_authed(&outcome);
 }
 
 #[tokio::test]
@@ -243,7 +287,7 @@ async fn required_route_invalid_token_denies() {
 async fn optional_route_no_token_forwards() {
     let guard = build_guard(MockValidator::no_token(), vec![("/api", Rule::optional())]);
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
 }
 
 #[tokio::test]
@@ -254,7 +298,7 @@ async fn optional_route_valid_token_forwards_with_token() {
         vec![("/api", Rule::optional())],
     );
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(outcome, Outcome::Forward { token: Some(_), .. }));
+    assert_forward_authed(&outcome);
 }
 
 #[tokio::test]
@@ -262,17 +306,18 @@ async fn default_rule_applies_to_unmatched_paths() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/health", Rule::public())
         .default(Rule::optional())
         .build()
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/health").await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
 
     // Unmatched path uses the default Optional rule; no token → Forward.
     let outcome = check(&guard, &http::Method::GET, "/other").await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
 }
 
 // --- check_request: scope enforcement ---
@@ -287,7 +332,7 @@ async fn scope_check_passes() {
         vec![("/admin", Rule::required().scopes(["admin"]))],
     );
     let outcome = check(&guard, &http::Method::GET, "/admin").await;
-    assert!(matches!(outcome, Outcome::Forward { token: Some(_), .. }));
+    assert_forward_authed(&outcome);
 }
 
 #[tokio::test]
@@ -300,10 +345,7 @@ async fn scope_check_failure_denies_403() {
         vec![("/admin", Rule::required().scopes(["admin"]))],
     );
     let outcome = check(&guard, &http::Method::GET, "/admin").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::FORBIDDEN
-    ));
+    assert_deny(&outcome, http::StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -317,10 +359,7 @@ async fn multiple_scopes_all_required() {
     );
     // Has "read" but not "write" → denied.
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::FORBIDDEN
-    ));
+    assert_deny(&outcome, http::StatusCode::FORBIDDEN);
 }
 
 // --- check_request: audience enforcement ---
@@ -333,7 +372,7 @@ async fn audience_check_passes() {
         vec![("/api", Rule::required().audience("my-api"))],
     );
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(outcome, Outcome::Forward { token: Some(_), .. }));
+    assert_forward_authed(&outcome);
 }
 
 #[tokio::test]
@@ -344,10 +383,7 @@ async fn audience_mismatch_denies_401() {
         vec![("/api", Rule::required().audience("my-api"))],
     );
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 // --- check_request: custom checks ---
@@ -363,10 +399,7 @@ async fn custom_check_forbidden_denies_403() {
         )],
     );
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::FORBIDDEN
-    ));
+    assert_deny(&outcome, http::StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -380,10 +413,7 @@ async fn custom_check_invalid_token_denies_401() {
         )],
     );
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -394,7 +424,7 @@ async fn custom_check_ok_forwards() {
         vec![("/api", Rule::required().check(|_| Ok(())))],
     );
     let outcome = check(&guard, &http::Method::GET, "/api").await;
-    assert!(matches!(outcome, Outcome::Forward { token: Some(_), .. }));
+    assert_forward_authed(&outcome);
 }
 
 // --- check_request: strip_credentials ---
@@ -483,10 +513,7 @@ async fn request_uri_strip_prefix_no_match_denies() {
     // Validation should not have been called
     assert!(guard.validator.captured_uri.lock().unwrap().is_none());
 
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -517,12 +544,11 @@ async fn subtree_covers_path_and_descendants() {
     let claims = MockClaims {
         scopes: Some("read".into()),
     };
-    let guard = Guard::builder()
-        .validator(MockValidator::valid(claims))
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required().scopes(["admin"]))
-        .build()
-        .unwrap();
+    let guard = subtree_guard(
+        MockValidator::valid(claims),
+        "/admin",
+        Rule::required().scopes(["admin"]),
+    );
 
     for path in ["/admin", "/admin/", "/admin/users", "/admin/users/1"] {
         let outcome = check(&guard, &http::Method::GET, path).await;
@@ -538,6 +564,7 @@ async fn subtree_exact_route_carve_out_wins() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/admin", Rule::required())
         .route("/admin/health", Rule::public())
         .build()
@@ -545,14 +572,11 @@ async fn subtree_exact_route_carve_out_wins() {
 
     // The more-specific exact route is public — no token still forwards.
     let outcome = check(&guard, &http::Method::GET, "/admin/health").await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
 
     // Everything else under the subtree requires a token.
     let outcome = check(&guard, &http::Method::GET, "/admin/secret").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -560,12 +584,7 @@ async fn subtree_trailing_slash_excludes_bare_path() {
     // A trailing slash means "this directory and its contents, but not the bare
     // name". `/admin/` and descendants are public; bare `/admin` falls through
     // to the default (required) rule.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin/", Rule::public())
-        .build()
-        .unwrap();
+    let guard = subtree_guard(MockValidator::no_token(), "/admin/", Rule::public());
 
     assert!(matches!(
         check(&guard, &http::Method::GET, "/admin/").await,
@@ -575,84 +594,38 @@ async fn subtree_trailing_slash_excludes_bare_path() {
         check(&guard, &http::Method::GET, "/admin/x").await,
         Outcome::Forward { .. }
     ));
-    assert!(matches!(
-        check(&guard, &http::Method::GET, "/admin").await,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(
+        &check(&guard, &http::Method::GET, "/admin").await,
+        http::StatusCode::UNAUTHORIZED,
+    );
 }
 
 // --- path-confusion guard ---
 
 #[tokio::test]
-async fn guard_denies_traversal_into_scoped_subtree() {
-    // Raw `/x/../admin/secret` matches the default rule; a backend that resolves
-    // `..` would route it into `/admin`. Route changes → 400.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required().scopes(["admin"]))
-        .build()
-        .unwrap();
-
-    let outcome = check(&guard, &http::Method::GET, "/x/../admin/secret").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
-}
-
-#[tokio::test]
-async fn guard_denies_decoded_double_slash() {
-    // Raw `/%2f/admin` has no literal `/` after the encoded byte, so it matches
-    // the default rule; a backend that decodes `%2F` and merges slashes routes
-    // it to `/admin`. Route change → 400. (Without slash-merging in the decode
-    // strategy the decoded form is `//admin`, which would slip through.)
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required().scopes(["admin"]))
-        .build()
-        .unwrap();
-
-    let outcome = check(&guard, &http::Method::GET, "/%2f/admin").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
-}
-
-#[tokio::test]
-async fn guard_denies_encoded_dot_traversal() {
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required())
-        .build()
-        .unwrap();
-
-    let outcome = check(&guard, &http::Method::GET, "/%2e%2e/admin").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
-}
-
-#[tokio::test]
-async fn guard_denies_path_param_vector() {
-    // `/admin/..;/secret` matches `/admin` raw, but `;`-strip-then-resolve escapes
-    // to `/secret` (default) — route change → 400.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required())
-        .build()
-        .unwrap();
-
-    let outcome = check(&guard, &http::Method::GET, "/admin/..;/secret").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+async fn guard_denies_normalizations_that_relocate_the_rule() {
+    // Each raw path matches the default rule (or `/admin` raw), but a normalizing
+    // backend would resolve it onto — or off — the protected `/admin` subtree. The
+    // path→rule binding is ambiguous, so the guard refuses it pre-auth with a 400.
+    let guard = subtree_guard(MockValidator::no_token(), "/admin", Rule::required());
+    // (attack path, why a normalizing backend relocates the rule)
+    let cases: &[(&str, &str)] = &[
+        // `..` resolves into the scoped subtree.
+        ("/x/../admin/secret", "dot-segment traversal"),
+        // `%2F` decoded + slash-merged routes to `/admin` (raw has no literal `/`).
+        ("/%2f/admin", "decoded, merged double slash"),
+        // `%2e%2e` decodes to `..` → traversal.
+        ("/%2e%2e/admin", "encoded dot traversal"),
+        // `;`-strip-then-resolve escapes `/admin` to `/secret` (the default rule).
+        ("/admin/..;/secret", "path-parameter vector"),
+    ];
+    for (uri, why) in cases {
+        let outcome = check(&guard, &http::Method::GET, uri).await;
+        assert!(
+            matches!(outcome, Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST),
+            "{uri} ({why}) must be denied 400, got {outcome:?}",
+        );
+    }
 }
 
 #[tokio::test]
@@ -673,12 +646,11 @@ async fn guard_400_challenges_carry_no_scope_hint() {
 
     // Ambiguous path: the raw path matches the scoped /admin subtree, so a leak
     // would surface as `scope="admin"` in the invalid_request challenge.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required().scopes(["admin"]))
-        .build()
-        .unwrap();
+    let guard = subtree_guard(
+        MockValidator::no_token(),
+        "/admin",
+        Rule::required().scopes(["admin"]),
+    );
     let (status, challenges) =
         deny_parts(check(&guard, &http::Method::GET, "/admin/..;/secret").await);
     assert_eq!(status, Some(http::StatusCode::BAD_REQUEST));
@@ -692,6 +664,7 @@ async fn guard_400_challenges_carry_no_scope_hint() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .resource("https://api.example.com".parse().unwrap())
         .strip_prefix("/proxy")
         .default(Rule::required().scopes(["admin"]))
@@ -706,12 +679,11 @@ async fn guard_400_challenges_carry_no_scope_hint() {
 
     // Contrast: a post-routing insufficient-scope 403 keeps the hint — that is the
     // attribute's canonical use (RFC 6750 §3), telling the client what to request.
-    let guard = Guard::builder()
-        .validator(MockValidator::valid(MockClaims { scopes: None }))
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required().scopes(["admin"]))
-        .build()
-        .unwrap();
+    let guard = subtree_guard(
+        MockValidator::valid(MockClaims { scopes: None }),
+        "/admin",
+        Rule::required().scopes(["admin"]),
+    );
     let (status, challenges) = deny_parts(check(&guard, &http::Method::GET, "/admin/x").await);
     assert_eq!(status, Some(http::StatusCode::FORBIDDEN));
     assert!(
@@ -724,15 +696,10 @@ async fn guard_400_challenges_carry_no_scope_hint() {
 async fn guard_allows_non_structural_encoded_content() {
     // Non-structural encoded content (`%20`) decodes to a deeper path under the same
     // `/files/{*rest}` rule — no route change → allowed by the content-decode precision.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/files", Rule::public())
-        .build()
-        .unwrap();
+    let guard = subtree_guard(MockValidator::no_token(), "/files", Rule::public());
 
     let outcome = check(&guard, &http::Method::GET, "/files/a%20b").await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
 }
 
 #[tokio::test]
@@ -742,18 +709,16 @@ async fn blob_subtree_tolerates_structural_byte_in_key() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .blob_subtree("/files", Rule::public())
         .build()
         .unwrap();
 
     let forwarded = check(&guard, &http::Method::GET, "/files/a%2fb").await;
-    assert!(matches!(forwarded, Outcome::Forward { token: None, .. }));
+    assert_forward(&forwarded);
 
     let denied = check(&guard, &http::Method::GET, "/files/a/../b").await;
-    assert!(matches!(
-        denied,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&denied, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -765,27 +730,22 @@ async fn method_specific_rule_closes_other_methods_no_backtrack() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/{*rest}", Rule::public()) // catch-all, any method, public
         .route("/admin", Rule::public().method(http::Method::GET)) // GET /admin public
         .build()
         .unwrap();
 
     // GET /admin → its GET rule → public.
-    assert!(matches!(
-        check(&guard, &http::Method::GET, "/admin").await,
-        Outcome::Forward { token: None, .. }
-    ));
+    assert_forward(&check(&guard, &http::Method::GET, "/admin").await);
     // POST /admin → no POST rule at /admin, no wildcard there → default (required) → 401.
     // Crucially NOT the public catch-all.
-    assert!(matches!(
-        check(&guard, &http::Method::POST, "/admin").await,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(
+        &check(&guard, &http::Method::POST, "/admin").await,
+        http::StatusCode::UNAUTHORIZED,
+    );
     // POST /other → matches the catch-all (any method) → public.
-    assert!(matches!(
-        check(&guard, &http::Method::POST, "/other").await,
-        Outcome::Forward { token: None, .. }
-    ));
+    assert_forward(&check(&guard, &http::Method::POST, "/other").await);
 }
 
 #[tokio::test]
@@ -795,19 +755,17 @@ async fn method_wildcard_fallback_is_per_terminal() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/admin", Rule::public().method(http::Method::GET)) // GET public
         .route("/admin", Rule::required()) // every other method requires a token
         .build()
         .unwrap();
 
-    assert!(matches!(
-        check(&guard, &http::Method::GET, "/admin").await,
-        Outcome::Forward { token: None, .. }
-    ));
-    assert!(matches!(
-        check(&guard, &http::Method::POST, "/admin").await,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_forward(&check(&guard, &http::Method::GET, "/admin").await);
+    assert_deny(
+        &check(&guard, &http::Method::POST, "/admin").await,
+        http::StatusCode::UNAUTHORIZED,
+    );
 }
 
 #[tokio::test]
@@ -821,22 +779,20 @@ async fn method_axis_falls_to_default_rule_not_the_method_rule() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .default(Rule::public()) // permissive fallback
         .route("/admin", Rule::required().method(http::Method::POST)) // only POST is protected
         .build()
         .unwrap();
 
     // POST /admin → its method rule → required → 401 without a token.
-    assert!(matches!(
-        check(&guard, &http::Method::POST, "/admin").await,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(
+        &check(&guard, &http::Method::POST, "/admin").await,
+        http::StatusCode::UNAUTHORIZED,
+    );
     // GET /admin → no GET rule at /admin → the *default* (public), NOT the POST rule.
     // The protection scoped to POST does not extend to GET.
-    assert!(matches!(
-        check(&guard, &http::Method::GET, "/admin").await,
-        Outcome::Forward { token: None, .. }
-    ));
+    assert_forward(&check(&guard, &http::Method::GET, "/admin").await);
 }
 
 #[test]
@@ -845,6 +801,7 @@ fn blob_subtree_with_nested_route_is_build_error() {
     let result = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .blob_subtree("/files", Rule::public())
         .route("/files/secret", Rule::required())
         .build();
@@ -859,18 +816,10 @@ async fn guard_denies_structural_byte_in_plain_blob() {
     // Under the uniform-live model, a plain `subtree` blob denies an encoded slash in
     // its tail (a structural byte). Tolerating it is an explicit opt-in (opaque blob),
     // not the default.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/files", Rule::public())
-        .build()
-        .unwrap();
+    let guard = subtree_guard(MockValidator::no_token(), "/files", Rule::public());
 
     let outcome = check(&guard, &http::Method::GET, "/files/a%2fb").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -878,34 +827,21 @@ async fn guard_inert_for_double_encoding() {
     // Double-encoded dots are inert in a single pass (no `.` produced), so no
     // route change: the request falls through to the default rule (401 for the
     // missing token), not a 400 from the guard.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required())
-        .build()
-        .unwrap();
+    let guard = subtree_guard(MockValidator::no_token(), "/admin", Rule::required());
 
     let outcome = check(&guard, &http::Method::GET, "/%252e%252e/admin").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn guard_allows_long_clean_path() {
     // A very long but canonical path (no `%`/`;`/`//`/`/.`) can't be ambiguous,
     // so the length cap must not reject it — it routes under its rule normally.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/files", Rule::public())
-        .build()
-        .unwrap();
+    let guard = subtree_guard(MockValidator::no_token(), "/files", Rule::public());
 
     let path = format!("/files/{}", "a".repeat(16_384));
     let outcome = check(&guard, &http::Method::GET, &path).await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
 }
 
 #[tokio::test]
@@ -913,19 +849,11 @@ async fn guard_rejects_long_suspicious_path() {
     // A suspicious path (contains `%`) over the cap is denied: once the first
     // normalization shows the path can change, the length cap rejects it before
     // the remaining normalizations run.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/files", Rule::public())
-        .build()
-        .unwrap();
+    let guard = subtree_guard(MockValidator::no_token(), "/files", Rule::public());
 
     let path = format!("/files/{}%2e", "a".repeat(16_384));
     let outcome = check(&guard, &http::Method::GET, &path).await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -935,16 +863,14 @@ async fn guard_off_allows_traversal() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/admin", Rule::required().scopes(["admin"]))
         .path_confusion(crate::resource::PathConfusion::off())
         .build()
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/x/../admin/secret").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 // --- build-time non-canonical-pattern detection ---
@@ -955,6 +881,7 @@ fn build_rejects_noncanonical_pattern_with_double_slash() {
     let result = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/a/b", Rule::public())
         .route("/a//b", Rule::required())
         .build();
@@ -970,6 +897,7 @@ fn build_rejects_traversal_pattern() {
     let result = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/x/../b", Rule::required())
         .build();
     assert!(matches!(
@@ -985,6 +913,7 @@ fn build_allows_noncanonical_pattern_when_guard_off() {
     let result = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/a/b", Rule::public())
         .route("/a%2fb", Rule::required())
         .path_confusion(crate::resource::PathConfusion::off())
@@ -999,6 +928,7 @@ fn build_rejects_public_rule_with_check() {
     let result = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/health", Rule::public().check(|_| Ok(())))
         .build();
     assert!(matches!(
@@ -1012,6 +942,7 @@ fn build_rejects_public_default_rule_with_check() {
     let result = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .default(Rule::public().check(|_| Ok(())))
         .build();
     assert!(matches!(
@@ -1026,6 +957,7 @@ fn build_allows_distinct_canonical_trailing_slash_routes() {
     let result = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/admin", Rule::public())
         .route("/admin/", Rule::required())
         .build();
@@ -1039,6 +971,7 @@ async fn structural_case_opt_in_catches_relocation() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Insensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/admin", Rule::required())
         .build()
         .unwrap();
@@ -1046,28 +979,17 @@ async fn structural_case_opt_in_catches_relocation() {
     // `/Admin/x` carries uppercase a case-insensitive backend would fold onto the
     // protected `/admin` rule → denied 400.
     let outcome = check(&guard, &http::Method::GET, "/Admin/x").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn structural_case_not_flagged_by_default() {
     // Without with_case, a mixed-case path is not structural → falls to the
     // default (required) rule → 401 for the missing token, not a 400.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required())
-        .build()
-        .unwrap();
+    let guard = subtree_guard(MockValidator::no_token(), "/admin", Rule::required());
 
     let outcome = check(&guard, &http::Method::GET, "/Admin/x").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 // --- strict hygiene (RejectNonCanonical) ---
@@ -1080,16 +1002,14 @@ async fn hygiene_rejects_noncanonical_even_when_same_rule() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/files", Rule::public())
         .path_confusion(PathConfusion::reject_non_canonical())
         .build()
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/files/a%2fb").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1098,6 +1018,7 @@ async fn hygiene_allows_canonical_path() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/files", Rule::public())
         .path_confusion(PathConfusion::reject_non_canonical())
         .build()
@@ -1105,7 +1026,7 @@ async fn hygiene_allows_canonical_path() {
 
     // A clean path is canonical → allowed (public → forward).
     let outcome = check(&guard, &http::Method::GET, "/files/a/b").await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
 }
 
 // --- custom break-glass probe ---
@@ -1129,6 +1050,7 @@ async fn custom_probe_denies_aliased_prefix() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/admin", Rule::required().scopes(["admin"]))
         .structural_classes(StructuralClasses::new().with_probe(DangerPrefixProbe))
         .build()
@@ -1136,10 +1058,7 @@ async fn custom_probe_denies_aliased_prefix() {
 
     // `/danger/secret` carries the probe's form → denied 400 (break-glass).
     let outcome = check(&guard, &http::Method::GET, "/danger/secret").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1151,6 +1070,7 @@ async fn structural_overlong_opt_in_catches_relocation() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/admin", Rule::required())
         .structural_classes(
             StructuralClasses::new().with_overlong([StructuralChar::Slash, StructuralChar::Dot]),
@@ -1159,10 +1079,7 @@ async fn structural_overlong_opt_in_catches_relocation() {
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/x%c0%af..%c0%afadmin/secret").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1170,38 +1087,27 @@ async fn structural_overlong_not_flagged_by_default() {
     // Without the opt-in, overlong bytes are inert (the default scan only handles
     // single-byte %2F/%2E), so the path falls to the default (required) rule → 401
     // for the missing token, not a 400.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .subtree("/admin", Rule::required())
-        .build()
-        .unwrap();
+    let guard = subtree_guard(MockValidator::no_token(), "/admin", Rule::required());
 
     let outcome = check(&guard, &http::Method::GET, "/x%c0%af..%c0%afadmin/secret").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn structural_null_truncation_opt_in_catches() {
-    use crate::resource::StructuralClasses;
-    // A NUL-terminating backend reads `/admin%00/secret` as `/admin`; the truncation
-    // class denies the `%00`.
+async fn structural_null_truncation_denied_by_default() {
+    // A NUL-terminating backend reads `/admin%00/secret` as `/admin`. The truncation
+    // class is always-on in huskarl-route-guard (a NUL has no legitimate use in a
+    // path), so the default configuration denies the `%00` — no opt-in needed.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/admin", Rule::required())
-        .structural_classes(StructuralClasses::new().with_null_truncation())
         .build()
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/admin%00/secret").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::BAD_REQUEST
-    ));
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
 }
 
 // ── CVE regression casebook: scoping (architecture, not the structural guard) ──
@@ -1217,13 +1123,10 @@ async fn cve_query_string_cannot_widen_a_rule() {
     let guard = build_guard(MockValidator::no_token(), vec![("/public", Rule::public())]);
     // A protected path stays protected even when the query names a public one.
     let outcome = check(&guard, &http::Method::GET, "/admin?next=/public").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
     // A public path matches on its path regardless of the query.
     let outcome = check(&guard, &http::Method::GET, "/public?next=/admin").await;
-    assert!(matches!(outcome, Outcome::Forward { token: None, .. }));
+    assert_forward(&outcome);
 }
 
 #[tokio::test]
@@ -1239,10 +1142,7 @@ async fn cve_raw_fragment_is_stripped_to_base_path() {
         vec![("/admin", Rule::required())],
     );
     let outcome = check(&guard, &http::Method::GET, "/admin#/public").await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -1261,10 +1161,7 @@ async fn cve_forwarded_uri_header_is_not_trusted() {
             None,
         )
         .await;
-    assert!(matches!(
-        outcome,
-        Outcome::Deny { status, .. } if status == http::StatusCode::UNAUTHORIZED
-    ));
+    assert_deny(&outcome, http::StatusCode::UNAUTHORIZED);
 }
 
 // --- metrics: the `huskarl.resource.check` outcome counter ---
@@ -1375,6 +1272,7 @@ fn metrics_name_label_present_when_configured() {
         let guard = Guard::builder()
             .validator(MockValidator::no_token())
             .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+            .decode_layers(DecodeLayers::Single)
             .metrics_name("edge")
             .route("/health", Rule::public())
             .build()

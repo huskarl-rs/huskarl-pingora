@@ -1,22 +1,6 @@
 [tools]
 cmake = "4"
-"cargo:cargo-bolero" = "latest"
 
 [tasks.fmt]
 run = "cargo +nightly fmt"
 description = "Format code with nightly rustfmt"
-
-# Coverage-guided fuzzing of a bolero target (needs nightly for libFuzzer). Primes the live
-# corpus from the committed seeds in `fuzz-corpus/` so a run starts warm, then fuzzes.
-# Targets are addressed by their fully-qualified name (see `cargo bolero list`); extra args
-# pass through (e.g. `-T 60s` to bound a run, `-r <n>` for a run count).
-#
-#   mise run fuzz path_confusion_proptest::guard_relocation -T 600s   # router + verdict
-#   mise run fuzz route_tree::tests::matcher_differential -T 300s     # matcher vs matchit
-#   mise run fuzz structural::tests::scanner -T 300s                  # scanner invariants
-#
-# Edit/regenerate the seeds with:
-#   cargo test --features resource regenerate_fuzz_corpus -- --ignored
-[tasks.fuzz]
-description = "Prime seeds and fuzz a bolero target by full name (nightly)"
-run = "bash scripts/fuzz.sh"

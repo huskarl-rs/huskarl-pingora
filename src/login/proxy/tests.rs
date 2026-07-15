@@ -162,10 +162,6 @@ impl SessionDriver for MockSessionDriver {
         *self.delete_called.lock().unwrap() = true;
         Ok(vec![])
     }
-
-    fn session_aead_cipher(&self) -> Arc<dyn huskarl::core::crypto::cipher::AeadCipher> {
-        unimplemented!()
-    }
 }
 
 // ── Mock inner proxy ─────────────────────────────────────────────
@@ -265,22 +261,37 @@ async fn test_grant() -> AuthorizationCodeGrant {
 
 type TestProxy = LoginProxy<InnerProxy, MockSessionDriver>;
 
-async fn build_proxy_with_routes(
-    store: MockSessionDriver,
-    routes: Vec<(&'static str, LoginRule<MockSession>)>,
-) -> TestProxy {
-    let engine = Arc::new(
+/// Wraps a session store in a `LoginEngine` over the shared test config, grant,
+/// and cipher — the engine every proxy-under-test is built on.
+async fn build_engine<SD: SessionDriver>(store: SD) -> Arc<huskarl_login::engine::LoginEngine<SD>> {
+    Arc::new(
         huskarl_login::engine::LoginEngine::builder()
             .config(default_config())
             .grant(test_grant().await)
             .session_store(store)
             .cipher(test_cipher().await)
             .build(),
-    );
+    )
+}
+
+/// A rule check that only admits sessions whose role is `"admin"`.
+fn admin_only(s: &MockSession) -> Result<(), CheckError> {
+    if s.role == Some("admin") {
+        Ok(())
+    } else {
+        Err(CheckError::Forbidden("admin only".into()))
+    }
+}
+
+async fn build_proxy_with_routes(
+    store: MockSessionDriver,
+    routes: Vec<(&'static str, LoginRule<MockSession>)>,
+) -> TestProxy {
     let mut builder = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(engine)
-        .case_sensitivity(crate::login::CaseSensitivity::Sensitive);
+        .engine(build_engine(store).await)
+        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .decode_layers(crate::login::DecodeLayers::Single);
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
@@ -376,6 +387,7 @@ async fn subtree_required_covers_path_and_descendants() {
         .inner(InnerProxy::new())
         .engine(engine)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .subtree("/dashboard", LoginRule::required())
         .build()
         .expect("valid routes");
@@ -457,16 +469,7 @@ async fn required_check_pass_forwards() {
         .build();
     let proxy = build_proxy_with_routes(
         store,
-        vec![(
-            "/admin",
-            LoginRule::required().check(|s: &MockSession| {
-                if s.role == Some("admin") {
-                    Ok(())
-                } else {
-                    Err(CheckError::Forbidden("admin only".into()))
-                }
-            }),
-        )],
+        vec![("/admin", LoginRule::required().check(admin_only))],
     )
     .await;
     let (mut s, _c) = make_session("GET", "/admin", "Accept: application/json\r\n").await;
@@ -485,16 +488,7 @@ async fn required_check_fail_returns_403() {
         .build();
     let proxy = build_proxy_with_routes(
         store,
-        vec![(
-            "/admin",
-            LoginRule::required().check(|s: &MockSession| {
-                if s.role == Some("admin") {
-                    Ok(())
-                } else {
-                    Err(CheckError::Forbidden("admin only".into()))
-                }
-            }),
-        )],
+        vec![("/admin", LoginRule::required().check(admin_only))],
     )
     .await;
     let (mut s, mut c) = make_session("GET", "/admin", "Accept: application/json\r\n").await;
@@ -527,18 +521,11 @@ async fn cors_preflight_not_passed_through_when_disabled() {
     // With cors_passthrough(false) a preflight is subject to the normal flow: the
     // default `required` rule has no session, so the engine gates it instead of
     // letting it reach the inner proxy.
-    let engine = Arc::new(
-        huskarl_login::engine::LoginEngine::builder()
-            .config(default_config())
-            .grant(test_grant().await)
-            .session_store(MockSessionDriver::default())
-            .cipher(test_cipher().await)
-            .build(),
-    );
     let proxy = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(engine)
+        .engine(build_engine(MockSessionDriver::default()).await)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .cors_passthrough(false)
         .build()
         .expect("valid routes");
@@ -753,16 +740,7 @@ async fn denied_check_returns_403() {
     let store = MockSessionDriver::builder().load_session(session).build();
     let proxy = build_proxy_with_routes(
         store,
-        vec![(
-            "/admin",
-            LoginRule::required().check(|s: &MockSession| {
-                if s.role == Some("admin") {
-                    Ok(())
-                } else {
-                    Err(CheckError::Forbidden("admin only".into()))
-                }
-            }),
-        )],
+        vec![("/admin", LoginRule::required().check(admin_only))],
     )
     .await;
     let (mut s, mut c) = make_session("GET", "/admin", "Accept: application/json\r\n").await;
@@ -858,18 +836,11 @@ async fn build_structural_proxy(
     routes: Vec<(&'static str, LoginRule<MockSession>)>,
     path_confusion: crate::login::PathConfusion,
 ) -> TestProxy {
-    let engine = Arc::new(
-        huskarl_login::engine::LoginEngine::builder()
-            .config(default_config())
-            .grant(test_grant().await)
-            .session_store(MockSessionDriver::default())
-            .cipher(test_cipher().await)
-            .build(),
-    );
     let mut builder = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(engine)
+        .engine(build_engine(MockSessionDriver::default()).await)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .path_confusion(path_confusion);
     for (pattern, rule) in routes {
         builder = builder.subtree(pattern, rule);
@@ -993,18 +964,11 @@ async fn structural_off_allows_traversal() {
 
 #[tokio::test]
 async fn build_rejects_noncanonical_pattern() {
-    let engine = Arc::new(
-        huskarl_login::engine::LoginEngine::builder()
-            .config(default_config())
-            .grant(test_grant().await)
-            .session_store(MockSessionDriver::default())
-            .cipher(test_cipher().await)
-            .build(),
-    );
     let result = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(engine)
+        .engine(build_engine(MockSessionDriver::default()).await)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
         .route("/a/b", LoginRule::public())
         .route("/a//b", LoginRule::required())
         .build();
@@ -1153,18 +1117,11 @@ mod store_backed {
     }
 
     async fn build_store_proxy(store: StoreBackedSessionStore<InMemoryStore>) -> StoreProxy {
-        let engine = Arc::new(
-            huskarl_login::engine::LoginEngine::builder()
-                .config(default_config())
-                .grant(test_grant().await)
-                .session_store(store)
-                .cipher(test_cipher().await)
-                .build(),
-        );
         LoginProxy::builder()
             .inner(StoreInner::new())
-            .engine(engine)
+            .engine(build_engine(store).await)
             .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+            .decode_layers(DecodeLayers::Single)
             .build()
             .expect("valid routes")
     }

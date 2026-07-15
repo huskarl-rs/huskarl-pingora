@@ -13,15 +13,30 @@ categories = ["authentication"]
 
 [features]
 default = ["resource", "login", "default-jws-verifier-platform"]
-resource = ["dep:bon", "dep:huskarl-resource-server", "dep:pingora-core", "dep:serde_json", "dep:metrics", "dep:strum"]
-login = ["dep:bon", "dep:huskarl", "dep:huskarl-login", "dep:pingora-core"]
+resource = [
+  "dep:bon",
+  "dep:huskarl-resource-server",
+  "dep:huskarl-route-guard",
+  "dep:pingora-core",
+  "dep:serde_json",
+  "dep:metrics",
+  "dep:strum",
+]
+login = [
+  "dep:bon",
+  "dep:huskarl",
+  "dep:huskarl-login",
+  "dep:huskarl-route-guard",
+  "dep:pingora-core",
+]
 default-jws-verifier-platform = [
-    "huskarl?/default-jws-verifier-platform",
-    "huskarl-resource-server?/default-jws-verifier-platform",
+  "huskarl?/default-jws-verifier-platform",
+  "huskarl-resource-server?/default-jws-verifier-platform",
 ]
 
 [dependencies]
 async-trait = "0.1.89"
+huskarl-route-guard = { version = "0.1", path = "../huskarl-route-guard", optional = true }
 bytes = "1"
 http = "1"
 log = "0.4"
@@ -33,31 +48,28 @@ tokio = { version = "1", features = ["sync"] }
 
 # resource feature
 bon = { version = "3.9", optional = true }
-huskarl-resource-server = { version = "0.9", default-features = false, optional = true }
+huskarl-resource-server = { version = "0.10", path = "../huskarl/huskarl-resource-server", default-features = false, optional = true }
 pingora-core = { version = "0.8", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
 metrics = { version = "0.24", default-features = false, optional = true }
 strum = { version = "0.27", default-features = false, features = ["derive"], optional = true }
 
 # login feature
-huskarl = { version = "0.9", default-features = false, optional = true }
+huskarl = { version = "0.10", default-features = false, optional = true }
 huskarl-login = { version = "0.3", path = "../huskarl-login", optional = true }
 pingora-cache = "0.8.0"
 
 [dev-dependencies]
-huskarl-resource-server = { version = "0.9" }
-huskarl-reqwest = { version = "0.7", features = ["rustls-tls"] }
-huskarl-crypto-native = { version = "0.9" }
+huskarl-resource-server = { version = "0.10", path = "../huskarl/huskarl-resource-server" }
+huskarl-reqwest = { version = "0.8", features = ["rustls-tls"] }
+huskarl-crypto-native = { version = "0.10" }
 hex = "0.4"
 pingora-core = { version = "0.8", features = ["rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 url = "2"
 env_logger = "0.11"
-matchit = "0.9"
-proptest = "1"
 rand = "0.10"
 uuid = "1"
-bolero = "0.13.4"
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 
 [[example]]
@@ -70,10 +82,3 @@ required-features = ["login"]
 
 [package.metadata.cargo-machete]
 ignored = ["pingora-cache"]
-
-# Build profile cargo-bolero uses for fuzz runs. Optimized (so the fuzzer explores fast)
-# but with assertions and overflow checks on, since a fuzzer's job is to trip them.
-[profile.fuzz]
-inherits = "release"
-debug-assertions = true
-overflow-checks = true

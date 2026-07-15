@@ -38,8 +38,8 @@ use huskarl::{
 };
 use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_pingora::login::{
-    CaseSensitivity, CookieSession, CookieSessionStore, LoginConfig, LoginCtx, LoginEngine,
-    LoginProxy, LoginRule, LogoutConfig, PathConfusion, SessionLifetime,
+    CaseSensitivity, CookieSession, CookieSessionStore, DecodeLayers, LoginConfig, LoginCtx,
+    LoginEngine, LoginProxy, LoginRule, LogoutConfig, PathConfusion, SessionLifetime,
 };
 use huskarl_reqwest::ReqwestClient;
 use huskarl_resource_server::core::client_auth::NoAuth;
@@ -223,6 +223,7 @@ fn main() {
             .inner(inner)
             .engine(engine)
             .case_sensitivity(CaseSensitivity::Sensitive)
+            .decode_layers(DecodeLayers::Single)
             // `subtree` applies a rule to a path and everything beneath it;
             // `route` matches a single exact path.
             //
