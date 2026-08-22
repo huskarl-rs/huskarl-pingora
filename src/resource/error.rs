@@ -7,7 +7,9 @@
 //!
 //! [RFC 6750]: https://datatracker.ietf.org/doc/html/rfc6750
 
-use crate::resource_server::error::{ToRfc6750Error, TokenErrorCode, TokenValidationError};
+use crate::resource_server::error::{
+    Challenge, ToRfc6750Error, TokenErrorCode, TokenValidationError,
+};
 
 /// Errors that can occur when building or configuring a [`Guard`](super::Guard)
 /// or [`AuthProxy`](super::AuthProxy).
@@ -30,6 +32,20 @@ pub enum ConfigError {
     PublicRuleWithConstraints(String),
     /// Failed to serialize resource metadata.
     Metadata(serde_json::Error),
+    /// The configured `resource` identifier is not a URL RFC 9728 §3.1 can derive a
+    /// Protected Resource Metadata URL from — it must be absolute HTTP(S) with no
+    /// fragment.
+    ///
+    /// This is a build error rather than a silently-omitted `resource_metadata`
+    /// challenge parameter: the guard is already serving a metadata document derived
+    /// from the same identifier, so an identifier it cannot advertise is one whose
+    /// document clients could not have located anyway.
+    ResourceMetadataUrl {
+        /// The offending resource identifier.
+        resource: String,
+        /// Why the derivation failed.
+        source: crate::resource_server::core::Error,
+    },
     /// A registered route pattern is non-canonical: it carries a structural byte
     /// (`%2F`, `..`, `//`, `;`, or an enabled opt-in form) that the path-confusion
     /// guard treats as route structure, so a normalizing backend would never present
@@ -64,6 +80,11 @@ impl std::fmt::Display for ConfigError {
                  that can never be enforced: the token validator is not called for public routes"
             ),
             Self::Metadata(e) => write!(f, "failed to serialize resource metadata: {e}"),
+            Self::ResourceMetadataUrl { resource, source } => write!(
+                f,
+                "resource identifier {resource:?} is not an absolute HTTP(S) URL, so no \
+                 RFC 9728 metadata URL can be derived from it: {source}"
+            ),
             Self::NonCanonicalPattern { pattern } => write!(
                 f,
                 "route pattern {pattern:?} is non-canonical — it carries a structural byte \
@@ -84,6 +105,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Metadata(e) => Some(e),
+            Self::ResourceMetadataUrl { source, .. } => Some(source),
             Self::Route { .. }
             | Self::PublicRuleWithConstraints(_)
             | Self::NonCanonicalPattern { .. }
@@ -107,9 +129,13 @@ impl From<huskarl_route_guard::RuleRouterError> for ConfigError {
             RuleRouterError::NonCanonicalCase { pattern } => {
                 Self::NonCanonicalCasePattern { pattern }
             }
-            RuleRouterError::RuleIdOutOfOrder { pattern, .. } => Self::Route {
+            RuleRouterError::EmptyMethodSet { pattern } => Self::Route {
                 pattern,
-                reason: "internal error: rule-id ordering invariant violated",
+                reason: "registration matches no method: its method set is empty",
+            },
+            RuleRouterError::TooManyRegistrations => Self::Route {
+                pattern: String::new(),
+                reason: "too many route registrations",
             },
         }
     }
@@ -119,17 +145,22 @@ impl From<huskarl_route_guard::RuleRouterError> for ConfigError {
 #[derive(Debug)]
 pub(crate) struct InvalidRequest(pub &'static str);
 
+impl std::fmt::Display for InvalidRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidRequest {}
+
 impl ToRfc6750Error for InvalidRequest {
     fn attempted_scheme(&self) -> Option<crate::resource_server::validator::extract::TokenType> {
         None
     }
 
-    fn token_error(&self) -> TokenValidationError {
-        TokenValidationError::Client(TokenErrorCode::InvalidRequest)
-    }
-
-    fn error_description(&self) -> Option<String> {
-        Some(self.0.to_string())
+    fn challenge(&self) -> Challenge {
+        Challenge::new(TokenValidationError::Client(TokenErrorCode::InvalidRequest))
+            .with_description(self.0)
     }
 }
 
@@ -137,17 +168,22 @@ impl ToRfc6750Error for InvalidRequest {
 #[derive(Debug)]
 pub(crate) struct InvalidToken(pub &'static str);
 
+impl std::fmt::Display for InvalidToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidToken {}
+
 impl ToRfc6750Error for InvalidToken {
     fn attempted_scheme(&self) -> Option<crate::resource_server::validator::extract::TokenType> {
         None
     }
 
-    fn token_error(&self) -> TokenValidationError {
-        TokenValidationError::Client(TokenErrorCode::InvalidToken)
-    }
-
-    fn error_description(&self) -> Option<String> {
-        Some(self.0.to_string())
+    fn challenge(&self) -> Challenge {
+        Challenge::new(TokenValidationError::Client(TokenErrorCode::InvalidToken))
+            .with_description(self.0)
     }
 }
 
@@ -158,16 +194,21 @@ pub(crate) struct CustomCheckError {
     pub description: String,
 }
 
+impl std::fmt::Display for CustomCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.description)
+    }
+}
+
+impl std::error::Error for CustomCheckError {}
+
 impl ToRfc6750Error for CustomCheckError {
     fn attempted_scheme(&self) -> Option<crate::resource_server::validator::extract::TokenType> {
         None
     }
 
-    fn token_error(&self) -> TokenValidationError {
-        TokenValidationError::Client(self.code)
-    }
-
-    fn error_description(&self) -> Option<String> {
-        Some(self.description.clone())
+    fn challenge(&self) -> Challenge {
+        Challenge::new(TokenValidationError::Client(self.code))
+            .with_description(self.description.clone())
     }
 }

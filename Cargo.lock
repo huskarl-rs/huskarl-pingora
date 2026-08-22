@@ -340,7 +340,7 @@ version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -1115,7 +1115,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1513,34 +1513,6 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "huskarl"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02a28c0761a6622c5545af30183ca096a8c1fea48e8eb7187c92a84430fa7ee6"
-dependencies = [
- "arc-swap",
- "base64",
- "bon",
- "bytes",
- "form_urlencoded",
- "getrandom 0.4.3",
- "gloo-timers",
- "http",
- "huskarl-core 0.9.0",
- "huskarl-crypto-native 0.10.0",
- "huskarl-crypto-webcrypto 0.10.0",
- "huskarl-macros 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "rand 0.10.2",
- "serde",
- "serde_json",
- "sha2",
- "snafu",
- "subtle",
- "tokio",
- "web-time",
-]
-
-[[package]]
-name = "huskarl"
 version = "0.10.1"
 dependencies = [
  "arc-swap",
@@ -1551,8 +1523,10 @@ dependencies = [
  "getrandom 0.4.3",
  "gloo-timers",
  "http",
- "huskarl-core 0.9.1",
- "huskarl-macros 0.3.1",
+ "huskarl-core",
+ "huskarl-crypto-native",
+ "huskarl-crypto-webcrypto",
+ "huskarl-macros",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -1561,35 +1535,6 @@ dependencies = [
  "subtle",
  "tokio",
  "web-time",
-]
-
-[[package]]
-name = "huskarl-core"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6829ae468be1800209695557611fa734650fbe58e1cc47e8c5dd255b7ca9972"
-dependencies = [
- "arc-swap",
- "base64",
- "bon",
- "bytes",
- "form_urlencoded",
- "futures-util",
- "getrandom 0.4.3",
- "gloo-timers",
- "hex",
- "http",
- "rand 0.10.2",
- "secrecy",
- "serde",
- "serde_json",
- "sha2",
- "snafu",
- "strum 0.27.2",
- "tokio",
- "url",
- "web-time",
- "zeroize",
 ]
 
 [[package]]
@@ -1607,7 +1552,7 @@ dependencies = [
  "hex",
  "http",
  "httpdate",
- "huskarl-macros 0.3.1",
+ "huskarl-macros",
  "rand 0.10.2",
  "secrecy",
  "serde",
@@ -1624,31 +1569,6 @@ dependencies = [
 
 [[package]]
 name = "huskarl-crypto-native"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03cc1eb60c53c1dbe2ffc987c9137c7866bc837576dcfd089937a4481dfa2a03"
-dependencies = [
- "aead",
- "aes-gcm",
- "chacha20poly1305",
- "ed25519-dalek",
- "hmac",
- "huskarl-core 0.9.0",
- "p256",
- "p384",
- "pkcs8",
- "rand 0.10.2",
- "rsa",
- "serde_json",
- "sha2",
- "signature",
- "snafu",
- "strum 0.27.2",
- "subtle",
-]
-
-[[package]]
-name = "huskarl-crypto-native"
 version = "0.10.1"
 dependencies = [
  "aead",
@@ -1656,8 +1576,8 @@ dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "hmac",
- "huskarl-core 0.9.1",
- "huskarl-macros 0.3.1",
+ "huskarl-core",
+ "huskarl-macros",
  "p256",
  "p384",
  "pkcs8",
@@ -1673,27 +1593,10 @@ dependencies = [
 
 [[package]]
 name = "huskarl-crypto-webcrypto"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28a1c6210e86e29662c1e4d72b144755d848a4bf26045b19afefc3a3d4e65675"
-dependencies = [
- "huskarl-core 0.9.0",
- "serde",
- "serde-wasm-bindgen",
- "serde_bytes",
- "serde_json",
- "snafu",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "huskarl-crypto-webcrypto"
 version = "0.10.1"
 dependencies = [
- "huskarl-core 0.9.1",
- "huskarl-macros 0.3.1",
+ "huskarl-core",
+ "huskarl-macros",
  "serde",
  "serde-wasm-bindgen",
  "serde_bytes",
@@ -1713,7 +1616,7 @@ dependencies = [
  "bytes",
  "ciborium",
  "http",
- "huskarl 0.10.1",
+ "huskarl",
  "log",
  "metrics",
  "rand 0.10.2",
@@ -1737,18 +1640,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "huskarl-macros"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91df0947d8d52c4def038b8af46e3d2036a4a5cfe144b0c44e095d9672579ef"
-dependencies = [
- "darling 0.23.0",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
 name = "huskarl-pingora"
 version = "0.6.0"
 dependencies = [
@@ -1758,8 +1649,8 @@ dependencies = [
  "env_logger",
  "hex",
  "http",
- "huskarl 0.10.0",
- "huskarl-crypto-native 0.10.0",
+ "huskarl",
+ "huskarl-crypto-native",
  "huskarl-login",
  "huskarl-reqwest",
  "huskarl-resource-server",
@@ -1784,14 +1675,14 @@ dependencies = [
 [[package]]
 name = "huskarl-reqwest"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4409c830c7fce3f99a6d1b190bfa7a64d1174c1fd48f8c3cbf01d13b4c405359"
 dependencies = [
  "bon",
  "bytes",
  "http",
- "huskarl-core 0.9.0",
+ "huskarl-core",
+ "huskarl-macros",
  "reqwest",
+ "snafu",
 ]
 
 [[package]]
@@ -1804,9 +1695,9 @@ dependencies = [
  "getrandom 0.4.3",
  "gloo-timers",
  "http",
- "huskarl-core 0.9.1",
- "huskarl-crypto-native 0.10.1",
- "huskarl-crypto-webcrypto 0.10.1",
+ "huskarl-core",
+ "huskarl-crypto-native",
+ "huskarl-crypto-webcrypto",
  "serde",
  "serde_json",
  "sha2",
@@ -2986,7 +2877,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3366,7 +3257,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3691,7 +3582,7 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f103c50866b8743da9429b8a581d81a27c2d3a9c4ac7df8f8571c1dd7896eda"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -4338,7 +4229,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

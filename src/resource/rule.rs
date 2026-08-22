@@ -181,7 +181,7 @@ impl<C> Rule<C> {
     /// is a separate concern that belongs *above* this layer; do not rely on a method rule
     /// to allow it through.
     pub fn method(mut self, method: http::Method) -> Self {
-        self.method = MethodMatch::Only(method);
+        self.method = MethodMatch::from(method);
         self
     }
 }

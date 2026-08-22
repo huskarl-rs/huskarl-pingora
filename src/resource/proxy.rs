@@ -162,9 +162,16 @@ where
                 status,
                 challenges,
                 dpop_nonce,
+                retry_after,
             } => {
-                write_challenge_response(session, status, &challenges, dpop_nonce.as_deref())
-                    .await?;
+                write_challenge_response(
+                    session,
+                    status,
+                    &challenges,
+                    dpop_nonce.as_deref(),
+                    retry_after,
+                )
+                .await?;
                 return Ok(true);
             }
         }
@@ -269,17 +276,17 @@ mod tests {
             let outcome = match &self.0 {
                 MockOutcome::Missing => Ok(None),
                 MockOutcome::Valid(claims) => Ok(Some(ValidatedRequest {
-                    issuer: None,
-                    subject: None,
-                    audience: vec![],
+                    iss: None,
+                    sub: None,
+                    aud: vec![],
                     jti: None,
-                    issued_at: None,
-                    expiration: None,
+                    iat: None,
+                    exp: None,
                     cnf: None,
                     claims: claims.clone(),
                     introspection_jwt: None,
                 })),
-                MockOutcome::Invalid => Err(MockError),
+                MockOutcome::Invalid => Err(MockError::invalid_token()),
             };
             Box::pin(async move {
                 ValidationResult {

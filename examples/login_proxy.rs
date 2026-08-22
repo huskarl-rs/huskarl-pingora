@@ -30,7 +30,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use huskarl::{
     core::{
-        jwk::{JwksSource, OctBytes},
+        crypto::seal::AeadV1Sealer,
+        jwk::OctBytes,
         secrets::{ProvidedSecret, Secret as _, SecretBytes},
         server_metadata::AuthorizationServerMetadata,
     },
@@ -164,11 +165,8 @@ fn main() {
             .expect("authorization server does not advertise an authorization endpoint")
             .client_id(client_id)
             .client_auth(NoAuth)
-            .http_client(http_client.clone())
+            .http_client(http_client)
             .redirect_uri(redirect_uri.clone())
-            .jws_verifier_factory(Arc::new(
-                JwksSource::builder().http_client(http_client).build(),
-            ))
             .build()
             .await
             .expect("failed to build authorization code grant");
@@ -177,7 +175,7 @@ fn main() {
         let cipher = Arc::new(aes_key_from_bytes(key_bytes).await);
 
         let session_store = CookieSessionStore::builder()
-            .cipher(cipher.clone())
+            .sealer(AeadV1Sealer::new(cipher))
             .cookie_name("huskarl_session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build();
@@ -185,7 +183,6 @@ fn main() {
         let login_config = LoginConfig::builder()
             .callback_path(parsed_redirect.path().to_owned())
             .scope(vec!["openid".to_owned()])
-            .base_url(base_url.parse().expect("valid base URL"))
             // Cookie sessions carry the refresh token, so bound the session
             // lifetime crate-side rather than delegating to the auth server.
             .session_lifetime(SessionLifetime::Bounded(std::time::Duration::from_hours(8)))
@@ -215,8 +212,8 @@ fn main() {
                 .config(login_config)
                 .grant(grant)
                 .session_store(session_store)
-                .cipher(cipher)
-                .build(),
+                .build()
+                .expect("failed to build login engine"),
         );
 
         LoginProxy::builder()

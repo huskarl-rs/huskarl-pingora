@@ -107,15 +107,16 @@ mod tests;
 /// #     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
 /// #     SD: SessionDriver + Send + Sync,
 /// # {
-/// // The login-state cipher is optional: omitted, it defaults to the session
-/// // store's own AEAD cipher (the two seals are AAD-domain-separated, so
-/// // sharing one key is safe). Pass `.cipher(...)` only to use a distinct key.
+/// // The login-state sealer is optional: omitted, it defaults to the session
+/// // store's own sealer (the two seals are AAD-domain-separated, so sharing one
+/// // key is safe). Pass `.sealer(...)` only to use a distinct one.
 /// let engine = Arc::new(
 ///     LoginEngine::builder()
 ///         .config(login_config)
 ///         .grant(grant)
 ///         .session_store(store)
-///         .build(),
+///         .build()
+///         .expect("valid login config"),
 /// );
 ///
 /// let proxy = LoginProxy::builder()
@@ -240,11 +241,13 @@ where
             let method = rule.method_match().clone();
             router = match (kind, method) {
                 (RouteKind::Exact, MethodMatch::Any) => router.route(pattern, rule),
-                (RouteKind::Exact, MethodMatch::Only(m)) => router.route_for(m, pattern, rule),
+                (RouteKind::Exact, m @ MethodMatch::OneOf(_)) => router.route_for(m, pattern, rule),
                 (RouteKind::Subtree, MethodMatch::Any) => router.subtree(&pattern, rule),
-                (RouteKind::Subtree, MethodMatch::Only(m)) => router.subtree_for(m, &pattern, rule),
+                (RouteKind::Subtree, m @ MethodMatch::OneOf(_)) => {
+                    router.subtree_for(m, &pattern, rule)
+                }
                 (RouteKind::Blob, MethodMatch::Any) => router.blob_subtree(&pattern, rule),
-                (RouteKind::Blob, MethodMatch::Only(m)) => {
+                (RouteKind::Blob, m @ MethodMatch::OneOf(_)) => {
                     router.blob_subtree_for(m, &pattern, rule)
                 }
             };
@@ -433,9 +436,13 @@ impl From<RuleRouterError> for RouteConfigError {
             RuleRouterError::NonCanonicalCase { pattern } => {
                 Self::NonCanonicalCasePattern { pattern }
             }
-            RuleRouterError::RuleIdOutOfOrder { pattern, .. } => Self::Route {
+            RuleRouterError::EmptyMethodSet { pattern } => Self::Route {
                 pattern,
-                reason: "internal error: rule-id ordering invariant violated",
+                reason: "registration matches no method: its method set is empty",
+            },
+            RuleRouterError::TooManyRegistrations => Self::Route {
+                pattern: String::new(),
+                reason: "too many route registrations",
             },
         }
     }
@@ -541,8 +548,8 @@ where
         // path a normalizing backend could route to a different rule is denied before
         // any rule applies. The attributed reason goes to the log; the client sees
         // only the coarse static message.
-        let (_, rule) = match self.routes.resolve(uri.path(), &method) {
-            Ok(matched) => matched,
+        let rule = match self.routes.resolve(uri.path(), &method) {
+            Ok(matched) => matched.rule(),
             Err(reason) => {
                 log::warn!("path-confusion guard denied {:?}: {reason}", uri.path());
                 let resp = self

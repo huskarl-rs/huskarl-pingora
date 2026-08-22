@@ -230,7 +230,7 @@ impl<S> LoginRule<S> {
     /// those at your edge. A CORS preflight (`OPTIONS`, credential-less) is handled above
     /// this layer.
     pub fn method(self, method: http::Method) -> Self {
-        let method = MethodMatch::Only(method);
+        let method = MethodMatch::from(method);
         match self {
             Self::Public { .. } => Self::Public { method },
             Self::Optional { check, .. } => Self::Optional { check, method },

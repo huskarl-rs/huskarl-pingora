@@ -142,12 +142,12 @@ mod tests {
 
     fn make_validated_request() -> Arc<ValidatedRequest<()>> {
         Arc::new(ValidatedRequest {
-            issuer: None,
-            subject: None,
-            audience: vec![],
+            iss: None,
+            sub: None,
+            aud: vec![],
             jti: None,
-            issued_at: None,
-            expiration: None,
+            iat: None,
+            exp: None,
             cnf: None,
             claims: (),
             introspection_jwt: None,

@@ -11,6 +11,8 @@ use pingora_error::{Error, ErrorType::InternalError};
 use pingora_http::{IntoCaseHeaderName, ResponseHeader};
 use pingora_proxy::Session;
 
+use crate::resource_server::core::platform::Duration;
+
 // ── Header helpers ───────────────────────────────────────────────────────────
 
 fn build_response(status: u16, capacity: usize) -> Result<ResponseHeader, Box<Error>> {
@@ -95,8 +97,12 @@ pub(crate) async fn write_challenge_response(
     status: http::StatusCode,
     challenges: &[String],
     dpop_nonce: Option<&str>,
+    retry_after: Option<Duration>,
 ) -> Result<(), Box<Error>> {
-    let capacity = challenges.len() + 2 + usize::from(dpop_nonce.is_some());
+    let capacity = challenges.len()
+        + 2
+        + usize::from(dpop_nonce.is_some())
+        + usize::from(retry_after.is_some());
     let mut resp = build_response(status.as_u16(), capacity)?;
 
     for challenge in challenges {
@@ -114,6 +120,21 @@ pub(crate) async fn write_challenge_response(
             "DPoP-Nonce",
             nonce,
             "failed to set DPoP-Nonce header",
+        )?;
+    }
+
+    if let Some(after) = retry_after {
+        // Delta-seconds rather than an HTTP-date, so the client needs no clock
+        // agreement with us. Round a fractional second up: a remaining cooldown
+        // must never render as `Retry-After: 0` and invite an immediate retry.
+        let seconds = after
+            .as_secs()
+            .saturating_add(u64::from(after.subsec_nanos() > 0));
+        insert_header(
+            &mut resp,
+            http::header::RETRY_AFTER,
+            seconds,
+            "failed to set Retry-After header",
         )?;
     }
 
@@ -238,6 +259,7 @@ mod tests {
             http::StatusCode::UNAUTHORIZED,
             &challenges,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -265,12 +287,78 @@ mod tests {
             http::StatusCode::UNAUTHORIZED,
             &["Bearer".to_owned()],
             Some("server-nonce-abc"),
+            None,
         )
         .await
         .unwrap();
 
         let resp = session.response_written().unwrap();
         assert_eq!(resp.headers.get("dpop-nonce").unwrap(), "server-nonce-abc");
+    }
+
+    #[tokio::test]
+    async fn challenge_response_omits_retry_after_when_absent() {
+        let (mut session, _client) = make_session("GET", "/api").await;
+
+        write_challenge_response(
+            &mut session,
+            http::StatusCode::UNAUTHORIZED,
+            &["Bearer".to_owned()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let resp = session.response_written().unwrap();
+        assert!(resp.headers.get("retry-after").is_none());
+    }
+
+    #[tokio::test]
+    async fn challenge_response_emits_retry_after_as_delta_seconds() {
+        let (mut session, _client) = make_session("GET", "/api").await;
+
+        write_challenge_response(
+            &mut session,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            &[],
+            None,
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+
+        let resp = session.response_written().unwrap();
+        assert_eq!(resp.status.as_u16(), 503);
+        assert_eq!(resp.headers.get("retry-after").unwrap(), "30");
+    }
+
+    #[tokio::test]
+    async fn challenge_response_rounds_fractional_retry_after_up() {
+        // A remaining cooldown must never render as `Retry-After: 0` — that reads as
+        // "retry immediately" and would hammer a service that is already failing.
+        for (interval, expected) in [
+            (Duration::from_millis(1), "1"),
+            (Duration::from_millis(1500), "2"),
+            (Duration::ZERO, "0"),
+        ] {
+            let (mut session, _client) = make_session("GET", "/api").await;
+            write_challenge_response(
+                &mut session,
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                &[],
+                None,
+                Some(interval),
+            )
+            .await
+            .unwrap();
+            let resp = session.response_written().unwrap();
+            assert_eq!(
+                resp.headers.get("retry-after").unwrap(),
+                expected,
+                "{interval:?} should render as {expected}",
+            );
+        }
     }
 
     #[tokio::test]
@@ -281,6 +369,7 @@ mod tests {
             &mut session,
             http::StatusCode::FORBIDDEN,
             &["Bearer error=\"insufficient_scope\"".to_owned()],
+            None,
             None,
         )
         .await
@@ -308,6 +397,7 @@ mod tests {
             &mut session,
             http::StatusCode::FORBIDDEN,
             &[malicious],
+            None,
             None,
         )
         .await;

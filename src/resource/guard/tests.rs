@@ -5,7 +5,10 @@ use std::sync::Mutex;
 
 use super::*;
 use crate::{
-    resource::test_support::{MockClaims, MockError, mock_validator_metadata},
+    resource::test_support::{
+        ChallengeCounter, CountingError, MockClaims, MockError, MockErrorKind,
+        mock_validator_metadata,
+    },
     resource_server::validator::{ValidationResult, metadata::ValidatorMetadata},
 };
 
@@ -15,7 +18,7 @@ enum MockOutcome {
         claims: MockClaims,
         audience: Vec<String>,
     },
-    Invalid,
+    Invalid(MockErrorKind),
 }
 
 struct MockValidator {
@@ -49,8 +52,14 @@ impl MockValidator {
     }
 
     fn invalid() -> Self {
+        Self::rejecting(MockErrorKind::InvalidToken)
+    }
+
+    /// A validator that rejects with a specific kind, so the guard's outcome
+    /// classification can be driven one branch at a time.
+    fn rejecting(kind: MockErrorKind) -> Self {
         Self {
-            outcome: MockOutcome::Invalid,
+            outcome: MockOutcome::Invalid(kind),
             captured_uri: Mutex::new(None),
         }
     }
@@ -75,17 +84,17 @@ impl AccessTokenValidator for MockValidator {
         let outcome = match &self.outcome {
             MockOutcome::Missing => Ok(None),
             MockOutcome::Valid { claims, audience } => Ok(Some(ValidatedRequest {
-                issuer: None,
-                subject: None,
-                audience: audience.clone(),
+                iss: None,
+                sub: None,
+                aud: audience.clone(),
                 jti: None,
-                issued_at: None,
-                expiration: None,
+                iat: None,
+                exp: None,
                 cnf: None,
                 claims: claims.clone(),
                 introspection_jwt: None,
             })),
-            MockOutcome::Invalid => Err(MockError),
+            MockOutcome::Invalid(kind) => Err(MockError(*kind)),
         };
 
         Box::pin(async move {
@@ -223,6 +232,153 @@ fn resource_metadata_root_path_no_suffix() {
     );
     let (path, _) = guard.resource_metadata().unwrap();
     assert_eq!(path, "/.well-known/oauth-protected-resource");
+}
+
+/// The `WWW-Authenticate` values from a denial, or `None` if the request was forwarded.
+fn deny_challenges(outcome: &Outcome<MockClaims>) -> Option<&[String]> {
+    match outcome {
+        Outcome::Deny { challenges, .. } => Some(challenges),
+        Outcome::Forward { .. } => None,
+    }
+}
+
+/// The `resource_metadata` parameter value from whichever challenge carries it.
+fn advertised_metadata_url(challenges: &[String]) -> Option<&str> {
+    challenges.iter().find_map(|c| {
+        c.split("resource_metadata=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+    })
+}
+
+/// The challenge must name where the metadata document lives (RFC 9728 §5.1), derived
+/// from the resource identifier rather than left to the caller to configure twice.
+#[tokio::test]
+async fn challenge_advertises_resource_metadata_url() {
+    let guard = build_guard_with_resource(
+        MockValidator::no_token(),
+        vec![("/api", Rule::required())],
+        "https://api.example.com",
+        None,
+    );
+
+    let outcome = check(&guard, &http::Method::GET, "/api").await;
+    let challenges = deny_challenges(&outcome).expect("expected a denial");
+    assert_eq!(
+        advertised_metadata_url(challenges),
+        Some("https://api.example.com/.well-known/oauth-protected-resource"),
+        "challenges: {challenges:?}",
+    );
+}
+
+/// The URL the challenge advertises and the path the guard serves the document at are
+/// two derivations of one fact. If they drift, clients follow the advertised URL to a
+/// 404 — so pin them together, including the tenant-path case where the well-known
+/// segment is *inserted* rather than appended (RFC 9728 §3.1).
+#[tokio::test]
+async fn advertised_metadata_url_matches_the_served_path() {
+    for resource in [
+        "https://api.example.com",
+        "https://api.example.com/",
+        "https://api.example.com/tenant1",
+    ] {
+        let guard = build_guard_with_resource(
+            MockValidator::no_token(),
+            vec![("/api", Rule::required())],
+            resource,
+            None,
+        );
+        let (served_path, _) = guard.resource_metadata().unwrap();
+
+        let outcome = check(&guard, &http::Method::GET, "/api").await;
+        let challenges = deny_challenges(&outcome).expect("expected a denial");
+        let advertised = advertised_metadata_url(challenges)
+            .unwrap_or_else(|| unreachable!("no metadata URL for {resource}: {challenges:?}"));
+        let advertised_path = advertised.parse::<http::Uri>().unwrap().path().to_owned();
+
+        assert_eq!(
+            advertised_path, served_path,
+            "{resource}: advertised {advertised} but the document is served at {served_path}",
+        );
+    }
+}
+
+/// A validator configured with its own metadata URL is pointing clients at a document
+/// served elsewhere. That is a deliberate choice, so the derived value must not
+/// overwrite it.
+#[tokio::test]
+async fn explicit_validator_metadata_url_is_not_overwritten() {
+    struct CustomUrlValidator(MockValidator);
+
+    impl AccessTokenValidator for CustomUrlValidator {
+        type Claims = MockClaims;
+        type Error = MockError;
+
+        fn validate_request<'a>(
+            &'a self,
+            headers: &'a http::HeaderMap,
+            method: &'a http::Method,
+            uri: &'a http::Uri,
+            client_cert_der: Option<&'a [u8]>,
+        ) -> crate::resource_server::core::platform::MaybeSendBoxFuture<
+            'a,
+            ValidationResult<MockClaims, MockError>,
+        > {
+            self.0
+                .validate_request(headers, method, uri, client_cert_der)
+        }
+    }
+
+    impl ProvideValidatorMetadata for CustomUrlValidator {
+        fn validator_metadata(&self, resource: Option<&str>) -> ValidatorMetadata {
+            let mut metadata = mock_validator_metadata(resource);
+            metadata.resource_metadata = Some("https://meta.example.com/prm".to_owned());
+            metadata
+        }
+    }
+
+    let guard = Guard::builder()
+        .validator(CustomUrlValidator(MockValidator::no_token()))
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
+        .resource("https://api.example.com".parse().unwrap())
+        .route("/api", Rule::required())
+        .build()
+        .unwrap();
+
+    // Called directly: the shared `check` helper is typed to `Guard<MockValidator>`.
+    let outcome = guard
+        .check_request(
+            &http::HeaderMap::new(),
+            &http::Method::GET,
+            &"/api".parse().unwrap(),
+            None,
+        )
+        .await;
+    let challenges = deny_challenges(&outcome).expect("expected a denial");
+    assert_eq!(
+        advertised_metadata_url(challenges),
+        Some("https://meta.example.com/prm"),
+        "the explicit URL was overwritten: {challenges:?}",
+    );
+}
+
+/// A resource identifier RFC 9728 cannot derive a metadata URL from is a build error,
+/// not a silently-omitted parameter — the document it would serve is unreachable too.
+#[test]
+fn non_absolute_resource_is_a_build_error() {
+    let result = Guard::builder()
+        .validator(MockValidator::no_token())
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
+        .resource("/api".parse().unwrap())
+        .route("/api", Rule::required())
+        .build();
+
+    assert!(
+        matches!(result, Err(ConfigError::ResourceMetadataUrl { .. })),
+        "expected ResourceMetadataUrl for a relative resource identifier",
+    );
 }
 
 #[test]
@@ -704,8 +860,9 @@ async fn guard_allows_non_structural_encoded_content() {
 
 #[tokio::test]
 async fn blob_subtree_tolerates_structural_byte_in_key() {
-    // `blob_subtree` opts the catch-all tail into opaque-key handling: an encoded slash
-    // in the key is forwarded, but a dot-segment still denies (no traversal escape).
+    // `blob_subtree` declares the tail an opaque key space. Tolerance is scoped to the
+    // subtree: an encoded slash in the key forwards, as does a climb that resolves
+    // inside the blob — but a climb that escapes it still denies.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
@@ -717,8 +874,11 @@ async fn blob_subtree_tolerates_structural_byte_in_key() {
     let forwarded = check(&guard, &http::Method::GET, "/files/a%2fb").await;
     assert_forward(&forwarded);
 
-    let denied = check(&guard, &http::Method::GET, "/files/a/../b").await;
-    assert_deny(&denied, http::StatusCode::BAD_REQUEST);
+    let within = check(&guard, &http::Method::GET, "/files/a/../b").await;
+    assert_forward(&within);
+
+    let escapes = check(&guard, &http::Method::GET, "/files/../b").await;
+    assert_deny(&escapes, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -812,14 +972,32 @@ fn blob_subtree_with_nested_route_is_build_error() {
 }
 
 #[tokio::test]
-async fn guard_denies_structural_byte_in_plain_blob() {
-    // Under the uniform-live model, a plain `subtree` blob denies an encoded slash in
-    // its tail (a structural byte). Tolerating it is an explicit opt-in (opaque blob),
-    // not the default.
+async fn plain_subtree_scopes_structural_byte_to_its_uniformity() {
+    // Runtime tolerance follows the subtree's *uniformity*, not the `blob_subtree`
+    // declaration: while `/files` is a single-rule subtree, every path a structural
+    // byte could reach past the anchor carries the matched rule, so an encoded slash
+    // in the tail forwards. A climb out of the subtree still denies.
     let guard = subtree_guard(MockValidator::no_token(), "/files", Rule::public());
 
     let outcome = check(&guard, &http::Method::GET, "/files/a%2fb").await;
-    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
+    assert_forward(&outcome);
+
+    let escapes = check(&guard, &http::Method::GET, "/files/../b").await;
+    assert_deny(&escapes, http::StatusCode::BAD_REQUEST);
+
+    // Registering a distinct rule under the subtree breaks that uniformity — the byte
+    // could now relocate the path across a rule boundary, so it goes back to denying.
+    let nested = Guard::builder()
+        .validator(MockValidator::no_token())
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
+        .subtree("/files", Rule::public())
+        .route("/files/secret", Rule::required())
+        .build()
+        .unwrap();
+
+    let denied = check(&nested, &http::Method::GET, "/files/a%2fb").await;
+    assert_deny(&denied, http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1252,6 +1430,212 @@ fn metrics_invalid_token_on_bad_token() {
         check(&guard, &http::Method::GET, "/api").await
     });
     assert_eq!(check_outcome_count(&counters, "invalid_token"), 1);
+}
+
+/// A validator that could not reach a backing service produces a 5xx, and must be
+/// counted as a server error — not as `invalid_token`. Labelling an outage as a token
+/// rejection both overstates rejections and hides the outage from availability alerts.
+#[test]
+fn metrics_server_error_not_counted_as_invalid_token() {
+    let (outcome, counters) = with_metrics(async {
+        let guard = build_guard(
+            MockValidator::rejecting(MockErrorKind::ServerError),
+            vec![("/api", Rule::required())],
+        );
+        check(&guard, &http::Method::GET, "/api").await
+    });
+    assert_deny(&outcome, http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(check_outcome_count(&counters, "server_error"), 1);
+    assert_eq!(check_outcome_count(&counters, "invalid_token"), 0);
+}
+
+/// A server-side failure's `Retry-After` interval must survive the guard. Dropping it
+/// leaves clients with no backoff signal against an authorization server that is already
+/// failing — the retry storm arrives exactly when it does the most harm.
+#[tokio::test]
+async fn server_error_carries_retry_after_through_the_guard() {
+    let guard = build_guard(
+        MockValidator::rejecting(MockErrorKind::ServerError),
+        vec![("/api", Rule::required())],
+    );
+
+    let outcome = check(&guard, &http::Method::GET, "/api").await;
+    assert!(
+        matches!(
+            &outcome,
+            Outcome::Deny {
+                status,
+                retry_after: Some(after),
+                challenges,
+                ..
+            } if *status == http::StatusCode::SERVICE_UNAVAILABLE
+                && *after == MockError::RETRY_AFTER
+                // RFC 6750: a 5xx carries no challenge — re-authenticating would not help.
+                && challenges.is_empty()
+        ),
+        "expected a 503 carrying the retry interval and no challenge, got {outcome:?}",
+    );
+}
+
+/// A client-side rejection has no interval to report: waiting does not fix a bad token.
+#[tokio::test]
+async fn client_error_carries_no_retry_after() {
+    let guard = build_guard(MockValidator::invalid(), vec![("/api", Rule::required())]);
+
+    let outcome = check(&guard, &http::Method::GET, "/api").await;
+    assert!(
+        matches!(
+            &outcome,
+            Outcome::Deny {
+                retry_after: None,
+                ..
+            }
+        ),
+        "expected no retry interval, got {outcome:?}",
+    );
+}
+
+/// A failed sender-constraint check is the possible-stolen-token bucket (RFC 9449 §7.1),
+/// and a nonce challenge is routine churn — they must not share a label, or the
+/// alertable signal drowns in the routine one.
+#[test]
+fn metrics_binding_error_and_nonce_required_are_distinct() {
+    let (_, counters) = with_metrics(async {
+        let guard = build_guard(
+            MockValidator::rejecting(MockErrorKind::BindingError),
+            vec![("/api", Rule::required())],
+        );
+        check(&guard, &http::Method::GET, "/api").await
+    });
+    assert_eq!(check_outcome_count(&counters, "binding_error"), 1);
+    assert_eq!(check_outcome_count(&counters, "invalid_token"), 0);
+    assert_eq!(check_outcome_count(&counters, "nonce_required"), 0);
+
+    let (_, counters) = with_metrics(async {
+        let guard = build_guard(
+            MockValidator::rejecting(MockErrorKind::NonceRequired),
+            vec![("/api", Rule::required())],
+        );
+        check(&guard, &http::Method::GET, "/api").await
+    });
+    assert_eq!(check_outcome_count(&counters, "nonce_required"), 1);
+    assert_eq!(check_outcome_count(&counters, "binding_error"), 0);
+}
+
+/// Credentials that cannot be parsed out of the request are a malformed request, not a
+/// judged-and-rejected token — same bucket as any other `400`.
+#[test]
+fn metrics_extract_error_counts_as_invalid_request() {
+    let (outcome, counters) = with_metrics(async {
+        let guard = build_guard(
+            MockValidator::rejecting(MockErrorKind::ExtractError),
+            vec![("/api", Rule::required())],
+        );
+        check(&guard, &http::Method::GET, "/api").await
+    });
+    assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
+    assert_eq!(check_outcome_count(&counters, "invalid_request"), 1);
+    assert_eq!(check_outcome_count(&counters, "invalid_token"), 0);
+}
+
+/// The rejection path must build exactly one `Challenge`. Status, retry interval,
+/// `WWW-Authenticate` values, and the metric classification all derive from it, and each
+/// rebuild would re-clone the owned description and parameters — on a path whose rate an
+/// attacker chooses. Regressions here are silent, so pin the count.
+#[tokio::test]
+async fn rejection_builds_exactly_one_challenge() {
+    struct CountingValidator(std::sync::Arc<ChallengeCounter>);
+
+    impl AccessTokenValidator for CountingValidator {
+        type Claims = MockClaims;
+        type Error = CountingError;
+
+        fn validate_request<'a>(
+            &'a self,
+            _headers: &'a http::HeaderMap,
+            _method: &'a http::Method,
+            _uri: &'a http::Uri,
+            _client_cert_der: Option<&'a [u8]>,
+        ) -> crate::resource_server::core::platform::MaybeSendBoxFuture<
+            'a,
+            ValidationResult<MockClaims, CountingError>,
+        > {
+            let error = CountingError(std::sync::Arc::clone(&self.0));
+            Box::pin(async move {
+                ValidationResult {
+                    outcome: Err(error),
+                    dpop_nonce: None,
+                }
+            })
+        }
+    }
+
+    impl ProvideValidatorMetadata for CountingValidator {
+        fn validator_metadata(&self, resource: Option<&str>) -> ValidatorMetadata {
+            mock_validator_metadata(resource)
+        }
+    }
+
+    let counter = std::sync::Arc::new(ChallengeCounter::default());
+    let guard = Guard::builder()
+        .validator(CountingValidator(std::sync::Arc::clone(&counter)))
+        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+        .decode_layers(DecodeLayers::Single)
+        .route("/api", Rule::required())
+        .build()
+        .unwrap();
+
+    let outcome = guard
+        .check_request(
+            &http::HeaderMap::new(),
+            &http::Method::GET,
+            &"/api".parse().unwrap(),
+            None,
+        )
+        .await;
+
+    assert!(matches!(&outcome, Outcome::Deny { .. }), "{outcome:?}");
+    assert_eq!(
+        counter.get(),
+        1,
+        "the rejection path rebuilt the challenge instead of reusing it",
+    );
+}
+
+/// The full classification table. `Expired` is unreachable through a challenge (it is
+/// RFC 6750 `invalid_token` on the wire), so only a validator that overrides
+/// `validation_outcome` reports it — covered here rather than end-to-end.
+#[test]
+fn validation_outcome_classification_table() {
+    use crate::{metrics::CheckOutcome, resource_server::validator::observe::ValidationOutcome};
+
+    for (outcome, expected) in [
+        (ValidationOutcome::CallError, CheckOutcome::ServerError),
+        (ValidationOutcome::BindingError, CheckOutcome::BindingError),
+        (
+            ValidationOutcome::NonceRequired,
+            CheckOutcome::NonceRequired,
+        ),
+        (ValidationOutcome::Expired, CheckOutcome::Expired),
+        (
+            ValidationOutcome::ExtractError,
+            CheckOutcome::InvalidRequest,
+        ),
+        (ValidationOutcome::InvalidToken, CheckOutcome::InvalidToken),
+        (
+            ValidationOutcome::UnrecognizedIssuer,
+            CheckOutcome::UnrecognizedIssuer,
+        ),
+        // Unreachable on the error path, but floored to the coarse bucket rather than
+        // silently counted as a success.
+        (ValidationOutcome::NoToken, CheckOutcome::InvalidToken),
+    ] {
+        assert_eq!(
+            CheckOutcome::from_validation(outcome),
+            expected,
+            "{outcome:?} should classify as {expected:?}",
+        );
+    }
 }
 
 #[test]

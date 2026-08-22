@@ -24,6 +24,7 @@ use crate::{
         uri::request_uri,
     },
     resource_server::{
+        core::resource_metadata::{WELL_KNOWN_PATH, well_known_url},
         error::{InsufficientScope, ToRfc6750Error, TokenErrorCode},
         validator::{
             AccessTokenValidator, ValidatedRequest,
@@ -207,7 +208,25 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         }
 
         let resource_str = resource.as_ref().map(ToString::to_string);
-        let metadata = validator.validator_metadata(resource_str.as_deref());
+        let mut metadata = validator.validator_metadata(resource_str.as_deref());
+
+        // Advertise where the RFC 9728 document lives, so a client that gets a challenge
+        // can find it without guessing (RFC 9728 §5.1). The guard already serves that
+        // document — see `resource_metadata` below — but nothing was telling clients the
+        // URL, and the two derivations could drift apart unnoticed. Deriving here from
+        // the same resource identifier keeps one source of truth.
+        //
+        // A validator that was configured with its own URL wins: pointing clients at a
+        // document served elsewhere is a deliberate choice, not a value to overwrite.
+        if metadata.resource_metadata.is_none()
+            && let Some(base) = resource_str.as_deref()
+        {
+            let url = well_known_url(base).map_err(|source| ConfigError::ResourceMetadataUrl {
+                resource: base.to_owned(),
+                source,
+            })?;
+            metadata.resource_metadata = Some(url.to_string());
+        }
 
         // Collect unique scopes from all route rules and the default rule.
         let mut all_scopes = BTreeSet::new();
@@ -231,11 +250,13 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             let method = rule.method.clone();
             router = match (kind, method) {
                 (RouteKind::Exact, MethodMatch::Any) => router.route(pattern, rule),
-                (RouteKind::Exact, MethodMatch::Only(m)) => router.route_for(m, pattern, rule),
+                (RouteKind::Exact, m @ MethodMatch::OneOf(_)) => router.route_for(m, pattern, rule),
                 (RouteKind::Subtree, MethodMatch::Any) => router.subtree(&pattern, rule),
-                (RouteKind::Subtree, MethodMatch::Only(m)) => router.subtree_for(m, &pattern, rule),
+                (RouteKind::Subtree, m @ MethodMatch::OneOf(_)) => {
+                    router.subtree_for(m, &pattern, rule)
+                }
                 (RouteKind::Blob, MethodMatch::Any) => router.blob_subtree(&pattern, rule),
-                (RouteKind::Blob, MethodMatch::Only(m)) => {
+                (RouteKind::Blob, m @ MethodMatch::OneOf(_)) => {
                     router.blob_subtree_for(m, &pattern, rule)
                 }
             };
@@ -355,6 +376,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             status: http::StatusCode::BAD_REQUEST,
             challenges,
             dpop_nonce: None,
+            retry_after: None,
         }
     }
 
@@ -376,7 +398,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             .filter(|p| p != "/")
             .unwrap_or_default();
 
-        let path = format!("/.well-known/oauth-protected-resource{suffix}");
+        let path = format!("{WELL_KNOWN_PATH}{suffix}");
 
         // RFC 9728 §2 requires the document's `resource` member, so
         // `to_resource_metadata` yields `None` when no resource identifier is
@@ -467,8 +489,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         // denied (ambiguous) path gets a rule-independent 400 before any rule applies.
         // The attributed reason (which check and byte class fired) goes to the log so
         // the denial is actionable; the client sees only the coarse static message.
-        let (_, rule) = match self.routes.resolve(path, method) {
-            Ok(matched) => matched,
+        let rule = match self.routes.resolve(path, method) {
+            Ok(matched) => matched.rule(),
             Err(reason) => {
                 log::warn!("path-confusion guard denied {path:?}: {reason}");
                 return (
@@ -510,16 +532,27 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 
         match result.outcome {
             Err(err) => {
-                // Token present but invalid.
-                let status = err.token_error().suggested_status();
-                let challenges = self.metadata.challenges(Some(&err), scope_param, None);
+                // The validator rejected, or could not reach a backing service. Build the
+                // `Challenge` once and share it between the rejection and the metric
+                // classification: it owns a description and parameters, so rebuilding it
+                // per consumer would clone them repeatedly on a path an attacker chooses
+                // how often to trigger.
+                let challenge = err.challenge();
+                let rejection = self.metadata.rejection_from(&err, &challenge, scope_param);
+                // Classify from the same error: a server-side failure is a 5xx that was
+                // never a token judgement, so labelling it `invalid_token` would both
+                // overstate rejections and hide the outage. The error is asked rather than
+                // the challenge, because outcomes like `Expired` and `UnrecognizedIssuer`
+                // are indistinguishable from `invalid_token` on the wire.
+                let outcome = CheckOutcome::from_validation(err.validation_outcome(&challenge));
                 (
                     Outcome::Deny {
-                        status,
-                        challenges,
+                        status: rejection.status,
+                        challenges: rejection.www_authenticate,
                         dpop_nonce,
+                        retry_after: rejection.retry_after,
                     },
-                    CheckOutcome::InvalidToken,
+                    outcome,
                 )
             }
             Ok(None) => {
@@ -532,6 +565,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                                 status: http::StatusCode::UNAUTHORIZED,
                                 challenges,
                                 dpop_nonce,
+                                retry_after: None,
                             },
                             CheckOutcome::Unauthenticated,
                         )
@@ -593,6 +627,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                     status: http::StatusCode::UNAUTHORIZED,
                     challenges,
                     dpop_nonce: dpop_nonce.map(String::from),
+                    retry_after: None,
                 },
                 CheckOutcome::InvalidToken,
             ));
@@ -612,6 +647,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                             status: http::StatusCode::FORBIDDEN,
                             challenges,
                             dpop_nonce: dpop_nonce.map(String::from),
+                            retry_after: None,
                         },
                         CheckOutcome::InsufficientScope,
                     ));
@@ -634,6 +670,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                             status: http::StatusCode::FORBIDDEN,
                             challenges,
                             dpop_nonce: dpop_nonce.map(String::from),
+                            retry_after: None,
                         },
                         CheckOutcome::InsufficientScope,
                     ));
@@ -649,6 +686,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                             status: http::StatusCode::UNAUTHORIZED,
                             challenges,
                             dpop_nonce: dpop_nonce.map(String::from),
+                            retry_after: None,
                         },
                         CheckOutcome::InvalidToken,
                     ));

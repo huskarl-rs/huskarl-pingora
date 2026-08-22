@@ -31,6 +31,7 @@ use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_login::{
     CompletedLogin, LoginConfig, SessionDriver, SessionError, SessionErrorKind, SessionLifetime,
     SessionState,
+    core::crypto::seal::{AeadSealerUnsealer, AeadV1Sealer},
 };
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_proxy::{ProxyHttp, Session};
@@ -129,6 +130,16 @@ impl SessionDriver for MockSessionDriver {
     ) {
     }
 
+    fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
+        // The engine is always built with an explicit `.sealer(...)` below, so
+        // this default is never reached.
+        unimplemented!()
+    }
+
+    fn clear_session_cookies(&self, _: &http::HeaderMap) -> Vec<HeaderValue> {
+        vec![]
+    }
+
     async fn create(
         &self,
         _: CompletedLogin,
@@ -217,11 +228,14 @@ async fn test_cipher() -> AesGcmKey {
     .unwrap()
 }
 
+async fn test_sealer() -> AeadV1Sealer<AesGcmKey> {
+    AeadV1Sealer::new(test_cipher().await)
+}
+
 fn default_config() -> LoginConfig {
     LoginConfig::builder()
         .callback_path("/callback")
         .scope(vec![])
-        .base_url("https://app.example.com".parse().unwrap())
         .session_lifetime(SessionLifetime::Bounded(Duration::from_hours(8)))
         .build()
         .unwrap()
@@ -269,8 +283,9 @@ async fn build_engine<SD: SessionDriver>(store: SD) -> Arc<huskarl_login::engine
             .config(default_config())
             .grant(test_grant().await)
             .session_store(store)
-            .cipher(test_cipher().await)
-            .build(),
+            .sealer(test_sealer().await)
+            .build()
+            .unwrap(),
     )
 }
 
@@ -380,8 +395,9 @@ async fn subtree_required_covers_path_and_descendants() {
             .config(default_config())
             .grant(test_grant().await)
             .session_store(MockSessionDriver::default())
-            .cipher(test_cipher().await)
-            .build(),
+            .sealer(test_sealer().await)
+            .build()
+            .unwrap(),
     );
     let proxy = LoginProxy::builder()
         .inner(InnerProxy::new())
@@ -1110,7 +1126,7 @@ mod store_backed {
     async fn build_store(external: InMemoryStore) -> StoreBackedSessionStore<InMemoryStore> {
         StoreBackedSessionStore::builder()
             .external(external)
-            .cipher(test_cipher().await)
+            .sealer(test_sealer().await)
             .cookie_name("session".parse().unwrap())
             .cookie_path("/".parse().unwrap())
             .build()
