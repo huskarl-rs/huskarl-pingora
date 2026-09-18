@@ -125,14 +125,14 @@
 //!
 //! The builder **requires** a [`DecodeLayers`](path_confusion::DecodeLayers)
 //! declaration; there is no default. Declare
-//! [`Layered`](path_confusion::DecodeLayers::Layered) whenever more than one layer
-//! percent-decodes the path before it is finally routed — a CDN or WAF in front of the
-//! origin, or proxy-in-front-of-proxy. That topology is **CVE-2025-0108** (PAN-OS):
+//! [`UpToTwo`](path_confusion::DecodeLayers::UpToTwo) whenever the path may receive
+//! one or two percent-decode passes before it is finally routed — a CDN or WAF in front
+//! of the origin, or proxy-in-front-of-proxy. That topology is **CVE-2025-0108** (PAN-OS):
 //! nginx decoded `%252e%252e` once and passed it, then Apache decoded again to `..`
-//! and traversed into a protected path. Under `Layered`, double-percent forms
+//! and traversed into a protected path. Under `UpToTwo`, double-percent forms
 //! (`%252F`, `%252E`) are treated as structure and the content-decode check applies
 //! two passes. Declare [`Single`](path_confusion::DecodeLayers::Single) for a lone
-//! backend with nothing decoding in front; when unsure, `Layered` is the safe,
+//! backend with nothing decoding in front; when unsure, `UpToTwo` is the safe,
 //! deny-more direction.
 //!
 //! ## Case-insensitive backends

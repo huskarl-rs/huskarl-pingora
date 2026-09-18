@@ -1,4 +1,4 @@
-//! [`ProxyHttp`](pingora_proxy::ProxyHttp) decorator for the login flow.
+//! [`ProxyHttp`] decorator for the login flow.
 //!
 //! [`LoginProxy`] wraps an inner proxy and runs each request through the
 //! shared [`LoginEngine`]: `/callback` and `/logout` are handled internally,
@@ -17,7 +17,9 @@ use std::sync::Arc;
 use http::HeaderValue;
 use huskarl_login::{
     DefaultPersistFailurePolicy, PersistFailurePolicy, SessionDriver,
-    engine::{LoadedSession, LoginEngine, LoginResponse, error_chain, is_cors_preflight},
+    engine::{
+        LoadedSession, LoginEngine, LoginResponse, SetCookies, error_chain, is_cors_preflight,
+    },
 };
 use huskarl_route_guard::{MethodMatch, RuleRouter, RuleRouterError};
 use pingora_error::{
@@ -25,7 +27,7 @@ use pingora_error::{
     ErrorType::{HTTPStatus, InternalError},
     Result,
 };
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use pingora_proxy_delegate::proxy_http_delegate;
 
@@ -33,7 +35,9 @@ use super::{
     ctx::HasLoginSession,
     rule::{CheckError, LoginRule},
 };
-use crate::path_confusion::{CaseSensitivity, DecodeLayers, PathConfusion, StructuralClasses};
+use crate::path_confusion::{
+    CaseSensitivity, DecodeLayers, DenyReason, PathConfusion, StructuralClasses,
+};
 
 #[cfg(test)]
 mod tests;
@@ -52,7 +56,7 @@ mod tests;
 ///   or forwards it to the inner proxy with the loaded session in the
 ///   context (rules `required` or `optional`). Paths matched by a `public`
 ///   rule skip session loading entirely.
-/// - `upstream_response_filter` persists or deletes the session via the
+/// - `upstream_response_filter` persists or terminates the session via the
 ///   engine, appending the resulting `Set-Cookie` headers to the response.
 ///   A failure here is handled by the configured [`PersistFailurePolicy`].
 /// - `logging` is the persistence fallback for requests that never reach
@@ -64,22 +68,13 @@ mod tests;
 ///   inside [`LoginEngine::load_session`], so what's at stake here is an
 ///   activity touch or a retry of a failed eager persist.)
 ///
-/// # Session cookie forwarding (known limitation)
+/// # Session credential stripping
 ///
-/// Unlike the resource side, which strips the `Authorization`/`DPoP` credentials
-/// before the upstream, this proxy forwards the inbound `Cookie` header
-/// **unchanged** — so the session cookie reaches the upstream. This is low
-/// severity: the session cookie is sealed with the proxy's AEAD cipher and marked
-/// `HttpOnly` / `__Host-`, so it is opaque to a backend that does not share the
-/// cipher, and identity is delivered to the application through the session object
-/// in the context, not the cookie. The cost is essentially bandwidth.
-///
-/// It is not stripped today only because, unlike a dedicated `Authorization`
-/// header, the session lives *inside* a shared `Cookie` header alongside the
-/// application's own cookies — and, for cookie-backed sessions, across a family of
-/// chunk (`{name}.N`) and kid-sidecar (`{name}.kid`) cookies — so removing it means
-/// parsing and rebuilding the header rather than dropping it. Revisit if the
-/// upstream is not fully trusted.
+/// Before forwarding, this proxy removes the session driver's cookies from the
+/// inbound `Cookie` header, including cookie-session chunks and key-id sidecars.
+/// Unrelated application cookies are preserved. Identity reaches the application
+/// through the session object in the context, so the upstream never needs the
+/// replayable browser credential.
 ///
 /// # Type parameters
 ///
@@ -186,7 +181,7 @@ where
         /// CDN, WAF, or second proxy decoding in front of the upstream (see
         /// [`DecodeLayers`]). Required, no default: decode depth is a topology fact
         /// the library will not guess. When unsure, declare
-        /// [`Layered`](DecodeLayers::Layered) — the safe, deny-more direction.
+        /// [`UpToTwo`](DecodeLayers::UpToTwo) — the safe, deny-more direction.
         decode_layers: DecodeLayers,
         /// Which path-confusion guard to apply — denies requests whose path a
         /// normalizing backend could route to a different rule than the one matched
@@ -211,15 +206,14 @@ where
         persist_failure_policy: Box<dyn PersistFailurePolicy>,
         /// Whether to pass CORS preflight requests — `OPTIONS` carrying an
         /// `Access-Control-Request-Method` header — straight to the inner proxy,
-        /// bypassing session loading, the per-route [`LoginRule`], and the
-        /// path-confusion guard.
+        /// bypassing session loading and the per-route [`LoginRule`]. The
+        /// path-confusion guard still validates the request path before it is
+        /// passed through.
         ///
         /// Defaults to `true`. A browser sends a preflight **without** credentials,
         /// so no session cookie reaches us and there is no authorization decision to
         /// make: the preflight only negotiates CORS, which belongs to the inner proxy
-        /// or a dedicated CORS filter, not this login layer. Path confusion likewise
-        /// has nothing to protect here — it equalizes which *authz rule* serves a path,
-        /// and a credential-less preflight selects no rule.
+        /// or a dedicated CORS filter, not this login layer.
         ///
         /// Set to `false` to instead route preflights through the normal flow (engine
         /// route handlers, rule lookup, path-confusion guard, session loading) — e.g.
@@ -228,10 +222,19 @@ where
         #[builder(default = true)]
         cors_passthrough: bool,
     ) -> Result<Self, RouteConfigError> {
+        for (_kind, pattern, rule) in &routes {
+            if rule.public_check_requested() {
+                return Err(RouteConfigError::PublicRuleWithCheck(pattern.clone()));
+            }
+        }
+        if default.public_check_requested() {
+            return Err(RouteConfigError::PublicRuleWithCheck("<default>".into()));
+        }
+
         // Build the rule-id router via route-guard's builder: it assigns rule ids and
         // expands subtree patterns internally, so the id contract holds by construction
         // (no `RuleIdOutOfOrder` reachable from here) and runs the canonical-pattern check.
-        let mut router = RuleRouter::builder()
+        let mut rule_router_builder = RuleRouter::builder()
             .default(default)
             .case_sensitivity(case_sensitivity)
             .decode_layers(decode_layers)
@@ -239,20 +242,26 @@ where
             .structural_classes(structural_classes);
         for (kind, pattern, rule) in routes {
             let method = rule.method_match().clone();
-            router = match (kind, method) {
-                (RouteKind::Exact, MethodMatch::Any) => router.route(pattern, rule),
-                (RouteKind::Exact, m @ MethodMatch::OneOf(_)) => router.route_for(m, pattern, rule),
-                (RouteKind::Subtree, MethodMatch::Any) => router.subtree(&pattern, rule),
-                (RouteKind::Subtree, m @ MethodMatch::OneOf(_)) => {
-                    router.subtree_for(m, &pattern, rule)
+            rule_router_builder = match (kind, method) {
+                (RouteKind::Exact, MethodMatch::Any) => rule_router_builder.route(pattern, rule),
+                (RouteKind::Exact, m @ MethodMatch::OneOf(_)) => {
+                    rule_router_builder.route_for(m, pattern, rule)
                 }
-                (RouteKind::Blob, MethodMatch::Any) => router.blob_subtree(&pattern, rule),
+                (RouteKind::Subtree, MethodMatch::Any) => {
+                    rule_router_builder.subtree(&pattern, rule)
+                }
+                (RouteKind::Subtree, m @ MethodMatch::OneOf(_)) => {
+                    rule_router_builder.subtree_for(m, &pattern, rule)
+                }
+                (RouteKind::Blob, MethodMatch::Any) => {
+                    rule_router_builder.blob_subtree(&pattern, rule)
+                }
                 (RouteKind::Blob, m @ MethodMatch::OneOf(_)) => {
-                    router.blob_subtree_for(m, &pattern, rule)
+                    rule_router_builder.blob_subtree_for(m, &pattern, rule)
                 }
             };
         }
-        let routes = router.build()?;
+        let routes = rule_router_builder.build()?;
         Ok(Self {
             inner,
             engine,
@@ -358,6 +367,22 @@ where
         write_login_response(session, resp, Vec::new()).await?;
         Ok(true)
     }
+
+    /// Logs and renders the rule-independent response for a structurally
+    /// ambiguous request path.
+    async fn serve_path_confusion(
+        &self,
+        session: &mut Session,
+        path: &str,
+        reason: &DenyReason,
+    ) -> Result<bool> {
+        log::warn!("path-confusion guard denied {path:?}: {reason}");
+        let resp = self
+            .engine
+            .render_error(http::StatusCode::BAD_REQUEST, reason.message());
+        write_login_response(session, resp, vec![]).await?;
+        Ok(true)
+    }
 }
 
 /// Errors that can occur when building a [`LoginProxy`]'s route table.
@@ -367,6 +392,11 @@ where
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RouteConfigError {
+    /// A public route has a custom check that can never run because public
+    /// routes deliberately skip session loading.
+    ///
+    /// The string is the route pattern, or `"<default>"` for the default rule.
+    PublicRuleWithCheck(String),
     /// A route pattern could not be lowered into the route grammar — e.g. an in-segment
     /// prefix/suffix parameter (`/v{ver}`, which the whole-segment grammar cannot
     /// express), a non-final catch-all, or a conflict with another route.
@@ -399,6 +429,10 @@ pub enum RouteConfigError {
 impl std::fmt::Display for RouteConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PublicRuleWithCheck(pattern) => write!(
+                f,
+                "public login rule for {pattern:?} has a custom check that can never run: public routes do not load a session"
+            ),
             Self::Route { pattern, reason } => {
                 write!(f, "invalid route pattern {pattern:?}: {reason}")
             }
@@ -421,7 +455,8 @@ impl std::fmt::Display for RouteConfigError {
 impl std::error::Error for RouteConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Route { .. }
+            Self::PublicRuleWithCheck(_)
+            | Self::Route { .. }
             | Self::NonCanonicalPattern { .. }
             | Self::NonCanonicalCasePattern { .. } => None,
         }
@@ -439,6 +474,10 @@ impl From<RuleRouterError> for RouteConfigError {
             RuleRouterError::EmptyMethodSet { pattern } => Self::Route {
                 pattern,
                 reason: "registration matches no method: its method set is empty",
+            },
+            RuleRouterError::EmptyPatternSet => Self::Route {
+                pattern: String::new(),
+                reason: "registration has no route patterns",
             },
             RuleRouterError::TooManyRegistrations => Self::Route {
                 pattern: String::new(),
@@ -481,6 +520,19 @@ async fn write_login_response(
     Ok(())
 }
 
+/// Consumes cookies owed to a response that has already been sent, reporting
+/// what was stranded. `discard` then consumes the guard without logging —
+/// non-delivery here is a fact, not a dropped-cookie bug.
+fn report_stranded_cookies(cookies: SetCookies) {
+    if !cookies.is_empty() {
+        log::warn!(
+            "session updated after the response was sent — {} Set-Cookie header(s) could not be delivered",
+            cookies.len()
+        );
+    }
+    cookies.discard();
+}
+
 /// Appends session `Set-Cookie` headers (eager-refresh re-seal, touch re-save,
 /// or teardown clears) to the upstream response.
 ///
@@ -490,7 +542,7 @@ async fn write_login_response(
 /// replay it to another user (RFC 6749 §5.1). Engine-authored responses
 /// already carry `no-store`. An empty `cookies` (the steady-state authenticated
 /// request) leaves the upstream's own cache headers untouched.
-fn append_set_cookies(resp: &mut ResponseHeader, cookies: Vec<HeaderValue>) -> Result<()> {
+fn append_set_cookies(resp: &mut ResponseHeader, cookies: SetCookies) -> Result<()> {
     if cookies.is_empty() {
         return Ok(());
     }
@@ -520,18 +572,20 @@ where
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let req = session.req_header();
-
-        // CORS preflight: browsers strip credentials, so a session cookie would never
-        // reach us and there is no authz rule to select — path confusion has nothing to
-        // protect. Let the inner proxy handle these directly, unless the deployment opts
-        // out and wants preflights routed through the normal flow.
-        if self.cors_passthrough && is_cors_preflight(&req.method, &req.headers) {
-            return self.inner.request_filter(session, ctx).await;
-        }
-
         let uri = req.uri.clone();
         let method = req.method.clone();
         let headers = req.headers.clone();
+
+        // Preflights stay session-free but still cross the structural path guard;
+        // non-browser clients can manufacture preflight-shaped requests.
+        if self.cors_passthrough && is_cors_preflight(&method, &headers) {
+            if let Err(reason) = self.routes.resolve(uri.path(), &method) {
+                return self
+                    .serve_path_confusion(session, uri.path(), &reason)
+                    .await;
+            }
+            return self.inner.request_filter(session, ctx).await;
+        }
 
         // The engine handles its configured callback / logout paths fully —
         // they take precedence over any user-registered route.
@@ -551,12 +605,9 @@ where
         let rule = match self.routes.resolve(uri.path(), &method) {
             Ok(matched) => matched.rule(),
             Err(reason) => {
-                log::warn!("path-confusion guard denied {:?}: {reason}", uri.path());
-                let resp = self
-                    .engine
-                    .render_error(http::StatusCode::BAD_REQUEST, reason.message());
-                write_login_response(session, resp, vec![]).await?;
-                return Ok(true);
+                return self
+                    .serve_path_confusion(session, uri.path(), &reason)
+                    .await;
             }
         };
 
@@ -587,18 +638,20 @@ where
         // any), what the response still owes the store, and which Set-Cookie
         // headers must reach the client.
         let (maybe_sess, pending, set_cookies) = match loaded {
-            LoadedSession::Missing => (None, None, Vec::new()),
-            LoadedSession::Cleared { clears, .. } => (None, None, clears.into_headers()),
+            LoadedSession::Missing => (None, None, SetCookies::default()),
+            LoadedSession::Cleared { clears, .. } => (None, None, clears),
             LoadedSession::Active {
                 session: sess,
                 set_cookies,
-            } => (Some(sess), None, set_cookies.into_headers()),
+            } => (Some(sess), None, set_cookies),
             // The serving copy is cloned out of the pending persist so the
             // inner proxy sees the session in `LoginState` as usual; the
             // commit after the response carries its own copy.
-            LoadedSession::ActivePending { pending } => {
-                (Some(pending.session().clone()), Some(pending), Vec::new())
-            }
+            LoadedSession::ActivePending { pending } => (
+                Some(pending.session().clone()),
+                Some(pending),
+                SetCookies::default(),
+            ),
             // The access token expired and the refresh is transiently
             // unavailable — authentication can be neither confirmed nor refuted
             // right now. Serve a retryable error rather than bouncing the user
@@ -614,15 +667,11 @@ where
             // cookies the engine decided to drop (expired, refresh failed).
             if required {
                 let resp = self.engine.redirect_to_login(&headers, &uri).await;
-                write_login_response(session, resp, set_cookies).await?;
+                write_login_response(session, resp, set_cookies.into_headers()).await?;
                 return Ok(true);
             }
-            let state = ctx.login_state_mut();
-            state.session = None;
-            state.pending = None;
-            state.request_headers = headers;
-            state.set_cookies = set_cookies;
-            state.delete_requested = false;
+            ctx.login_state_mut()
+                .prepare_forward(None, None, headers, set_cookies);
             return self.inner.request_filter(session, ctx).await;
         };
 
@@ -635,7 +684,7 @@ where
             // The deny response may still owe the store a post-response save:
             // the retry of an eager refresh persist that failed. Best-effort —
             // the user is denied either way.
-            let mut cookies = set_cookies;
+            let mut cookies = set_cookies.into_headers();
             if let Some(pending) = pending {
                 match pending.commit(&self.engine, &headers).await {
                     Ok(more) => cookies.extend(more),
@@ -650,14 +699,24 @@ where
             return Ok(true);
         }
 
-        let state = ctx.login_state_mut();
-        state.session = Some(sess);
-        state.pending = pending;
-        state.request_headers = headers;
-        state.set_cookies = set_cookies;
-        state.delete_requested = false;
+        ctx.login_state_mut()
+            .prepare_forward(Some(sess), pending, headers, set_cookies);
 
         self.inner.request_filter(session, ctx).await
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        self.engine
+            .strip_session_credentials(&mut upstream_request.headers);
+
+        self.inner
+            .upstream_request_filter(session, upstream_request, ctx)
+            .await
     }
 
     async fn upstream_response_filter(
@@ -675,7 +734,7 @@ where
         let request_headers = std::mem::take(&mut state.request_headers);
         let set_cookies = std::mem::take(&mut state.set_cookies);
         let pending = state.pending.take();
-        let delete_requested = std::mem::replace(&mut state.delete_requested, false);
+        let terminate_requested = std::mem::replace(&mut state.terminate_requested, false);
 
         append_set_cookies(upstream_response, set_cookies)?;
 
@@ -683,24 +742,28 @@ where
             return Ok(());
         };
 
-        if delete_requested {
-            // The owed persist (if any) is moot for a session being deleted.
+        if terminate_requested {
+            // The owed persist (if any) is moot for a session being terminated.
             if let Some(pending) = pending {
                 pending.abandon();
             }
-            return match self.engine.delete_session(&sess, &request_headers).await {
-                Ok(cookies) => append_set_cookies(upstream_response, cookies.into_headers()),
-                Err(e) => {
-                    // A failed delete means the session is still live;
-                    // sending the response without its cookie clears would
-                    // leave the client logged in. Always fail closed.
-                    log::error!("failed to delete session: {}", error_chain(&e));
-                    Err(Error::explain(
-                        InternalError,
-                        format!("failed to delete session: {}", error_chain(&e)),
-                    ))
-                }
-            };
+            // The browser clears are built before server-side revocation and
+            // are delivered whichever way revocation went: a backend failure
+            // can leave a copied store pointer usable, but must not keep the
+            // current browser logged in. Failing the request here would
+            // replace this response — clears and all — and leave the client
+            // holding a live session cookie, so report the revocation failure
+            // instead and let operators monitor it.
+            let (clears, revocation) = self
+                .engine
+                .terminate_session(&sess, &request_headers)
+                .await
+                .into_parts();
+            append_set_cookies(upstream_response, clears)?;
+            if let Err(e) = revocation {
+                log::error!("failed to revoke session: {}", error_chain(&e));
+            }
+            return Ok(());
         }
 
         // Fully persisted at load time — nothing owed.
@@ -708,7 +771,7 @@ where
             return Ok(());
         };
         match pending.commit(&self.engine, &request_headers).await {
-            Ok(cookies) => append_set_cookies(upstream_response, cookies.into_headers()),
+            Ok(cookies) => append_set_cookies(upstream_response, cookies),
             Err(e) => {
                 log::error!("failed to persist session: {}", error_chain(&e));
                 match self.persist_failure_policy.handle(&e) {
@@ -734,44 +797,41 @@ where
         // longer be delivered — external stores still persist correctly,
         // cookie-backed stores cannot.
         let state = ctx.login_state_mut();
+        let set_cookies = std::mem::take(&mut state.set_cookies);
+        report_stranded_cookies(set_cookies);
         if let Some(sess) = state.session.take() {
             let request_headers = std::mem::take(&mut state.request_headers);
             let pending = state.pending.take();
-            let delete_requested = std::mem::replace(&mut state.delete_requested, false);
-            state.set_cookies.clear();
-
-            let result = if delete_requested {
-                // The owed persist (if any) is moot for a session being deleted.
+            let terminate_requested = std::mem::replace(&mut state.terminate_requested, false);
+            if terminate_requested {
+                // The owed persist (if any) is moot for a session being terminated.
                 if let Some(pending) = pending {
                     pending.abandon();
                 }
-                Some(self.engine.delete_session(&sess, &request_headers).await)
-            } else if let Some(pending) = pending {
-                Some(pending.commit(&self.engine, &request_headers).await)
-            } else {
-                // Fully persisted at load time — nothing owed.
-                None
-            };
-            match result {
-                Some(Ok(cookies)) => {
-                    // The response is already gone, so these cookies can't be
-                    // delivered — report what was stranded, then `discard` to
-                    // consume the guard without logging (non-delivery here is a
-                    // fact, not a dropped-cookie bug).
-                    if !cookies.is_empty() {
-                        log::warn!(
-                            "session persisted after the response was sent — {} Set-Cookie header(s) could not be delivered",
-                            cookies.len()
-                        );
-                    }
-                    cookies.discard();
+                // The browser clears and the server-side revocation are
+                // independent: the clears exist even when revocation fails.
+                let (clears, revocation) = self
+                    .engine
+                    .terminate_session(&sess, &request_headers)
+                    .await
+                    .into_parts();
+                report_stranded_cookies(clears);
+                if let Err(err) = revocation {
+                    log::error!(
+                        "failed to revoke session in logging fallback: {}",
+                        error_chain(&err)
+                    );
                 }
-                Some(Err(err)) => log::error!(
-                    "failed to persist session in logging fallback: {}",
-                    error_chain(&err)
-                ),
-                None => {}
+            } else if let Some(pending) = pending {
+                match pending.commit(&self.engine, &request_headers).await {
+                    Ok(cookies) => report_stranded_cookies(cookies),
+                    Err(err) => log::error!(
+                        "failed to persist session in logging fallback: {}",
+                        error_chain(&err)
+                    ),
+                }
             }
+            // Otherwise fully persisted at load time — nothing owed.
         }
 
         self.inner.logging(session, e, ctx).await;

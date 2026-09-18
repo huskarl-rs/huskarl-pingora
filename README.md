@@ -59,16 +59,16 @@ where) with a *content-decode* check (whether percent-decoding the path lands on
 different rule, catching `/%61dmin` → `/admin`). For the complete decision
 algorithm — what each check covers, what it does **not**, and how to configure it
 for your backend — see the
-[`path_confusion`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/) module.
+[`path_confusion`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/) module.
 
-The guard, whose mode is selected with [`PathConfusion`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.PathConfusion.html),
+The guard, whose mode is selected with [`PathConfusion`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/enum.PathConfusion.html),
 denies a structural byte wherever a wildcard or catch-all captures it. To proxy opaque keys
 that legitimately contain encoded separators, opt the tail in explicitly with
 `blob_subtree` (see below) — it is never inferred from table shape.
 
 ## Positional structural reject (the default)
 
-[`PathConfusion::reject_structural()`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.PathConfusion.html#method.reject_structural)
+[`PathConfusion::reject_structural()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/PathConfusion/fn.reject_structural.html)
 models **no backend**. Because route patterns are canonical, any structural
 character (`%2F`, `..`, `;`, …) in a request necessarily lands inside a wildcard or
 catch-all position — so the default denies it. The route table you already wrote is
@@ -89,68 +89,76 @@ With `subtree("/files", …)`, `subtree("/admin", …)`, and
 When a prefix proxies opaque identifiers whose keys legitimately contain encoded
 separators (object-store keys, …), register it with `blob_subtree` instead of
 `subtree`. Its catch-all tail then **tolerates** the boundary-shifting bytes
-(`%2F`, `;`, `\`) inside the key, so `/files/a%2Fb.txt` is allowed — but `..`, NUL
-truncation, and case folding are **still** denied even there, so traversal cannot
-escape the blob. Registering a more-specific route *under* a `blob_subtree` is a
+(`%2F`, `;`, `\`) inside the key, so `/files/a%2Fb.txt` is allowed — but `..` and
+NUL truncation are **still** denied even there, so traversal cannot escape the
+blob. Registering a more-specific route *under* a `blob_subtree` is a
 build error (a structural byte could then relocate into it), so the opt-in is safe
 by construction rather than dependent on table shape.
 
 ## Opt-in classes and encodings
 
-The always-on alphabet is the standard RFC 3986 surface — encoded slash,
-dot-segments, and `;`-matrix-params — sound for a conventional standards-conforming
-backend. A backend that considers *more* paths equivalent needs the matching toggle
-on [`StructuralClasses`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/struct.StructuralClasses.html), passed via the builder’s
+The always-on alphabet is encoded slash, dot-segments, `;`-matrix-params, and
+`%00`/raw-NUL truncation — the forms whose legitimate-traffic cost is near nil. A
+backend that considers *more* paths equivalent needs the matching toggle on
+[`StructuralClasses`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/struct.StructuralClasses.html), passed via the builder’s
 `structural_classes`:
 
-- [`with_backslash()`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/struct.StructuralClasses.html#method.with_backslash) — `\`/`%5C`
+- [`with_backslash()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/StructuralClasses/fn.with_backslash.html) — `\`/`%5C`
   as a separator (Windows/IIS);
-- [`with_null_truncation()`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/struct.StructuralClasses.html#method.with_null_truncation) —
-  `%00` as a C-string terminator;
-- [`with_overlong([…])`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/struct.StructuralClasses.html#method.with_overlong) and
-  [`with_double_decode()`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/struct.StructuralClasses.html#method.with_double_decode) —
-  recognise overlong-UTF-8 (`%C0%AF`) and double-percent (`%252F`) forms. Enable
-  `with_double_decode()` — or the topology-named
-  [`behind_decoding_proxy()`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/struct.StructuralClasses.html#method.behind_decoding_proxy)
-  preset — whenever two layers each decode (CDN/WAF → origin, or proxy → proxy):
-  that is **CVE-2025-0108** (PAN-OS), where nginx decoded `%252e%252e` once and
-  passed it, then Apache decoded again to `..` and traversed into a protected path;
-- [`with_probe(p)`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/struct.StructuralClasses.html#method.with_probe) — a custom
-  [`StructuralProbe`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/trait.StructuralProbe.html) **break-glass** for a structural
+- [`with_overlong([…])`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/StructuralClasses/fn.with_overlong.html) —
+  recognise overlong-UTF-8 forms (`%C0%AF`) accepted by legacy decoders;
+- [`with_probe(p)`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/StructuralClasses/fn.with_probe.html) — a custom
+  [`StructuralProbe`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/trait.StructuralProbe.html) **break-glass** for a structural
   form the built-in alphabet doesn’t ship (e.g. a fresh CVE), denied on presence
   anywhere in the path.
 
 Each toggle is a per-deployment security decision: it is how you tell the guard
 which paths your backend considers equivalent. Example:
-`StructuralClasses::new().with_backslash()`. (Case is **not** here — it is a
-separate, required builder declaration; see below.)
+`StructuralClasses::new().with_backslash()`. (Case and decode depth are **not**
+here — they are separate, required builder declarations; see below.)
+
+## Decoding layers in front of the upstream
+
+The builder **requires** a [`DecodeLayers`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/enum.DecodeLayers.html)
+declaration; there is no default. Declare
+[`UpToTwo`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/DecodeLayers/#variant.UpToTwo) whenever the path may receive
+one or two percent-decode passes before it is finally routed — a CDN or WAF in front
+of the origin, or proxy-in-front-of-proxy. That topology is **CVE-2025-0108** (PAN-OS):
+nginx decoded `%252e%252e` once and passed it, then Apache decoded again to `..`
+and traversed into a protected path. Under `UpToTwo`, double-percent forms
+(`%252F`, `%252E`) are treated as structure and the content-decode check applies
+two passes. Declare [`Single`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/DecodeLayers/#variant.Single) for a lone
+backend with nothing decoding in front; when unsure, `UpToTwo` is the safe,
+deny-more direction.
 
 ## Case-insensitive backends
 
 Path matching here is **case-sensitive** (and so is the route matcher), but whether that
 matches your upstream is a security fact the library cannot infer — so the builder
 **requires** you to declare it with
-[`CaseSensitivity`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.CaseSensitivity.html); there is no default. A case-folding
+[`CaseSensitivity`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/enum.CaseSensitivity.html); there is no default. A case-folding
 upstream — IIS, ASP.NET, servlet containers on Windows, or anything serving files
 from a Windows/macOS filesystem — routes `/ADMIN` and `/admin` to the same resource,
 so a differently-cased request can reach a route *without that route’s checks*
 (`/ADMIN` falling through to a weaker rule, then served as `/admin`).
 
-- [`Sensitive`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.CaseSensitivity.html#variant.Sensitive) — the upstream distinguishes
+- [`Sensitive`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/CaseSensitivity/#variant.Sensitive) — the upstream distinguishes
   case; routes differing only by case are genuinely distinct and allowed.
-- [`Insensitive`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.CaseSensitivity.html#variant.Insensitive) — the upstream folds
-  case. The guard then treats case as path structure (an uppercase request that
-  could reach another rule is denied), **route patterns must be registered in
-  lowercase** (an uppercase pattern is a build error — it is the form the backend
-  resolves to), and two routes differing only by case are rejected at build. Only
-  ASCII case is modeled.
+- [`Insensitive`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/CaseSensitivity/#variant.Insensitive) — the upstream folds
+  case. The guard then runs a **precise case-fold check**: it lowercases the request
+  path, re-routes it, and denies only if the folded path lands on a *different* rule
+  — mixed-case content that folds within its own rule (`/files/ReadMe.TXT`) keeps
+  flowing, while `/ADMIN` folding onto a distinct `/admin` rule is denied. **Route
+  patterns must be registered in lowercase** (an uppercase pattern is a build error —
+  it is the form the backend resolves to), and two routes differing only by case are
+  rejected at build. Only ASCII case is modeled.
 
 ## Strict and off
 
-[`reject_non_canonical()`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.PathConfusion.html#method.reject_non_canonical)
+[`reject_non_canonical()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/PathConfusion/fn.reject_non_canonical.html)
 treats *every* position as live — it denies **any** non-canonical path (`..`,
 `//`, encoded separators) outright, strict defense-in-depth that also rejects
-legitimate blob keys. [`off()`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/enum.PathConfusion.html#method.off) disables the
+legitimate blob keys. [`off()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/PathConfusion/fn.off.html) disables the
 guard.
 
 ## Build-time check
@@ -173,7 +181,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl_pingora::{
-    resource::{AuthCtx, AuthProxy, CaseSensitivity, Guard, Rule},
+    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeLayers, Guard, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
         validator::rfc9068::Rfc9068Validator,
@@ -238,6 +246,7 @@ async fn main() {
     let guard = Guard::builder()
         .validator(validator)
         .case_sensitivity(CaseSensitivity::Sensitive) // required: declare backend case behavior
+        .decode_layers(DecodeLayers::Single) // required: declare decode depth behind this layer
         .subtree("/api", Rule::required().scopes(["api"])) // /api and below
         .route("/health", Rule::public()) // exactly /health
         .build()

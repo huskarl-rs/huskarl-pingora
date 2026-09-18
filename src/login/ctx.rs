@@ -5,24 +5,24 @@
 //! through `request_filter` → inner proxy → `upstream_response_filter`, and
 //! [`LoginCtx`], a convenience wrapper that implements it automatically.
 
-use http::{HeaderMap, HeaderValue};
-use huskarl_login::engine::PendingPersist;
+use http::HeaderMap;
+use huskarl_login::engine::{PendingPersist, SetCookies};
 
 /// State held on the proxy context across the request lifecycle.
 ///
 /// [`LoginProxy`](super::LoginProxy) populates this in `request_filter` and
-/// reads it in `upstream_response_filter` to persist or delete the session
+/// reads it in `upstream_response_filter` to persist or terminate the session
 /// after the inner proxy responds.
 ///
-/// User code reads `session` and sets `delete_requested` directly; the
+/// User code reads `session` and sets `terminate_requested` directly; the
 /// remaining fields are proxy-managed bookkeeping.
 #[non_exhaustive]
 pub struct LoginState<S> {
     /// The loaded session, if one was present and valid.
     pub session: Option<S>,
-    /// Set to `true` by the inner proxy when it wants the session destroyed on
+    /// Set to `true` by the inner proxy when it wants the session terminated on
     /// this response (e.g. an inner-proxy-managed account-deletion endpoint).
-    pub delete_requested: bool,
+    pub terminate_requested: bool,
     /// `Some` when a post-response save is owed to the store: a token refresh
     /// succeeded but the engine's eager save failed, so the owed persist must
     /// be committed (via [`PendingPersist::commit`]) after the inner proxy
@@ -35,7 +35,7 @@ pub struct LoginState<S> {
     /// `Set-Cookie` headers the engine produced during load: clears for an
     /// expired or refresh-failed session, or the re-sealed session cookies
     /// when a token refresh was persisted eagerly.
-    pub(crate) set_cookies: Vec<HeaderValue>,
+    pub(crate) set_cookies: SetCookies,
 }
 
 impl<S> Default for LoginState<S> {
@@ -44,9 +44,26 @@ impl<S> Default for LoginState<S> {
             session: None,
             pending: None,
             request_headers: HeaderMap::new(),
-            set_cookies: Vec::new(),
-            delete_requested: false,
+            set_cookies: SetCookies::default(),
+            terminate_requested: false,
         }
+    }
+}
+
+impl<S> LoginState<S> {
+    /// Replaces proxy-managed request state immediately before forwarding.
+    pub(crate) fn prepare_forward(
+        &mut self,
+        session: Option<S>,
+        pending: Option<PendingPersist<S>>,
+        request_headers: HeaderMap,
+        set_cookies: SetCookies,
+    ) {
+        self.session = session;
+        self.pending = pending;
+        self.request_headers = request_headers;
+        self.set_cookies = set_cookies;
+        self.terminate_requested = false;
     }
 }
 
@@ -54,12 +71,12 @@ impl<S> Default for LoginState<S> {
 ///
 /// Implement this on your proxy's context type so [`LoginProxy`](super::LoginProxy)
 /// can stash the loaded session, the engine's persistence decision, and the
-/// original request headers it needs to persist or delete the session after
+/// original request headers it needs to persist or terminate the session after
 /// the inner proxy responds.
 ///
-/// Inner-proxy code reaches the session and the delete flag through
+/// Inner-proxy code reaches the session and the termination flag through
 /// [`login_state`](Self::login_state) / [`login_state_mut`](Self::login_state_mut):
-/// read `login_state().session`, and set `login_state_mut().delete_requested = true`
+/// read `login_state().session`, and set `login_state_mut().terminate_requested = true`
 /// to tear the session down on this response (e.g. a "delete my account"
 /// endpoint).
 ///
@@ -108,7 +125,7 @@ impl<T: std::fmt::Debug, S> std::fmt::Debug for LoginCtx<T, S> {
         f.debug_struct("LoginCtx")
             .field("session_loaded", &self.state.session.is_some())
             .field("pending_save", &self.state.pending.is_some())
-            .field("delete_requested", &self.state.delete_requested)
+            .field("terminate_requested", &self.state.terminate_requested)
             .field("inner", &self.inner)
             .finish()
     }
@@ -132,7 +149,7 @@ mod tests {
     fn login_ctx_new_defaults() {
         let ctx = LoginCtx::<(), String>::new(());
         assert!(ctx.login_state().session.is_none());
-        assert!(!ctx.login_state().delete_requested);
+        assert!(!ctx.login_state().terminate_requested);
         assert_eq!(ctx.inner, ());
     }
 
@@ -140,7 +157,7 @@ mod tests {
     fn login_ctx_default_defaults() {
         let ctx = LoginCtx::<(), String>::default();
         assert!(ctx.login_state().session.is_none());
-        assert!(!ctx.login_state().delete_requested);
+        assert!(!ctx.login_state().terminate_requested);
     }
 
     #[test]
@@ -154,10 +171,10 @@ mod tests {
     }
 
     #[test]
-    fn delete_requested_flag() {
+    fn terminate_requested_flag() {
         let mut ctx = LoginCtx::<(), String>::new(());
-        ctx.login_state_mut().delete_requested = true;
-        assert!(ctx.login_state().delete_requested);
+        ctx.login_state_mut().terminate_requested = true;
+        assert!(ctx.login_state().terminate_requested);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::resource_server::error::{
 /// Errors that can occur when building or configuring a [`Guard`](super::Guard)
 /// or [`AuthProxy`](super::AuthProxy).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// A route pattern could not be lowered into the route grammar — e.g. an in-segment
     /// prefix/suffix parameter (`/v{ver}`, which the whole-segment grammar cannot
@@ -32,19 +33,41 @@ pub enum ConfigError {
     PublicRuleWithConstraints(String),
     /// Failed to serialize resource metadata.
     Metadata(serde_json::Error),
+    /// Validator metadata unexpectedly could not produce a resource document.
+    ResourceMetadataDocumentUnavailable,
+    /// The configured RFC 9728 resource identifier is invalid.
+    InvalidResourceIdentifier {
+        /// The offending resource identifier.
+        resource: String,
+        /// A human-readable reason.
+        reason: &'static str,
+    },
+    /// The base URI used for `DPoP` request reconstruction is invalid.
+    InvalidBaseUri {
+        /// The offending base URI.
+        base_uri: String,
+        /// A human-readable reason.
+        reason: &'static str,
+    },
     /// The configured `resource` identifier is not a URL RFC 9728 §3.1 can derive a
-    /// Protected Resource Metadata URL from — it must be absolute HTTP(S) with no
+    /// Protected Resource Metadata URL from — it must be absolute HTTPS with no
     /// fragment.
     ///
-    /// This is a build error rather than a silently-omitted `resource_metadata`
-    /// challenge parameter: the guard is already serving a metadata document derived
-    /// from the same identifier, so an identifier it cannot advertise is one whose
-    /// document clients could not have located anyway.
+    /// This is a configuration error so the proxy cannot advertise an
+    /// identifier from which clients could not locate a metadata document.
     ResourceMetadataUrl {
         /// The offending resource identifier.
         resource: String,
         /// Why the derivation failed.
         source: crate::resource_server::core::Error,
+    },
+    /// A validator advertises a metadata URL other than the local endpoint
+    /// derived from the configured resource identifier.
+    ResourceMetadataUrlMismatch {
+        /// URL supplied by the validator.
+        configured: String,
+        /// URL derived for the local endpoint.
+        derived: String,
     },
     /// A registered route pattern is non-canonical: it carries a structural byte
     /// (`%2F`, `..`, `//`, `;`, or an enabled opt-in form) that the path-confusion
@@ -79,11 +102,30 @@ impl std::fmt::Display for ConfigError {
                 "public rule for \"{pattern}\" has audience, scope, or custom-check constraints \
                  that can never be enforced: the token validator is not called for public routes"
             ),
-            Self::Metadata(e) => write!(f, "failed to serialize resource metadata: {e}"),
-            Self::ResourceMetadataUrl { resource, source } => write!(
+            Self::Metadata(_) => f.write_str("failed to serialize resource metadata"),
+            Self::ResourceMetadataDocumentUnavailable => {
+                f.write_str("validator metadata could not produce an RFC 9728 document")
+            }
+            Self::InvalidResourceIdentifier { resource, reason } => {
+                write!(
+                    f,
+                    "invalid protected-resource identifier {resource:?}: {reason}"
+                )
+            }
+            Self::InvalidBaseUri { base_uri, reason } => {
+                write!(f, "invalid DPoP base URI {base_uri:?}: {reason}")
+            }
+            Self::ResourceMetadataUrl { resource, .. } => write!(
                 f,
-                "resource identifier {resource:?} is not an absolute HTTP(S) URL, so no \
-                 RFC 9728 metadata URL can be derived from it: {source}"
+                "resource identifier {resource:?} cannot be used to derive an \
+                 RFC 9728 metadata URL"
+            ),
+            Self::ResourceMetadataUrlMismatch {
+                configured,
+                derived,
+            } => write!(
+                f,
+                "validator metadata URL {configured:?} does not match local endpoint {derived:?}"
             ),
             Self::NonCanonicalPattern { pattern } => write!(
                 f,
@@ -108,6 +150,10 @@ impl std::error::Error for ConfigError {
             Self::ResourceMetadataUrl { source, .. } => Some(source),
             Self::Route { .. }
             | Self::PublicRuleWithConstraints(_)
+            | Self::ResourceMetadataDocumentUnavailable
+            | Self::InvalidResourceIdentifier { .. }
+            | Self::InvalidBaseUri { .. }
+            | Self::ResourceMetadataUrlMismatch { .. }
             | Self::NonCanonicalPattern { .. }
             | Self::NonCanonicalCasePattern { .. } => None,
         }
@@ -132,6 +178,10 @@ impl From<huskarl_route_guard::RuleRouterError> for ConfigError {
             RuleRouterError::EmptyMethodSet { pattern } => Self::Route {
                 pattern,
                 reason: "registration matches no method: its method set is empty",
+            },
+            RuleRouterError::EmptyPatternSet => Self::Route {
+                pattern: String::new(),
+                reason: "registration has no route patterns",
             },
             RuleRouterError::TooManyRegistrations => Self::Route {
                 pattern: String::new(),

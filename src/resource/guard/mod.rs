@@ -24,7 +24,7 @@ use crate::{
         uri::request_uri,
     },
     resource_server::{
-        core::resource_metadata::{WELL_KNOWN_PATH, well_known_url},
+        core::resource_metadata::well_known_url,
         error::{InsufficientScope, ToRfc6750Error, TokenErrorCode},
         validator::{
             AccessTokenValidator, ValidatedRequest,
@@ -126,9 +126,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if any route pattern is rejected by
-    /// `matchit` or if a public rule is configured with audience or scope
-    /// constraints (which can never be enforced).
+    /// Returns [`ConfigError`] if the `DPoP` base URI or a route pattern is
+    /// invalid, or if a public rule has constraints that can never be enforced.
     #[builder]
     pub fn new(
         // One entry per `route`/`subtree`/`blob_subtree` call, in registration order.
@@ -137,24 +136,22 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         // by construction rather than by hand.
         #[builder(field)] routes: Vec<(RouteKind, String, Rule<V::Claims>)>,
         validator: V,
-        /// This resource server's own externally-visible base URL — its scheme,
-        /// authority, and base path (e.g. `https://api.example.com`). Used for two
-        /// things: the resource identifier in RFC 9728 metadata, and **`DPoP` `htu`
-        /// binding** — the guard reconstructs the client-facing request URL by combining
-        /// this authority (and base path) with the request path and passes it to the
-        /// validator to check against the proof's `htu` claim.
+        /// Externally visible base URI used to reconstruct the complete request URI
+        /// for **`DPoP` `htu` binding**. Its path is prepended to the incoming request
+        /// path after `strip_prefix` is applied.
         ///
         /// # Security
         ///
         /// For `DPoP`, set this to a value *you* control. The guard never derives the
-        /// authority from the inbound `Host` header, so configuring `resource`
+        /// authority from the inbound `Host` header, so configuring `base_uri`
         /// explicitly is what keeps `htu` bound to your real origin. If it is left unset,
         /// `htu` is matched against the raw request URI — which from a downstream proxy is
         /// origin-form (path only) and therefore no longer pins scheme/host, so a captured
-        /// proof could be replayed across origins. Set `resource` whenever you accept
+        /// proof could be replayed across origins. Set `base_uri` whenever you accept
         /// DPoP-bound tokens.
-        resource: Option<http::Uri>,
-        /// Path prefix to strip from the request path before prepending the resource path during `DPoP` URI reconstruction.
+        base_uri: Option<http::Uri>,
+        /// Path prefix to strip from the request path before prepending the
+        /// `base_uri` path during `DPoP` URI reconstruction.
         ///
         /// This is useful when a front proxy adds a path prefix that isn't part of the client-facing URI.
         #[builder(into)]
@@ -173,7 +170,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         /// CDN, WAF, or second proxy decoding in front of the upstream (see
         /// [`DecodeLayers`]). Required, no default: decode depth is a topology fact
         /// the library will not guess. When unsure, declare
-        /// [`Layered`](DecodeLayers::Layered) — the safe, deny-more direction.
+        /// [`UpToTwo`](DecodeLayers::UpToTwo) — the safe, deny-more direction.
         decode_layers: DecodeLayers,
         /// Which path-confusion guard to apply — denies requests whose path a
         /// normalizing backend could route to a different rule than the one matched
@@ -207,26 +204,10 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             return Err(ConfigError::PublicRuleWithConstraints("<default>".into()));
         }
 
-        let resource_str = resource.as_ref().map(ToString::to_string);
-        let mut metadata = validator.validator_metadata(resource_str.as_deref());
-
-        // Advertise where the RFC 9728 document lives, so a client that gets a challenge
-        // can find it without guessing (RFC 9728 §5.1). The guard already serves that
-        // document — see `resource_metadata` below — but nothing was telling clients the
-        // URL, and the two derivations could drift apart unnoticed. Deriving here from
-        // the same resource identifier keeps one source of truth.
-        //
-        // A validator that was configured with its own URL wins: pointing clients at a
-        // document served elsewhere is a deliberate choice, not a value to overwrite.
-        if metadata.resource_metadata.is_none()
-            && let Some(base) = resource_str.as_deref()
-        {
-            let url = well_known_url(base).map_err(|source| ConfigError::ResourceMetadataUrl {
-                resource: base.to_owned(),
-                source,
-            })?;
-            metadata.resource_metadata = Some(url.to_string());
+        if let Some(base_uri) = base_uri.as_ref() {
+            validate_base_uri(base_uri)?;
         }
+        let metadata = validator.validator_metadata(None);
 
         // Collect unique scopes from all route rules and the default rule.
         let mut all_scopes = BTreeSet::new();
@@ -240,7 +221,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         // assigns rule ids and expands subtree patterns internally, so the id contract
         // `RuleRouter::build` enforces holds by construction (no `RuleIdOutOfOrder`
         // reachable from here). This also runs the build-time canonical-pattern check.
-        let mut router = RuleRouter::builder()
+        let mut rule_router_builder = RuleRouter::builder()
             .default(default)
             .case_sensitivity(case_sensitivity)
             .decode_layers(decode_layers)
@@ -248,27 +229,33 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             .structural_classes(structural_classes);
         for (kind, pattern, rule) in routes {
             let method = rule.method.clone();
-            router = match (kind, method) {
-                (RouteKind::Exact, MethodMatch::Any) => router.route(pattern, rule),
-                (RouteKind::Exact, m @ MethodMatch::OneOf(_)) => router.route_for(m, pattern, rule),
-                (RouteKind::Subtree, MethodMatch::Any) => router.subtree(&pattern, rule),
-                (RouteKind::Subtree, m @ MethodMatch::OneOf(_)) => {
-                    router.subtree_for(m, &pattern, rule)
+            rule_router_builder = match (kind, method) {
+                (RouteKind::Exact, MethodMatch::Any) => rule_router_builder.route(pattern, rule),
+                (RouteKind::Exact, m @ MethodMatch::OneOf(_)) => {
+                    rule_router_builder.route_for(m, pattern, rule)
                 }
-                (RouteKind::Blob, MethodMatch::Any) => router.blob_subtree(&pattern, rule),
+                (RouteKind::Subtree, MethodMatch::Any) => {
+                    rule_router_builder.subtree(&pattern, rule)
+                }
+                (RouteKind::Subtree, m @ MethodMatch::OneOf(_)) => {
+                    rule_router_builder.subtree_for(m, &pattern, rule)
+                }
+                (RouteKind::Blob, MethodMatch::Any) => {
+                    rule_router_builder.blob_subtree(&pattern, rule)
+                }
                 (RouteKind::Blob, m @ MethodMatch::OneOf(_)) => {
-                    router.blob_subtree_for(m, &pattern, rule)
+                    rule_router_builder.blob_subtree_for(m, &pattern, rule)
                 }
             };
         }
-        let routes = router.build()?;
+        let routes = rule_router_builder.build()?;
 
         Ok(Self {
             validator,
             metadata,
             routes,
             scopes_supported,
-            base_uri: resource,
+            base_uri,
             strip_prefix,
             metrics_name,
         })
@@ -380,7 +367,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         }
     }
 
-    /// Returns the well-known path and serialized JSON for RFC 9728 resource metadata.
+    /// Enables metadata advertisement and returns the well-known path and
+    /// serialized JSON for RFC 9728 resource metadata.
     ///
     /// Per RFC 9728 §3.1, the well-known URI is constructed by inserting
     /// `/.well-known/oauth-protected-resource` between the host and the path
@@ -388,26 +376,44 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// `https://api.example.com/tenant1` has its metadata at
     /// `/.well-known/oauth-protected-resource/tenant1`.
     ///
-    /// When no resource identifier is set (or it has no path beyond `/`),
-    /// the well-known path is `/.well-known/oauth-protected-resource`.
-    pub(crate) fn resource_metadata(&self) -> Result<(String, Vec<u8>), ConfigError> {
-        let suffix = self
-            .base_uri
-            .as_ref()
-            .map(|uri| uri.path().to_owned())
-            .filter(|p| p != "/")
-            .unwrap_or_default();
+    /// When the resource identifier has no path beyond `/`, the well-known path
+    /// is `/.well-known/oauth-protected-resource`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] if the resource identifier is invalid, the
+    /// validator advertises a different endpoint, or the generated document
+    /// cannot be serialized.
+    pub(crate) fn enable_resource_metadata(
+        &mut self,
+        resource: &str,
+    ) -> Result<(String, Vec<u8>), ConfigError> {
+        validate_resource_identifier(resource)?;
+        let metadata_url =
+            well_known_url(resource).map_err(|source| ConfigError::ResourceMetadataUrl {
+                resource: resource.to_owned(),
+                source,
+            })?;
+        let derived = metadata_url.to_string();
 
-        let path = format!("{WELL_KNOWN_PATH}{suffix}");
+        let mut metadata = self.validator.validator_metadata(Some(resource));
+        if let Some(configured) = metadata.resource_metadata.as_ref()
+            && configured != &derived
+        {
+            return Err(ConfigError::ResourceMetadataUrlMismatch {
+                configured: configured.clone(),
+                derived,
+            });
+        }
+        metadata.resource = Some(resource.to_owned());
+        metadata.resource_metadata = Some(derived);
 
-        // RFC 9728 §2 requires the document's `resource` member, so
-        // `to_resource_metadata` yields `None` when no resource identifier is
-        // configured; fall back to an empty document and let the
-        // scopes_supported insertion below carry what we do know.
-        let mut value = match self.metadata.to_resource_metadata() {
-            Some(document) => serde_json::to_value(&document)?,
-            None => serde_json::Value::Object(serde_json::Map::new()),
+        let Some(document) = metadata.to_resource_metadata() else {
+            return Err(ConfigError::ResourceMetadataDocumentUnavailable);
         };
+        let path = metadata_url.as_uri().path().to_owned();
+
+        let mut value = serde_json::to_value(&document)?;
 
         if !self.scopes_supported.is_empty()
             && let Some(obj) = value.as_object_mut()
@@ -418,6 +424,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         }
 
         let json = serde_json::to_vec(&value)?;
+        self.metadata = metadata;
         Ok((path, json))
     }
 
@@ -696,4 +703,47 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 
         None
     }
+}
+
+fn validate_resource_identifier(resource: &str) -> Result<(), ConfigError> {
+    if resource.contains('#') {
+        return Err(ConfigError::InvalidResourceIdentifier {
+            resource: resource.to_owned(),
+            reason: "fragments are not allowed",
+        });
+    }
+    let uri =
+        resource
+            .parse::<http::Uri>()
+            .map_err(|_| ConfigError::InvalidResourceIdentifier {
+                resource: resource.to_owned(),
+                reason: "not a valid URI",
+            })?;
+    if uri.scheme_str() != Some("https") || uri.authority().is_none() {
+        return Err(ConfigError::InvalidResourceIdentifier {
+            resource: resource.to_owned(),
+            reason: "expected an absolute https URL with an authority",
+        });
+    }
+    well_known_url(resource).map_err(|source| ConfigError::ResourceMetadataUrl {
+        resource: resource.to_owned(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn validate_base_uri(base_uri: &http::Uri) -> Result<(), ConfigError> {
+    if !matches!(base_uri.scheme_str(), Some("http" | "https")) || base_uri.authority().is_none() {
+        return Err(ConfigError::InvalidBaseUri {
+            base_uri: base_uri.to_string(),
+            reason: "expected an absolute HTTP(S) URI",
+        });
+    }
+    if base_uri.query().is_some() {
+        return Err(ConfigError::InvalidBaseUri {
+            base_uri: base_uri.to_string(),
+            reason: "queries are not allowed",
+        });
+    }
+    Ok(())
 }

@@ -47,10 +47,9 @@ type CheckFn<S> = Arc<dyn Fn(&S) -> Result<(), CheckError> + Send + Sync>;
 /// scope, claim, role-based gates).
 ///
 /// The three cases are modelled as enum variants so the authorization check
-/// only exists where a session does. [`Public`](Self::Public) skips session
-/// loading entirely and therefore carries no `check` field — a "public route
-/// with an authorization check" is unrepresentable, rather than a silently
-/// ignored setting.
+/// only runs where a session exists. [`Public`](Self::Public) skips session
+/// loading entirely; attaching a check to it is rejected when the proxy is
+/// built rather than silently ignored.
 ///
 /// The type parameter is the session type produced by your
 /// [`SessionDriver`](super::SessionDriver) — usually inferred from context.
@@ -89,6 +88,9 @@ pub enum LoginRule<S = ()> {
     Public {
         /// Which HTTP method(s) this rule applies to (wildcard by default).
         method: MethodMatch,
+        /// Records an invalid `.check(...)` call so proxy construction can
+        /// report it with the affected route pattern.
+        check_requested: bool,
     },
     /// Load the session if a cookie is present, but pass through to the inner
     /// proxy either way. Use this when the path is publicly accessible but
@@ -124,8 +126,12 @@ impl<S> Default for LoginRule<S> {
 impl<S> Clone for LoginRule<S> {
     fn clone(&self) -> Self {
         match self {
-            Self::Public { method } => Self::Public {
+            Self::Public {
+                method,
+                check_requested,
+            } => Self::Public {
                 method: method.clone(),
+                check_requested: *check_requested,
             },
             Self::Optional { check, method } => Self::Optional {
                 check: check.clone(),
@@ -142,7 +148,14 @@ impl<S> Clone for LoginRule<S> {
 impl<S> std::fmt::Debug for LoginRule<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Public { method } => f.debug_struct("Public").field("method", method).finish(),
+            Self::Public {
+                method,
+                check_requested,
+            } => f
+                .debug_struct("Public")
+                .field("method", method)
+                .field("check_requested", check_requested)
+                .finish(),
             Self::Optional { check, method } => f
                 .debug_struct("Optional")
                 .field("check", &check.as_ref().map(|_| ..))
@@ -161,11 +174,13 @@ impl<S> LoginRule<S> {
     /// A rule that bypasses session handling entirely. The session store is
     /// not called and the inner proxy sees no session.
     ///
-    /// [`Public`](Self::Public) carries no authorization check — there is no
-    /// session to inspect — so [`check`](Self::check) has no effect on it.
+    /// [`Public`](Self::Public) carries no authorization check because there is
+    /// no session to inspect. Calling [`check`](Self::check) on it makes proxy
+    /// construction fail with `RouteConfigError::PublicRuleWithCheck`.
     pub fn public() -> Self {
         Self::Public {
             method: MethodMatch::Any,
+            check_requested: false,
         }
     }
 
@@ -203,12 +218,15 @@ impl<S> LoginRule<S> {
     ///
     /// Attaches to [`Optional`](Self::Optional) (where it runs only when a
     /// session is present) and [`Required`](Self::Required). On
-    /// [`Public`](Self::Public) there is no session to inspect, so this is a
-    /// no-op.
+    /// [`Public`](Self::Public), proxy construction fails because there is no
+    /// session to inspect.
     pub fn check(self, f: impl Fn(&S) -> Result<(), CheckError> + Send + Sync + 'static) -> Self {
         let check: Option<CheckFn<S>> = Some(Arc::new(f));
         match self {
-            Self::Public { method } => Self::Public { method },
+            Self::Public { method, .. } => Self::Public {
+                method,
+                check_requested: true,
+            },
             Self::Optional { method, .. } => Self::Optional { check, method },
             Self::Required { method, .. } => Self::Required { check, method },
         }
@@ -232,7 +250,12 @@ impl<S> LoginRule<S> {
     pub fn method(self, method: http::Method) -> Self {
         let method = MethodMatch::from(method);
         match self {
-            Self::Public { .. } => Self::Public { method },
+            Self::Public {
+                check_requested, ..
+            } => Self::Public {
+                method,
+                check_requested,
+            },
             Self::Optional { check, .. } => Self::Optional { check, method },
             Self::Required { check, .. } => Self::Required { check, method },
         }
@@ -241,10 +264,21 @@ impl<S> LoginRule<S> {
     /// The method qualifier — read by the proxy builder when registering the route.
     pub(crate) fn method_match(&self) -> &MethodMatch {
         match self {
-            Self::Public { method }
+            Self::Public { method, .. }
             | Self::Optional { method, .. }
             | Self::Required { method, .. } => method,
         }
+    }
+
+    /// Whether a check was attached to a public rule, which cannot run it.
+    pub(crate) fn public_check_requested(&self) -> bool {
+        matches!(
+            self,
+            Self::Public {
+                check_requested: true,
+                ..
+            }
+        )
     }
 }
 
@@ -289,12 +323,9 @@ mod tests {
     }
 
     #[test]
-    fn check_is_dropped_on_public() {
-        // A public route has no session to inspect, so the enum cannot carry a
-        // check — `.check()` is a structural no-op rather than a silently
-        // stored dead field.
+    fn check_on_public_is_recorded_for_build_validation() {
         let r = LoginRule::<String>::public().check(|_| Err(CheckError::Forbidden("nope".into())));
-        assert!(matches!(r, LoginRule::Public { .. }));
+        assert!(r.public_check_requested());
     }
 
     #[test]

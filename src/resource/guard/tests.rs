@@ -128,17 +128,17 @@ fn build_guard(
     builder.build().unwrap()
 }
 
-fn build_guard_with_resource(
+fn build_guard_with_base_uri(
     validator: MockValidator,
     routes: Vec<(&str, Rule<MockClaims>)>,
-    resource: &str,
+    base_uri: &str,
     strip_prefix: Option<&str>,
 ) -> Guard<MockValidator> {
     let mut builder = Guard::builder()
         .validator(validator)
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
         .decode_layers(DecodeLayers::Single)
-        .resource(resource.parse().unwrap())
+        .base_uri(base_uri.parse().unwrap())
         .maybe_strip_prefix(strip_prefix);
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
@@ -204,33 +204,25 @@ fn assert_forward_authed(outcome: &Outcome<MockClaims>) {
 // --- resource_metadata tests ---
 
 #[test]
-fn resource_metadata_default_path() {
-    let guard = build_guard(MockValidator::no_token(), vec![]);
-    let (path, _) = guard.resource_metadata().unwrap();
-    assert_eq!(path, "/.well-known/oauth-protected-resource");
-}
-
-#[test]
 fn resource_metadata_with_resource_path() {
-    let guard = build_guard_with_resource(
-        MockValidator::no_token(),
-        vec![],
-        "https://api.example.com/tenant1",
-        None,
-    );
-    let (path, _) = guard.resource_metadata().unwrap();
+    let mut guard = build_guard(MockValidator::no_token(), vec![]);
+    let (path, json) = guard
+        .enable_resource_metadata("https://api.example.com/tenant1?version=1")
+        .unwrap();
     assert_eq!(path, "/.well-known/oauth-protected-resource/tenant1");
+    let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(
+        value["resource"],
+        "https://api.example.com/tenant1?version=1"
+    );
 }
 
 #[test]
 fn resource_metadata_root_path_no_suffix() {
-    let guard = build_guard_with_resource(
-        MockValidator::no_token(),
-        vec![],
-        "https://api.example.com/",
-        None,
-    );
-    let (path, _) = guard.resource_metadata().unwrap();
+    let mut guard = build_guard(MockValidator::no_token(), vec![]);
+    let (path, _) = guard
+        .enable_resource_metadata("https://api.example.com/")
+        .unwrap();
     assert_eq!(path, "/.well-known/oauth-protected-resource");
 }
 
@@ -251,22 +243,16 @@ fn advertised_metadata_url(challenges: &[String]) -> Option<&str> {
     })
 }
 
-/// The challenge must name where the metadata document lives (RFC 9728 §5.1), derived
-/// from the resource identifier rather than left to the caller to configure twice.
+/// Do not advertise a local metadata URL when no endpoint has been enabled.
 #[tokio::test]
-async fn challenge_advertises_resource_metadata_url() {
-    let guard = build_guard_with_resource(
-        MockValidator::no_token(),
-        vec![("/api", Rule::required())],
-        "https://api.example.com",
-        None,
-    );
+async fn challenge_does_not_advertise_disabled_local_metadata() {
+    let guard = build_guard(MockValidator::no_token(), vec![("/api", Rule::required())]);
 
     let outcome = check(&guard, &http::Method::GET, "/api").await;
     let challenges = deny_challenges(&outcome).expect("expected a denial");
     assert_eq!(
         advertised_metadata_url(challenges),
-        Some("https://api.example.com/.well-known/oauth-protected-resource"),
+        None,
         "challenges: {challenges:?}",
     );
 }
@@ -282,13 +268,8 @@ async fn advertised_metadata_url_matches_the_served_path() {
         "https://api.example.com/",
         "https://api.example.com/tenant1",
     ] {
-        let guard = build_guard_with_resource(
-            MockValidator::no_token(),
-            vec![("/api", Rule::required())],
-            resource,
-            None,
-        );
-        let (served_path, _) = guard.resource_metadata().unwrap();
+        let mut guard = build_guard(MockValidator::no_token(), vec![("/api", Rule::required())]);
+        let (served_path, _) = guard.enable_resource_metadata(resource).unwrap();
 
         let outcome = check(&guard, &http::Method::GET, "/api").await;
         let challenges = deny_challenges(&outcome).expect("expected a denial");
@@ -299,6 +280,48 @@ async fn advertised_metadata_url_matches_the_served_path() {
         assert_eq!(
             advertised_path, served_path,
             "{resource}: advertised {advertised} but the document is served at {served_path}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_origin_can_back_distinct_resource_guards() {
+    for resource_path in ["payments", "inventory"] {
+        let resource = format!("https://api.example.com/{resource_path}");
+        let request_path = format!("/{resource_path}/item");
+        let mut guard = Guard::builder()
+            .validator(MockValidator::no_token())
+            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+            .decode_layers(DecodeLayers::Single)
+            .base_uri("https://api.example.com".parse().unwrap())
+            .route(&request_path, Rule::required())
+            .build()
+            .unwrap();
+        let (metadata_path, _) = guard.enable_resource_metadata(&resource).unwrap();
+        assert_eq!(
+            metadata_path,
+            format!("/.well-known/oauth-protected-resource/{resource_path}")
+        );
+
+        let outcome = check(&guard, &http::Method::GET, &request_path).await;
+        let challenges = deny_challenges(&outcome).expect("expected a denial");
+        assert_eq!(
+            advertised_metadata_url(challenges),
+            Some(format!(
+                "https://api.example.com/.well-known/oauth-protected-resource/{resource_path}"
+            ))
+            .as_deref()
+        );
+        let captured_uri = guard
+            .validator
+            .captured_uri
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            captured_uri.to_string(),
+            format!("https://api.example.com/{resource_path}/item")
         );
     }
 }
@@ -341,7 +364,6 @@ async fn explicit_validator_metadata_url_is_not_overwritten() {
         .validator(CustomUrlValidator(MockValidator::no_token()))
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
         .decode_layers(DecodeLayers::Single)
-        .resource("https://api.example.com".parse().unwrap())
         .route("/api", Rule::required())
         .build()
         .unwrap();
@@ -361,37 +383,74 @@ async fn explicit_validator_metadata_url_is_not_overwritten() {
         Some("https://meta.example.com/prm"),
         "the explicit URL was overwritten: {challenges:?}",
     );
+
+    let mut guard = guard;
+    assert!(matches!(
+        guard.enable_resource_metadata("https://api.example.com"),
+        Err(ConfigError::ResourceMetadataUrlMismatch { .. })
+    ));
 }
 
-/// A resource identifier RFC 9728 cannot derive a metadata URL from is a build error,
-/// not a silently-omitted parameter — the document it would serve is unreachable too.
+/// Invalid or insecure identifiers are rejected by the operation that uses them.
 #[test]
-fn non_absolute_resource_is_a_build_error() {
-    let result = Guard::builder()
-        .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_layers(DecodeLayers::Single)
-        .resource("/api".parse().unwrap())
-        .route("/api", Rule::required())
-        .build();
+fn resource_metadata_rejects_invalid_resource_identifiers() {
+    for resource in [
+        "/api",
+        "http://api.example.com",
+        "ftp://api.example.com",
+        "https://api.example.com/path#fragment",
+    ] {
+        let mut guard = Guard::builder()
+            .validator(MockValidator::no_token())
+            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+            .decode_layers(DecodeLayers::Single)
+            .route("/api", Rule::required())
+            .build()
+            .unwrap();
+        let result = guard.enable_resource_metadata(resource);
 
-    assert!(
-        matches!(result, Err(ConfigError::ResourceMetadataUrl { .. })),
-        "expected ResourceMetadataUrl for a relative resource identifier",
-    );
+        assert!(
+            matches!(result, Err(ConfigError::InvalidResourceIdentifier { .. })),
+            "expected InvalidResourceIdentifier for {resource:?}",
+        );
+    }
+}
+
+#[test]
+fn invalid_dpop_base_uri_is_a_build_error() {
+    for base_uri in [
+        "/api",
+        "ftp://api.example.com",
+        "https://api.example.com/base?tenant=one",
+    ] {
+        let result = Guard::builder()
+            .validator(MockValidator::no_token())
+            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
+            .decode_layers(DecodeLayers::Single)
+            .base_uri(base_uri.parse().unwrap())
+            .build();
+
+        assert!(
+            matches!(result, Err(ConfigError::InvalidBaseUri { .. })),
+            "expected InvalidBaseUri for {base_uri:?}"
+        );
+    }
 }
 
 #[test]
 fn resource_metadata_includes_scopes() {
-    let guard = build_guard(
+    let mut guard = build_guard(
         MockValidator::no_token(),
         vec![
             ("/admin", Rule::required().scopes(["admin", "write"])),
             ("/read", Rule::required().scopes(["read"])),
         ],
     );
-    let (_, json) = guard.resource_metadata().unwrap();
+    let (_, json) = guard
+        .enable_resource_metadata("https://api.example.com")
+        .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(value["resource"], "https://api.example.com");
     let scopes = value["scopes_supported"].as_array().unwrap();
     let scope_strs: Vec<&str> = scopes.iter().map(|v| v.as_str().unwrap()).collect();
     // BTreeSet orders alphabetically
@@ -400,8 +459,10 @@ fn resource_metadata_includes_scopes() {
 
 #[test]
 fn resource_metadata_no_scopes_omits_field() {
-    let guard = build_guard(MockValidator::no_token(), vec![]);
-    let (_, json) = guard.resource_metadata().unwrap();
+    let mut guard = build_guard(MockValidator::no_token(), vec![]);
+    let (_, json) = guard
+        .enable_resource_metadata("https://api.example.com")
+        .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
     assert!(value.get("scopes_supported").is_none());
 }
@@ -620,7 +681,7 @@ async fn request_uri_without_base_passes_original() {
 
 #[tokio::test]
 async fn request_uri_with_base_prepends_path() {
-    let guard = build_guard_with_resource(
+    let guard = build_guard_with_base_uri(
         MockValidator::no_token(),
         vec![],
         "https://api.example.com/v1",
@@ -639,7 +700,7 @@ async fn request_uri_with_base_prepends_path() {
 
 #[tokio::test]
 async fn request_uri_with_strip_prefix() {
-    let guard = build_guard_with_resource(
+    let guard = build_guard_with_base_uri(
         MockValidator::no_token(),
         vec![],
         "https://api.example.com",
@@ -658,7 +719,7 @@ async fn request_uri_with_strip_prefix() {
 
 #[tokio::test]
 async fn request_uri_strip_prefix_no_match_denies() {
-    let guard = build_guard_with_resource(
+    let guard = build_guard_with_base_uri(
         MockValidator::no_token(),
         vec![],
         "https://api.example.com",
@@ -674,7 +735,7 @@ async fn request_uri_strip_prefix_no_match_denies() {
 
 #[tokio::test]
 async fn request_uri_preserves_query_string() {
-    let guard = build_guard_with_resource(
+    let guard = build_guard_with_base_uri(
         MockValidator::no_token(),
         vec![],
         "https://api.example.com",
@@ -821,7 +882,7 @@ async fn guard_400_challenges_carry_no_scope_hint() {
         .validator(MockValidator::no_token())
         .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
         .decode_layers(DecodeLayers::Single)
-        .resource("https://api.example.com".parse().unwrap())
+        .base_uri("https://api.example.com".parse().unwrap())
         .strip_prefix("/proxy")
         .default(Rule::required().scopes(["admin"]))
         .build()

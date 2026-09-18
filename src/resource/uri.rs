@@ -1,6 +1,6 @@
 //! URI reconstruction for `DPoP` proof validation.
 //!
-//! When a `base_uri` (resource identifier) is configured on the
+//! When a `base_uri` is configured on the
 //! [`Guard`](super::Guard), the request path is rewritten to the client-facing
 //! URI so that `DPoP` `htu` (HTTP URI) binding works correctly behind a reverse
 //! proxy.
@@ -10,7 +10,7 @@
 //! **absent**, reconstruction returns the raw request URI unchanged; behind a
 //! proxy that is origin-form (path only), so the validator fails closed with an
 //! integration error rather than checking `htu`. Configure `base_uri` (the
-//! guard's `resource`) whenever DPoP-bound tokens are accepted.
+//! guard's `base_uri`) whenever DPoP-bound tokens are accepted.
 
 /// Reconstructs the client-facing URI for `DPoP` `htu` matching.
 ///

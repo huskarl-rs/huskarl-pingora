@@ -1,7 +1,7 @@
-//! [`ProxyHttp`](pingora_proxy::ProxyHttp) decorator for bearer token protection.
+//! [`ProxyHttp`] decorator for bearer token protection.
 //!
 //! [`AuthProxy`] wraps an inner proxy and intercepts `request_filter` to
-//! validate tokens via [`Guard`](super::Guard), `upstream_request_filter` to
+//! validate tokens via [`Guard`], `upstream_request_filter` to
 //! strip credentials, and `response_filter` to insert `DPoP-Nonce` headers.
 //! All other hooks delegate directly to the inner proxy.
 
@@ -92,7 +92,8 @@ where
         }
     }
 
-    /// Enables or disables the RFC 9728 protected resource metadata endpoint.
+    /// Enables the RFC 9728 protected resource metadata endpoint for
+    /// `resource`.
     ///
     /// When enabled, the proxy serves a JSON document describing the resource
     /// server's OAuth 2.0 capabilities (authorization servers, scopes, `DPoP`
@@ -103,22 +104,20 @@ where
     /// `https://api.example.com/tenant1` → path
     /// `/.well-known/oauth-protected-resource/tenant1`.
     ///
-    /// Disabled by default.
+    /// `resource` is the complete absolute identifier, not a path appended to
+    /// the guard's `base_uri`. It is preserved byte-for-byte in the document.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`](crate::resource::error::ConfigError) if the
-    /// metadata document cannot be serialized.
+    /// resource identifier is invalid, the validator advertises a different
+    /// endpoint, or the metadata document cannot be serialized.
     pub fn resource_metadata(
         mut self,
-        enabled: bool,
+        resource: impl AsRef<str>,
     ) -> Result<Self, crate::resource::error::ConfigError> {
-        self.resource_metadata = if enabled {
-            let (path, json) = self.guard.resource_metadata()?;
-            Some((path, Bytes::from(json)))
-        } else {
-            None
-        };
+        let (path, json) = self.guard.enable_resource_metadata(resource.as_ref())?;
+        self.resource_metadata = Some((path, Bytes::from(json)));
         Ok(self)
     }
 }
@@ -425,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_endpoint_serves_json() {
         let proxy = build_auth_proxy(MockValidator(MockOutcome::Missing), vec![])
-            .resource_metadata(true)
+            .resource_metadata("https://api.example.com")
             .unwrap();
         let (mut session, _client) =
             make_session("GET", "/.well-known/oauth-protected-resource").await;
@@ -446,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_endpoint_post_returns_405() {
         let proxy = build_auth_proxy(MockValidator(MockOutcome::Missing), vec![])
-            .resource_metadata(true)
+            .resource_metadata("https://api.example.com")
             .unwrap();
         let (mut session, _client) =
             make_session("POST", "/.well-known/oauth-protected-resource").await;
