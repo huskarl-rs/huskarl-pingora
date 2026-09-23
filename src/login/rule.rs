@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use huskarl_route_guard::MethodMatch;
+use crate::method::MethodMatch;
 
 /// An error returned by a custom [`LoginRule::check`] function.
 #[derive(Debug)]
@@ -239,7 +239,7 @@ impl<S> LoginRule<S> {
     /// orthogonal to the path — it never affects which *path* matches.
     ///
     /// **Default-deny on the method axis:** registering any method-specific rule on a path
-    /// makes every *other* method on that path fall to the default rule. Add a wildcard
+    /// denies every unlisted method on that path with `403 Forbidden`. Add a wildcard
     /// rule (no `.method()`) on the same path for a fallback policy; it is **not** inherited
     /// from a broader catch-all.
     ///

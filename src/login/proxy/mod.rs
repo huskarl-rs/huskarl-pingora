@@ -21,7 +21,7 @@ use huskarl_login::{
         LoadedSession, LoginEngine, LoginResponse, SetCookies, error_chain, is_cors_preflight,
     },
 };
-use huskarl_route_guard::{MethodMatch, RuleRouter, RuleRouterError};
+use huskarl_route_guard::{GuardConfig, PathRegistration, RuleRouter, RuleRouterError};
 use pingora_error::{
     Error,
     ErrorType::{HTTPStatus, InternalError},
@@ -35,8 +35,11 @@ use super::{
     ctx::HasLoginSession,
     rule::{CheckError, LoginRule},
 };
-use crate::path_confusion::{
-    CaseSensitivity, DecodeLayers, DenyReason, PathConfusion, StructuralClasses,
+use crate::{
+    method::MethodMatch,
+    path_confusion::{
+        CaseSensitivity, DecodeDepth, GuardMode, ResolveError, ResolveErrorKind, StructuralClasses,
+    },
 };
 
 #[cfg(test)]
@@ -88,7 +91,7 @@ mod tests;
 /// # use std::sync::Arc;
 /// # use huskarl::grant::authorization_code::AuthorizationCodeGrant;
 /// # use huskarl_pingora::login::{
-/// #     CaseSensitivity, DecodeLayers, HasLoginSession, LoginConfig, LoginEngine, LoginProxy,
+/// #     CaseSensitivity, DecodeDepth, HasLoginSession, LoginConfig, LoginEngine, LoginProxy,
 /// #     LoginRule, SessionDriver,
 /// # };
 /// # use pingora_proxy::ProxyHttp;
@@ -118,7 +121,7 @@ mod tests;
 ///     .inner(my_upstream)
 ///     .engine(engine)
 ///     .case_sensitivity(CaseSensitivity::Sensitive) // required: declare backend case behavior
-///     .decode_layers(DecodeLayers::Single) // required: declare decode depth behind this layer
+///     .decode_depth(DecodeDepth::UpToOne) // required: declare decode depth behind this layer
 ///     // Defaults to `LoginRule::required()` for paths that don't match.
 ///     // `subtree` covers a path and everything beneath it; `route` is one
 ///     // exact path.
@@ -162,7 +165,7 @@ where
     pub fn new(
         /// One entry per `route`/`subtree`/`blob_subtree` call, in registration order.
         /// Rule-id assignment and subtree-pattern expansion are deferred to
-        /// `RuleRouter::builder()` at build time, so the id contract holds by construction.
+        /// `RuleRouter::from_registrations` at build time.
         #[builder(field)]
         routes: Vec<(RouteKind, String, LoginRule<SD::SessionType>)>,
         inner: P,
@@ -179,19 +182,23 @@ where
         case_sensitivity: CaseSensitivity,
         /// Whether more than one percent-decode pass happens behind this layer — a
         /// CDN, WAF, or second proxy decoding in front of the upstream (see
-        /// [`DecodeLayers`]). Required, no default: decode depth is a topology fact
+        /// [`DecodeDepth`]). Required, no default: decode depth is a deployment assumption
         /// the library will not guess. When unsure, declare
-        /// [`UpToTwo`](DecodeLayers::UpToTwo) — the safe, deny-more direction.
-        decode_layers: DecodeLayers,
+        /// [`UpToTwo`](DecodeDepth::UpToTwo) — the safe, deny-more direction.
+        decode_depth: DecodeDepth,
         /// Which path-confusion guard to apply — denies requests whose path a
         /// normalizing backend could route to a different rule than the one matched
-        /// on the raw path. Defaults to [`PathConfusion::RejectStructural`].
+        /// on the raw path. Defaults to [`GuardMode::RejectAmbiguous`].
         #[builder(default)]
-        path_confusion: PathConfusion,
+        guard_mode: GuardMode,
         /// The structural classes and encodings the guard recognises beyond the
-        /// always-on trio. Defaults to [`StructuralClasses::new`].
+        /// built-in classes. Defaults to [`StructuralClasses::new`].
         #[builder(default)]
         structural_classes: StructuralClasses,
+        /// Maximum original path length in bytes for ambiguity analysis.
+        /// With custom probes this applies to every path. Disabled mode bypasses it.
+        #[builder(default = 8192)]
+        max_analysis_path_len: usize,
         /// Decides how to react when the post-response session persist fails.
         ///
         /// Defaults to [`DefaultPersistFailurePolicy`]: fail closed when the
@@ -231,37 +238,23 @@ where
             return Err(RouteConfigError::PublicRuleWithCheck("<default>".into()));
         }
 
-        // Build the rule-id router via route-guard's builder: it assigns rule ids and
-        // expands subtree patterns internally, so the id contract holds by construction
-        // (no `RuleIdOutOfOrder` reachable from here) and runs the canonical-pattern check.
-        let mut rule_router_builder = RuleRouter::builder()
-            .default(default)
-            .case_sensitivity(case_sensitivity)
-            .decode_layers(decode_layers)
-            .path_confusion(path_confusion)
-            .structural_classes(structural_classes);
-        for (kind, pattern, rule) in routes {
+        let config = GuardConfig::new(case_sensitivity, decode_depth)
+            .with_mode(guard_mode)
+            .with_structural_classes(structural_classes)
+            .with_max_analysis_path_len(max_analysis_path_len);
+        let registrations = routes.into_iter().map(|(kind, pattern, rule)| {
             let method = rule.method_match().clone();
-            rule_router_builder = match (kind, method) {
-                (RouteKind::Exact, MethodMatch::Any) => rule_router_builder.route(pattern, rule),
-                (RouteKind::Exact, m @ MethodMatch::OneOf(_)) => {
-                    rule_router_builder.route_for(m, pattern, rule)
-                }
-                (RouteKind::Subtree, MethodMatch::Any) => {
-                    rule_router_builder.subtree(&pattern, rule)
-                }
-                (RouteKind::Subtree, m @ MethodMatch::OneOf(_)) => {
-                    rule_router_builder.subtree_for(m, &pattern, rule)
-                }
-                (RouteKind::Blob, MethodMatch::Any) => {
-                    rule_router_builder.blob_subtree(&pattern, rule)
-                }
-                (RouteKind::Blob, m @ MethodMatch::OneOf(_)) => {
-                    rule_router_builder.blob_subtree_for(m, &pattern, rule)
-                }
+            let registration = match kind {
+                RouteKind::Exact => PathRegistration::path(pattern),
+                RouteKind::Subtree => PathRegistration::subtree(&pattern),
+                RouteKind::Blob => PathRegistration::exclusive_subtree(&pattern),
             };
-        }
-        let routes = rule_router_builder.build()?;
+            match method {
+                MethodMatch::Any => registration.all(rule),
+                MethodMatch::OneOf(methods) => registration.methods(methods, rule),
+            }
+        });
+        let routes = RuleRouter::from_registrations(default, config, registrations)?;
         Ok(Self {
             inner,
             engine,
@@ -317,13 +310,11 @@ where
         self
     }
 
-    /// Like [`subtree`](Self::subtree), but declares the subtree's catch-all tail an
-    /// **opaque** key space: structural bytes (`%2F`, `;`, `\`) *inside the key* are
-    /// tolerated rather than denied — for proxying opaque identifiers. Dot-segments
-    /// (`..`) and NUL truncation are **still** denied even in the blob (and a case
-    /// fold that would relocate out of it).
+    /// Registers an exclusive subtree, rejecting nested route overrides at build time.
     ///
-    /// Registering a more-specific route or `subtree` *under* the blob is a build error.
+    /// The same ambiguity checks apply as for [`subtree`](Self::subtree).
+    /// Encoded separators and dot-segments can pass only when analysis establishes
+    /// that they stay within the same rule. NUL is denied in every active mode.
     pub fn blob_subtree(mut self, path: &str, rule: LoginRule<SD::SessionType>) -> Self {
         self.routes.push((RouteKind::Blob, path.to_owned(), rule));
         self
@@ -332,7 +323,7 @@ where
 
 /// How a registration on the [`LoginProxy`] builder is lowered onto
 /// [`RuleRouter::builder`] at build time — an exact `route`, a `subtree`, or an
-/// opaque-tailed `blob_subtree`.
+/// exclusive `blob_subtree`.
 enum RouteKind {
     Exact,
     Subtree,
@@ -368,18 +359,20 @@ where
         Ok(true)
     }
 
-    /// Logs and renders the rule-independent response for a structurally
-    /// ambiguous request path.
+    /// Logs and renders a route-resolution denial.
     async fn serve_path_confusion(
         &self,
         session: &mut Session,
         path: &str,
-        reason: &DenyReason,
+        reason: &ResolveError,
     ) -> Result<bool> {
-        log::warn!("path-confusion guard denied {path:?}: {reason}");
-        let resp = self
-            .engine
-            .render_error(http::StatusCode::BAD_REQUEST, reason.message());
+        log::warn!("route guard denied {path:?}: {reason}");
+        let status = match reason.kind() {
+            ResolveErrorKind::InvalidInput => http::StatusCode::BAD_REQUEST,
+            ResolveErrorKind::PolicyDenied => http::StatusCode::FORBIDDEN,
+            ResolveErrorKind::Internal => http::StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let resp = self.engine.render_error(status, reason.message());
         write_login_response(session, resp, vec![]).await?;
         Ok(true)
     }

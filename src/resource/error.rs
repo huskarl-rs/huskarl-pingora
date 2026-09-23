@@ -35,7 +35,7 @@ pub enum ConfigError {
     Metadata(serde_json::Error),
     /// Validator metadata unexpectedly could not produce a resource document.
     ResourceMetadataDocumentUnavailable,
-    /// The configured RFC 9728 resource identifier is invalid.
+    /// The derived RFC 9728 resource identifier is invalid.
     InvalidResourceIdentifier {
         /// The offending resource identifier.
         resource: String,
@@ -48,6 +48,22 @@ pub enum ConfigError {
         base_uri: String,
         /// A human-readable reason.
         reason: &'static str,
+    },
+    /// Protected-resource metadata was enabled without the trusted public base
+    /// URI also required for `DPoP` reconstruction.
+    MissingBaseUri,
+    /// A protected-resource subpath is invalid.
+    InvalidResourcePath {
+        /// The offending subpath.
+        path: String,
+    },
+    /// A metadata publisher was given an endpoint for a different public
+    /// origin than the endpoints it already owns.
+    ResourceMetadataOriginMismatch {
+        /// The metadata endpoint on the other origin.
+        endpoint: String,
+        /// The public origin established by the first published endpoint.
+        expected_origin: String,
     },
     /// The configured `resource` identifier is not a URL RFC 9728 §3.1 can derive a
     /// Protected Resource Metadata URL from — it must be absolute HTTPS with no
@@ -68,6 +84,20 @@ pub enum ConfigError {
         configured: String,
         /// URL derived for the local endpoint.
         derived: String,
+    },
+    /// This auth integration was already bound to a protected resource.
+    ProtectedResourceAlreadyConfigured,
+    /// More than one document was registered for the same canonical metadata
+    /// path and query.
+    DuplicateResourceMetadataEndpoint {
+        /// The complete path and optional query shared by the documents.
+        path_and_query: String,
+    },
+    /// A protected resource was configured without any acceptable token
+    /// audience.
+    EmptyResourceAudiences {
+        /// The protected-resource identifier.
+        resource: String,
     },
     /// A registered route pattern is non-canonical: it carries a structural byte
     /// (`%2F`, `..`, `//`, `;`, or an enabled opt-in form) that the path-confusion
@@ -115,6 +145,19 @@ impl std::fmt::Display for ConfigError {
             Self::InvalidBaseUri { base_uri, reason } => {
                 write!(f, "invalid DPoP base URI {base_uri:?}: {reason}")
             }
+            Self::MissingBaseUri => f.write_str(
+                "a protected resource requires the public base URI used for DPoP reconstruction",
+            ),
+            Self::InvalidResourcePath { path } => {
+                write!(f, "invalid protected-resource subpath {path:?}")
+            }
+            Self::ResourceMetadataOriginMismatch {
+                endpoint,
+                expected_origin,
+            } => write!(
+                f,
+                "metadata endpoint {endpoint:?} is outside publisher origin {expected_origin:?}"
+            ),
             Self::ResourceMetadataUrl { resource, .. } => write!(
                 f,
                 "resource identifier {resource:?} cannot be used to derive an \
@@ -126,6 +169,17 @@ impl std::fmt::Display for ConfigError {
             } => write!(
                 f,
                 "validator metadata URL {configured:?} does not match local endpoint {derived:?}"
+            ),
+            Self::ProtectedResourceAlreadyConfigured => {
+                f.write_str("this auth integration already has a protected resource")
+            }
+            Self::DuplicateResourceMetadataEndpoint { path_and_query } => write!(
+                f,
+                "protected-resource metadata is already published at {path_and_query:?}"
+            ),
+            Self::EmptyResourceAudiences { resource } => write!(
+                f,
+                "protected resource {resource:?} must accept at least one token audience"
             ),
             Self::NonCanonicalPattern { pattern } => write!(
                 f,
@@ -153,7 +207,13 @@ impl std::error::Error for ConfigError {
             | Self::ResourceMetadataDocumentUnavailable
             | Self::InvalidResourceIdentifier { .. }
             | Self::InvalidBaseUri { .. }
+            | Self::MissingBaseUri
+            | Self::InvalidResourcePath { .. }
+            | Self::ResourceMetadataOriginMismatch { .. }
             | Self::ResourceMetadataUrlMismatch { .. }
+            | Self::ProtectedResourceAlreadyConfigured
+            | Self::DuplicateResourceMetadataEndpoint { .. }
+            | Self::EmptyResourceAudiences { .. }
             | Self::NonCanonicalPattern { .. }
             | Self::NonCanonicalCasePattern { .. } => None,
         }

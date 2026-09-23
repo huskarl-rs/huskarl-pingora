@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use huskarl_route_guard::MethodMatch;
-
-use crate::resource_server::validator::ValidatedRequest;
+use crate::{method::MethodMatch, resource_server::validator::ValidatedRequest};
 
 /// What level of authentication a route requires.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -167,7 +165,7 @@ impl<C> Rule<C> {
     /// orthogonal to the path — it never affects which *path* matches.
     ///
     /// **Default-deny on the method axis:** registering any method-specific rule on a path
-    /// makes every *other* method on that path fall to the default rule. Add a wildcard
+    /// denies every unlisted method on that path with `403 Forbidden`. Add a wildcard
     /// rule (no `.method()`) on the same path if you want a fallback policy for the rest;
     /// note the fallback must be on *that* path — it is **not** inherited from a broader
     /// catch-all.

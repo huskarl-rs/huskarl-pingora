@@ -54,62 +54,40 @@ it is **on by default**. The guard only ever *detects*: it denies with `400`,
 or allows and forwards the **raw** path unchanged — nothing synthesized ever
 reaches the upstream.
 
-It combines a *positional* check (which structural bytes can change routing, and
-where) with a *content-decode* check (whether percent-decoding the path lands on a
-different rule, catching `/%61dmin` → `/admin`). For the complete decision
-algorithm — what each check covers, what it does **not**, and how to configure it
-for your backend — see the
-[`path_confusion`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/) module.
+The default [`GuardMode::RejectAmbiguous`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.GuardMode.html#variant.RejectAmbiguous)
+checks whether the configured downstream parsing behaviors could select a
+different authorization rule. Its guarantees depend on your case sensitivity,
+decode depth, and structural-class declarations. See the
+[`path_confusion`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/) configuration module for the supported parsing model.
 
-The guard, whose mode is selected with [`PathConfusion`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/enum.PathConfusion.html),
-denies a structural byte wherever a wildcard or catch-all captures it. To proxy opaque keys
-that legitimately contain encoded separators, opt the tail in explicitly with
-`blob_subtree` (see below) — it is never inferred from table shape.
+Structural forms can pass when analysis proves they stay within the same rule.
+For example, `subtree("/files", Rule::public())` permits `/files/a%2Fb.txt`
+when no nested rule changes the policy. `/files/../admin/x` is denied when it
+could escape into a different rule. NUL truncation is always denied in active modes.
 
-## Positional structural reject (the default)
+`blob_subtree` registers an exclusive subtree: nested overrides are a build
+error. It uses the same ambiguity checks as an ordinary subtree; exclusivity
+does not disable checks or by itself establish uniform method coverage.
 
-[`PathConfusion::reject_structural()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/PathConfusion/fn.reject_structural.html)
-models **no backend**. Because route patterns are canonical, any structural
-character (`%2F`, `..`, `;`, …) in a request necessarily lands inside a wildcard or
-catch-all position — so the default denies it. The route table you already wrote is
-the entire input; you never need to know how your backend parses paths.
-
-With `subtree("/files", …)`, `subtree("/admin", …)`, and
-`route("/users/{id}", …)`:
-
-| request | verdict | reason |
-|---|---|---|
-| `/files/a%2Fb.txt` | **deny** | `%2F` could split the captured tail into another segment |
-| `/files/../admin/x` | **deny** | `..` can climb out of `/files` into `/admin` |
-| `/users/4%2F2` | **deny** | `%2F` could split the `{id}` segment into another route |
-| `/users/42` | allow | clean |
-
-## Opaque key spaces (`blob_subtree`)
-
-When a prefix proxies opaque identifiers whose keys legitimately contain encoded
-separators (object-store keys, …), register it with `blob_subtree` instead of
-`subtree`. Its catch-all tail then **tolerates** the boundary-shifting bytes
-(`%2F`, `;`, `\`) inside the key, so `/files/a%2Fb.txt` is allowed — but `..` and
-NUL truncation are **still** denied even there, so traversal cannot escape the
-blob. Registering a more-specific route *under* a `blob_subtree` is a
-build error (a structural byte could then relocate into it), so the opt-in is safe
-by construction rather than dependent on table shape.
+Method-specific rules deny unlisted methods with `403 Forbidden`, even if
+the default rule is public. Register an all-method rule at the same path to
+supply an explicit fallback policy.
 
 ## Opt-in classes and encodings
 
 The always-on alphabet is encoded slash, dot-segments, `;`-matrix-params, and
 `%00`/raw-NUL truncation — the forms whose legitimate-traffic cost is near nil. A
 backend that considers *more* paths equivalent needs the matching toggle on
-[`StructuralClasses`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/struct.StructuralClasses.html), passed via the builder’s
+[`StructuralClasses`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/struct.StructuralClasses.html), passed via the builder's
 `structural_classes`:
 
-- [`with_backslash()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/StructuralClasses/fn.with_backslash.html) — `\`/`%5C`
+- [`with_backslash()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/struct.StructuralClasses.html#method.with_backslash) — `\`/`%5C`
   as a separator (Windows/IIS);
-- [`with_overlong([…])`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/StructuralClasses/fn.with_overlong.html) —
+- [`with_overlong([…])`](path_confusion::StructuralClasses::with_overlong) —
   recognise overlong-UTF-8 forms (`%C0%AF`) accepted by legacy decoders;
-- [`with_probe(p)`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/StructuralClasses/fn.with_probe.html) — a custom
-  [`StructuralProbe`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/trait.StructuralProbe.html) **break-glass** for a structural
-  form the built-in alphabet doesn’t ship (e.g. a fresh CVE), denied on presence
+- [`with_probe(p)`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/struct.StructuralClasses.html#method.with_probe) — a custom
+  [`StructuralProbe`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/trait.StructuralProbe.html) **break-glass** for a structural
+  form the built-in alphabet doesn't ship (e.g. a fresh CVE), denied on presence
   anywhere in the path.
 
 Each toggle is a per-deployment security decision: it is how you tell the guard
@@ -117,34 +95,28 @@ which paths your backend considers equivalent. Example:
 `StructuralClasses::new().with_backslash()`. (Case and decode depth are **not**
 here — they are separate, required builder declarations; see below.)
 
-## Decoding layers in front of the upstream
+## Decode depth
 
-The builder **requires** a [`DecodeLayers`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/enum.DecodeLayers.html)
-declaration; there is no default. Declare
-[`UpToTwo`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/DecodeLayers/#variant.UpToTwo) whenever the path may receive
-one or two percent-decode passes before it is finally routed — a CDN or WAF in front
-of the origin, or proxy-in-front-of-proxy. That topology is **CVE-2025-0108** (PAN-OS):
-nginx decoded `%252e%252e` once and passed it, then Apache decoded again to `..`
-and traversed into a protected path. Under `UpToTwo`, double-percent forms
-(`%252F`, `%252E`) are treated as structure and the content-decode check applies
-two passes. Declare [`Single`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/DecodeLayers/#variant.Single) for a lone
-backend with nothing decoding in front; when unsure, `UpToTwo` is the safe,
-deny-more direction.
+The builder requires [`DecodeDepth`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.DecodeDepth.html), with no default.
+Declare `UpToOne` when downstream performs at most one whole-path percent decode,
+or `UpToTwo` when it may perform up to two. Count actual decoding passes across
+intermediaries and the origin, rather than the number of processes. More than
+two passes are outside the supported model.
 
 ## Case-insensitive backends
 
 Path matching here is **case-sensitive** (and so is the route matcher), but whether that
 matches your upstream is a security fact the library cannot infer — so the builder
 **requires** you to declare it with
-[`CaseSensitivity`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/enum.CaseSensitivity.html); there is no default. A case-folding
+[`CaseSensitivity`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.CaseSensitivity.html); there is no default. A case-folding
 upstream — IIS, ASP.NET, servlet containers on Windows, or anything serving files
 from a Windows/macOS filesystem — routes `/ADMIN` and `/admin` to the same resource,
-so a differently-cased request can reach a route *without that route’s checks*
+so a differently-cased request can reach a route *without that route's checks*
 (`/ADMIN` falling through to a weaker rule, then served as `/admin`).
 
-- [`Sensitive`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/CaseSensitivity/#variant.Sensitive) — the upstream distinguishes
+- [`Sensitive`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.CaseSensitivity.html#variant.Sensitive) — the upstream distinguishes
   case; routes differing only by case are genuinely distinct and allowed.
-- [`Insensitive`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/CaseSensitivity/#variant.Insensitive) — the upstream folds
+- [`Insensitive`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.CaseSensitivity.html#variant.Insensitive) — the upstream folds
   case. The guard then runs a **precise case-fold check**: it lowercases the request
   path, re-routes it, and denies only if the folded path lands on a *different* rule
   — mixed-case content that folds within its own rule (`/files/ReadMe.TXT`) keeps
@@ -153,20 +125,19 @@ so a differently-cased request can reach a route *without that route’s checks*
   it is the form the backend resolves to), and two routes differing only by case are
   rejected at build. Only ASCII case is modeled.
 
-## Strict and off
+## Strict mode, disabled mode, and analysis budget
 
-[`reject_non_canonical()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/PathConfusion/fn.reject_non_canonical.html)
-treats *every* position as live — it denies **any** non-canonical path (`..`,
-`//`, encoded separators) outright, strict defense-in-depth that also rejects
-legitimate blob keys. [`off()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/path_confusion/PathConfusion/fn.off.html) disables the
-guard.
+[`GuardMode::RequireCanonical`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.GuardMode.html#variant.RequireCanonical)
+rejects recognized structural forms and complete percent escapes even within a
+uniform subtree. [`GuardMode::Disabled`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.GuardMode.html#variant.Disabled)
+disables ambiguity analysis, but still validates path input and denies unlisted
+methods. Select the mode with `.guard_mode(...)`.
 
-## Build-time check
+`.max_analysis_path_len(...)` sets the analysis budget in original path bytes
+(default: 8,192). With custom probes it applies to every path; disabled mode
+bypasses the budget. This is not an overall request-size limit.
 
-Registering a route pattern that is itself non-canonical (e.g. `route("/a//b")`
-alongside `route("/a/b")`) is rejected at build time — every request to it
-would be denied, so it is a configuration error rather than a silent dead
-route.
+Active modes reject non-canonical route patterns at construction time.
 
 # Resource server example
 
@@ -181,7 +152,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl_pingora::{
-    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeLayers, Guard, Rule},
+    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
         validator::rfc9068::Rfc9068Validator,
@@ -246,7 +217,7 @@ async fn main() {
     let guard = Guard::builder()
         .validator(validator)
         .case_sensitivity(CaseSensitivity::Sensitive) // required: declare backend case behavior
-        .decode_layers(DecodeLayers::Single) // required: declare decode depth behind this layer
+        .decode_depth(DecodeDepth::UpToOne) // required: declare decode depth behind this layer
         .subtree("/api", Rule::required().scopes(["api"])) // /api and below
         .route("/health", Rule::public()) // exactly /health
         .build()

@@ -336,7 +336,7 @@ async fn build_proxy_with_routes(
         .inner(InnerProxy::new())
         .engine(build_engine(store).await)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_layers(crate::login::DecodeLayers::Single);
+        .decode_depth(crate::login::DecodeDepth::UpToOne);
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
@@ -441,7 +441,7 @@ async fn subtree_required_covers_path_and_descendants() {
         .inner(InnerProxy::new())
         .engine(engine)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_layers(DecodeLayers::Single)
+        .decode_depth(DecodeDepth::UpToOne)
         .subtree("/dashboard", LoginRule::required())
         .build()
         .expect("valid routes");
@@ -636,7 +636,7 @@ async fn cors_preflight_not_passed_through_when_disabled() {
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_layers(DecodeLayers::Single)
+        .decode_depth(DecodeDepth::UpToOne)
         .cors_passthrough(false)
         .build()
         .expect("valid routes");
@@ -654,7 +654,7 @@ async fn cors_preflight_not_passed_through_when_disabled() {
 async fn cors_preflight_still_runs_path_confusion_guard() {
     let proxy = build_structural_proxy(
         vec![("/dashboard", LoginRule::required())],
-        crate::login::PathConfusion::reject_structural(),
+        crate::login::GuardMode::RejectAmbiguous,
     )
     .await;
     let (mut session, mut client) = make_session(
@@ -999,14 +999,14 @@ async fn response_filter_no_session_does_nothing() {
 
 async fn build_structural_proxy(
     routes: Vec<(&'static str, LoginRule<MockSession>)>,
-    path_confusion: crate::login::PathConfusion,
+    guard_mode: crate::login::GuardMode,
 ) -> TestProxy {
     let mut builder = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_layers(DecodeLayers::Single)
-        .path_confusion(path_confusion);
+        .decode_depth(DecodeDepth::UpToOne)
+        .guard_mode(guard_mode);
     for (pattern, rule) in routes {
         builder = builder.subtree(pattern, rule);
     }
@@ -1017,7 +1017,7 @@ async fn build_structural_proxy(
 async fn structural_denies_traversal_into_subtree() {
     let proxy = build_structural_proxy(
         vec![("/dashboard", LoginRule::required())],
-        crate::login::PathConfusion::reject_structural(),
+        crate::login::GuardMode::RejectAmbiguous,
     )
     .await;
     let (mut s, mut c) =
@@ -1035,7 +1035,7 @@ async fn structural_denies_traversal_into_subtree() {
 async fn structural_denies_path_param_vector() {
     let proxy = build_structural_proxy(
         vec![("/dashboard", LoginRule::required())],
-        crate::login::PathConfusion::reject_structural(),
+        crate::login::GuardMode::RejectAmbiguous,
     )
     .await;
     let (mut s, mut c) = make_session(
@@ -1059,7 +1059,7 @@ async fn structural_allows_same_rule_encoded_content() {
     // like `%2f` would be denied under the uniform-live model unless declared opaque.)
     let proxy = build_structural_proxy(
         vec![("/files", LoginRule::public())],
-        crate::login::PathConfusion::reject_structural(),
+        crate::login::GuardMode::RejectAmbiguous,
     )
     .await;
     let (mut s, _c) = make_session("GET", "/files/a%20b", "").await;
@@ -1073,10 +1073,7 @@ async fn structural_allows_same_rule_encoded_content() {
 
 #[tokio::test]
 async fn method_specific_rule_does_not_escape_to_catchall() {
-    // `GET /admin` is public; the catch-all is public for any method. A `POST /admin`
-    // must NOT escape its `/admin` claim into the public catch-all — it falls to the
-    // default (required) and is gated, not forwarded. (If the builder failed to wire
-    // `.method()`, the GET-public rule would register as wildcard and POST would forward.)
+    // A method gap must deny before session loading or catch-all fallback.
     let proxy = build_proxy_with_routes(
         MockSessionDriver::default(),
         vec![
@@ -1093,8 +1090,7 @@ async fn method_specific_rule_does_not_escape_to_catchall() {
     assert!(!handled);
     assert!(proxy.inner.was_forwarded());
 
-    // POST /admin → no POST rule at /admin → default (required) → gated, NOT forwarded
-    // to the public catch-all.
+    // POST has no configured policy and returns 403.
     let proxy = build_proxy_with_routes(
         MockSessionDriver::default(),
         vec![
@@ -1103,17 +1099,18 @@ async fn method_specific_rule_does_not_escape_to_catchall() {
         ],
     )
     .await;
-    let (mut s, _c) = make_session("POST", "/admin", "").await;
+    let (mut s, mut c) = make_session("POST", "/admin", "").await;
     let mut ctx = proxy.inner.new_ctx();
     let _ = proxy.request_filter(&mut s, &mut ctx).await.unwrap();
     assert!(!proxy.inner.was_forwarded());
+    assert_eq!(read_status(&mut c).await, 403);
 }
 
 #[tokio::test]
 async fn structural_off_allows_traversal() {
     let proxy = build_structural_proxy(
         vec![("/dashboard", LoginRule::required())],
-        crate::login::PathConfusion::off(),
+        crate::login::GuardMode::Disabled,
     )
     .await;
     let (mut s, mut c) =
@@ -1128,18 +1125,19 @@ async fn structural_off_allows_traversal() {
 }
 
 #[tokio::test]
-async fn build_rejects_noncanonical_pattern() {
+async fn build_rejects_pattern_with_empty_segment() {
     let result = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_layers(DecodeLayers::Single)
+        .decode_depth(DecodeDepth::UpToOne)
         .route("/a/b", LoginRule::public())
         .route("/a//b", LoginRule::required())
         .build();
     assert!(matches!(
         result,
-        Err(crate::login::RouteConfigError::NonCanonicalPattern { .. })
+        Err(crate::login::RouteConfigError::Route { pattern, reason })
+            if pattern == "/a//b" && reason == "route pattern has an empty path segment"
     ));
 }
 
@@ -1149,7 +1147,7 @@ async fn build_rejects_check_on_public_rule() {
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
         .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_layers(DecodeLayers::Single)
+        .decode_depth(DecodeDepth::UpToOne)
         .route("/health", LoginRule::public().check(admin_only))
         .build();
 
@@ -1239,7 +1237,7 @@ mod store_backed {
             .inner(StoreInner::new())
             .engine(build_engine(store).await)
             .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
+            .decode_depth(DecodeDepth::UpToOne)
             .build()
             .expect("valid routes")
     }
@@ -1389,4 +1387,23 @@ mod store_backed {
         assert_eq!(external.calls().deletes, 1);
         assert!(external.is_empty());
     }
+}
+
+#[tokio::test]
+async fn disabled_guard_denies_method_gaps_with_public_default() {
+    let proxy = LoginProxy::builder()
+        .inner(InnerProxy::new())
+        .engine(build_engine(MockSessionDriver::default()).await)
+        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
+        .decode_depth(DecodeDepth::UpToOne)
+        .guard_mode(crate::login::GuardMode::Disabled)
+        .default(LoginRule::public())
+        .route("/admin", LoginRule::public().method(http::Method::GET))
+        .build()
+        .unwrap();
+    let (mut session, mut client) = make_session("POST", "/admin", "").await;
+    let mut ctx = proxy.inner.new_ctx();
+    assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+    assert_eq!(read_status(&mut client).await, 403);
+    assert!(!proxy.inner.was_forwarded());
 }

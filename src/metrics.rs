@@ -5,7 +5,7 @@
 //!
 //! | Counter | Labels |
 //! |---------|--------|
-//! | `huskarl.resource.check` | `outcome`: [`CheckOutcome`] values (`forward`, `path_confusion`, `unauthenticated`, `invalid_token`, `expired`, `unrecognized_issuer`, `binding_error`, `nonce_required`, `insufficient_scope`, `invalid_request`, `server_error`) |
+//! | `huskarl.resource.check` | `outcome`: [`CheckOutcome`] values (`forward`, `path_confusion`, `policy_denied`, `unauthenticated`, `invalid_token`, `expired`, `unrecognized_issuer`, `binding_error`, `nonce_required`, `insufficient_scope`, `invalid_request`, `server_error`) |
 //!
 //! One counter is emitted per [`Guard::check_request`](crate::resource::Guard::check_request)
 //! call, so `forward` counts successes and every other value is a denial broken out by
@@ -48,6 +48,8 @@ pub(crate) enum CheckOutcome {
     /// Denied `400` by the path-confusion guard: the path is ambiguous under the modeled
     /// backend transforms.
     PathConfusion,
+    /// The request method has no configured authorization policy.
+    PolicyDenied,
     /// Denied `401`: authentication is required but no token was presented.
     Unauthenticated,
     /// Denied `401`: a token was presented but is invalid — bad signature, wrong

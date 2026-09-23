@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl_pingora::{
-    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeLayers, Guard, PathConfusion, Rule},
+    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, GuardMode, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
         validator::rfc9068::Rfc9068Validator,
@@ -99,11 +99,10 @@ async fn main() {
 
     let validator = build_validator(&issuer, &audience).await;
 
-    // Path-confusion protection is ON by default (`PathConfusion::RejectStructural`):
+    // Path-confusion protection is ON by default (`GuardMode::RejectAmbiguous`):
     // a request carrying a structural byte (`%2F`, `..`, `;`, …) in a route position
     // the table makes able to change which rule matches (`/x/../public/secret`,
-    // `/health%2f..%2fadmin`, …) is rejected with 400, while the raw path is still
-    // forwarded. You must declare whether the upstream folds case: if it routes
+    // `/health%2f..%2fadmin`, …) is rejected with 400. Allowed paths are forwarded unchanged. You must declare whether the upstream folds case: if it routes
     // case-insensitively (IIS, some filesystems), `Insensitive` stops `/Health` from
     // dodging a rule (and requires routes to be registered in lowercase).
     let case_sensitivity = if std::env::var("CASE_INSENSITIVE_UPSTREAM").is_ok() {
@@ -118,11 +117,11 @@ async fn main() {
     let guard = Guard::builder()
         .validator(validator)
         .case_sensitivity(case_sensitivity)
-        .decode_layers(DecodeLayers::Single)
+        .decode_depth(DecodeDepth::UpToOne)
         .subtree("/public", Rule::public()) // /public and everything under it
         .route("/health", Rule::public()) // exactly /health
-        // RejectStructural is the default; PathConfusion::off() disables the guard.
-        .path_confusion(PathConfusion::reject_structural())
+        // RejectAmbiguous is the default; GuardMode::Disabled disables the guard.
+        .guard_mode(GuardMode::RejectAmbiguous)
         .build()
         .expect("failed to build guard");
 

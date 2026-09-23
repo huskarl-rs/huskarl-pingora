@@ -10,12 +10,15 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use bon::bon;
-use huskarl_route_guard::{MethodMatch, RuleRouter};
+use huskarl_route_guard::{GuardConfig, PathRegistration, RuleRouter};
 use pingora_proxy::Session;
 
 use crate::{
+    method::MethodMatch,
     metrics::CheckOutcome,
-    path_confusion::{CaseSensitivity, DecodeLayers, PathConfusion, StructuralClasses},
+    path_confusion::{
+        CaseSensitivity, DecodeDepth, GuardMode, ResolveError, ResolveErrorKind, StructuralClasses,
+    },
     resource::{
         error::{ConfigError, CustomCheckError, InvalidRequest, InvalidToken},
         outcome::Outcome,
@@ -70,7 +73,7 @@ pub struct ClientCertDer(pub Vec<u8>);
 /// # Example
 ///
 /// ```
-/// # use huskarl_pingora::resource::{CaseSensitivity, DecodeLayers, Guard, Rule};
+/// # use huskarl_pingora::resource::{CaseSensitivity, DecodeDepth, Guard, Rule};
 /// # fn build<V>(my_validator: V)
 /// # where
 /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -81,7 +84,7 @@ pub struct ClientCertDer(pub Vec<u8>);
 ///     // Required: declare whether the upstream folds path case, and whether a
 ///     // decoding layer (CDN/WAF) sits in front of it.
 ///     .case_sensitivity(CaseSensitivity::Sensitive)
-///     .decode_layers(DecodeLayers::Single)
+///     .decode_depth(DecodeDepth::UpToOne)
 ///     // `subtree` protects a path and everything beneath it (the usual intent).
 ///     .subtree("/admin", Rule::required().scopes(["admin"]))
 ///     .subtree("/public", Rule::public())
@@ -103,6 +106,17 @@ pub struct Guard<V: AccessTokenValidator + ProvideValidatorMetadata> {
     /// Optional value for the `name` label on emitted metrics, distinguishing guard
     /// instances when one process runs several. `None` omits the label.
     metrics_name: Option<String>,
+}
+
+/// One locally served RFC 9728 document and the metadata used for challenges
+/// on requests belonging to that protected resource.
+pub(crate) struct ResourceMetadataConfig {
+    pub(crate) resource_uri: http::Uri,
+    pub(crate) resource_origin: String,
+    pub(crate) resource_path: String,
+    pub(crate) endpoint_uri: http::Uri,
+    pub(crate) body: Vec<u8>,
+    pub(crate) validator_metadata: ValidatorMetadata,
 }
 
 impl<V: AccessTokenValidator + ProvideValidatorMetadata> std::fmt::Debug for Guard<V> {
@@ -132,13 +146,14 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     pub fn new(
         // One entry per `route`/`subtree`/`blob_subtree` call, in registration order.
         // Rule-id assignment and subtree-pattern expansion are deferred to
-        // `RuleRouter::builder()` at build time (see below), so the id contract holds
-        // by construction rather than by hand.
+        // `RuleRouter::from_registrations` at build time.
         #[builder(field)] routes: Vec<(RouteKind, String, Rule<V::Claims>)>,
         validator: V,
         /// Externally visible base URI used to reconstruct the complete request URI
         /// for **`DPoP` `htu` binding**. Its path is prepended to the incoming request
-        /// path after `strip_prefix` is applied.
+        /// path after `strip_prefix` is applied. It is also required when an
+        /// [`AuthProxy`](super::AuthProxy) is bound to a protected-resource
+        /// subpath; the same base and subpath derive that resource identifier.
         ///
         /// # Security
         ///
@@ -168,19 +183,23 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         case_sensitivity: CaseSensitivity,
         /// Whether more than one percent-decode pass happens behind this layer — a
         /// CDN, WAF, or second proxy decoding in front of the upstream (see
-        /// [`DecodeLayers`]). Required, no default: decode depth is a topology fact
+        /// [`DecodeDepth`]). Required, no default: decode depth is a deployment assumption
         /// the library will not guess. When unsure, declare
-        /// [`UpToTwo`](DecodeLayers::UpToTwo) — the safe, deny-more direction.
-        decode_layers: DecodeLayers,
+        /// [`UpToTwo`](DecodeDepth::UpToTwo) — the safe, deny-more direction.
+        decode_depth: DecodeDepth,
         /// Which path-confusion guard to apply — denies requests whose path a
         /// normalizing backend could route to a different rule than the one matched
-        /// on the raw path. Defaults to [`PathConfusion::RejectStructural`].
+        /// on the raw path. Defaults to [`GuardMode::RejectAmbiguous`].
         #[builder(default)]
-        path_confusion: PathConfusion,
+        guard_mode: GuardMode,
         /// The structural classes and encodings the guard recognises beyond the
-        /// always-on trio. Defaults to [`StructuralClasses::new`].
+        /// built-in classes. Defaults to [`StructuralClasses::new`].
         #[builder(default)]
         structural_classes: StructuralClasses,
+        /// Maximum original path length in bytes for ambiguity analysis.
+        /// With custom probes this applies to every path. Disabled mode bypasses it.
+        #[builder(default = 8192)]
+        max_analysis_path_len: usize,
         /// Optional value for the `name` label on emitted metrics (the
         /// `huskarl.resource.check` counter). Set it to tell guard instances apart when
         /// one process runs several; leave unset to omit the label.
@@ -217,38 +236,23 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         all_scopes.extend(default.scopes.iter().cloned());
         let scopes_supported: Vec<String> = all_scopes.into_iter().collect();
 
-        // Build the rule-id router + structural guard via route-guard's builder: it
-        // assigns rule ids and expands subtree patterns internally, so the id contract
-        // `RuleRouter::build` enforces holds by construction (no `RuleIdOutOfOrder`
-        // reachable from here). This also runs the build-time canonical-pattern check.
-        let mut rule_router_builder = RuleRouter::builder()
-            .default(default)
-            .case_sensitivity(case_sensitivity)
-            .decode_layers(decode_layers)
-            .path_confusion(path_confusion)
-            .structural_classes(structural_classes);
-        for (kind, pattern, rule) in routes {
+        let config = GuardConfig::new(case_sensitivity, decode_depth)
+            .with_mode(guard_mode)
+            .with_structural_classes(structural_classes)
+            .with_max_analysis_path_len(max_analysis_path_len);
+        let registrations = routes.into_iter().map(|(kind, pattern, rule)| {
             let method = rule.method.clone();
-            rule_router_builder = match (kind, method) {
-                (RouteKind::Exact, MethodMatch::Any) => rule_router_builder.route(pattern, rule),
-                (RouteKind::Exact, m @ MethodMatch::OneOf(_)) => {
-                    rule_router_builder.route_for(m, pattern, rule)
-                }
-                (RouteKind::Subtree, MethodMatch::Any) => {
-                    rule_router_builder.subtree(&pattern, rule)
-                }
-                (RouteKind::Subtree, m @ MethodMatch::OneOf(_)) => {
-                    rule_router_builder.subtree_for(m, &pattern, rule)
-                }
-                (RouteKind::Blob, MethodMatch::Any) => {
-                    rule_router_builder.blob_subtree(&pattern, rule)
-                }
-                (RouteKind::Blob, m @ MethodMatch::OneOf(_)) => {
-                    rule_router_builder.blob_subtree_for(m, &pattern, rule)
-                }
+            let registration = match kind {
+                RouteKind::Exact => PathRegistration::path(pattern),
+                RouteKind::Subtree => PathRegistration::subtree(&pattern),
+                RouteKind::Blob => PathRegistration::exclusive_subtree(&pattern),
             };
-        }
-        let routes = rule_router_builder.build()?;
+            match method {
+                MethodMatch::Any => registration.all(rule),
+                MethodMatch::OneOf(methods) => registration.methods(methods, rule),
+            }
+        });
+        let routes = RuleRouter::from_registrations(default, config, registrations)?;
 
         Ok(Self {
             validator,
@@ -299,7 +303,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
     /// subtree's catch-all, so you can layer exceptions:
     ///
     /// ```
-    /// # use huskarl_pingora::resource::{CaseSensitivity, DecodeLayers, Guard, Rule};
+    /// # use huskarl_pingora::resource::{CaseSensitivity, DecodeDepth, Guard, Rule};
     /// # fn build<V>(my_validator: V)
     /// # where
     /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -308,7 +312,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
     /// let guard = Guard::builder()
     ///     .validator(my_validator)
     ///     .case_sensitivity(CaseSensitivity::Sensitive)
-    ///     .decode_layers(DecodeLayers::Single)
+    ///     .decode_depth(DecodeDepth::UpToOne)
     ///     .subtree("/admin", Rule::required().scopes(["admin"]))
     ///     .route("/admin/health", Rule::public()) // exact carve-out wins
     ///     .build()
@@ -321,17 +325,11 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
         self
     }
 
-    /// Like [`subtree`](Self::subtree), but declares the subtree's catch-all tail an
-    /// **opaque** key space: structural bytes (`%2F`, `;`, `\`) *inside the key* are
-    /// tolerated rather than denied — for proxying opaque identifiers such as object-store
-    /// keys. Dot-segments (`..`) and NUL truncation are **still** denied even in the
-    /// blob, so traversal cannot escape it (and under a case-folding backend, a fold
-    /// that would relocate out of the blob is still denied — a mixed-case key that
-    /// folds within it is fine).
+    /// Registers an exclusive subtree, rejecting nested route overrides at build time.
     ///
-    /// Registering a more-specific [`route`](Self::route) or `subtree` *under* the blob is
-    /// a build error: a structural byte in the key could then relocate into that nested
-    /// route. Use a plain [`subtree`](Self::subtree) if you need nested routes.
+    /// The same ambiguity checks apply as for [`subtree`](Self::subtree).
+    /// Encoded separators and dot-segments can pass only when analysis establishes
+    /// that they stay within the same rule. NUL is denied in every active mode.
     pub fn blob_subtree(mut self, path: &str, rule: Rule<V::Claims>) -> Self {
         self.routes.push((RouteKind::Blob, path.to_owned(), rule));
         self
@@ -340,7 +338,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
 
 /// How a registration on [`GuardBuilder`] is lowered onto [`RuleRouter::builder`] at
 /// build time — an exact [`route`](GuardBuilder::route), a [`subtree`](GuardBuilder::subtree),
-/// or an opaque-tailed [`blob_subtree`](GuardBuilder::blob_subtree).
+/// or an exclusive [`blob_subtree`](GuardBuilder::blob_subtree).
 enum RouteKind {
     Exact,
     Subtree,
@@ -355,10 +353,11 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// matched rule's scope is a binding the guard has just declined to trust —
     /// advertising it would misdirect clients into a futile re-auth and hand a prober
     /// the route table's policy layout.
-    fn bad_request(&self, msg: &'static str) -> Outcome<V::Claims> {
-        let challenges = self
-            .metadata
-            .challenges(Some(&InvalidRequest(msg)), None, None);
+    fn bad_request_with_metadata(
+        metadata: &ValidatorMetadata,
+        msg: &'static str,
+    ) -> Outcome<V::Claims> {
+        let challenges = metadata.challenges(Some(&InvalidRequest(msg)), None, None);
         Outcome::Deny {
             status: http::StatusCode::BAD_REQUEST,
             challenges,
@@ -367,8 +366,36 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         }
     }
 
-    /// Enables metadata advertisement and returns the well-known path and
-    /// serialized JSON for RFC 9728 resource metadata.
+    fn route_denial(
+        metadata: &ValidatorMetadata,
+        reason: &ResolveError,
+    ) -> (Outcome<V::Claims>, CheckOutcome) {
+        match reason.kind() {
+            ResolveErrorKind::InvalidInput => (
+                Self::bad_request_with_metadata(metadata, reason.message()),
+                CheckOutcome::PathConfusion,
+            ),
+            kind => (
+                Outcome::Deny {
+                    status: if kind == ResolveErrorKind::PolicyDenied {
+                        http::StatusCode::FORBIDDEN
+                    } else {
+                        http::StatusCode::INTERNAL_SERVER_ERROR
+                    },
+                    challenges: Vec::new(),
+                    dpop_nonce: None,
+                    retry_after: None,
+                },
+                if kind == ResolveErrorKind::PolicyDenied {
+                    CheckOutcome::PolicyDenied
+                } else {
+                    CheckOutcome::ServerError
+                },
+            ),
+        }
+    }
+
+    /// Builds metadata advertisement for one RFC 9728 protected resource.
     ///
     /// Per RFC 9728 §3.1, the well-known URI is constructed by inserting
     /// `/.well-known/oauth-protected-resource` between the host and the path
@@ -384,11 +411,18 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// Returns a [`ConfigError`] if the resource identifier is invalid, the
     /// validator advertises a different endpoint, or the generated document
     /// cannot be serialized.
-    pub(crate) fn enable_resource_metadata(
-        &mut self,
+    pub(crate) fn build_resource_metadata(
+        &self,
         resource: &str,
-    ) -> Result<(String, Vec<u8>), ConfigError> {
+    ) -> Result<ResourceMetadataConfig, ConfigError> {
         validate_resource_identifier(resource)?;
+        let resource_uri =
+            resource
+                .parse::<http::Uri>()
+                .map_err(|_| ConfigError::InvalidResourceIdentifier {
+                    resource: resource.to_owned(),
+                    reason: "not a valid URI",
+                })?;
         let metadata_url =
             well_known_url(resource).map_err(|source| ConfigError::ResourceMetadataUrl {
                 resource: resource.to_owned(),
@@ -411,7 +445,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         let Some(document) = metadata.to_resource_metadata() else {
             return Err(ConfigError::ResourceMetadataDocumentUnavailable);
         };
-        let path = metadata_url.as_uri().path().to_owned();
+        let endpoint_uri = metadata_url.as_uri().clone();
 
         let mut value = serde_json::to_value(&document)?;
 
@@ -423,9 +457,60 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 .or_insert_with(|| serde_json::Value::from(self.scopes_supported.clone()));
         }
 
-        let json = serde_json::to_vec(&value)?;
-        self.metadata = metadata;
-        Ok((path, json))
+        let body = serde_json::to_vec(&value)?;
+        let resource_origin = format!(
+            "{}://{}",
+            resource_uri.scheme_str().unwrap_or_default(),
+            resource_uri
+                .authority()
+                .map_or("", http::uri::Authority::as_str)
+        );
+        let resource_path = resource_uri.path().to_owned();
+        Ok(ResourceMetadataConfig {
+            resource_uri,
+            resource_origin,
+            resource_path,
+            endpoint_uri,
+            body,
+            validator_metadata: metadata,
+        })
+    }
+
+    /// Derives one protected-resource identifier from this guard's trusted
+    /// public base URI and a resource subpath, then builds its RFC 9728 data.
+    pub(crate) fn build_resource_metadata_for_path(
+        &self,
+        resource_path: &str,
+    ) -> Result<ResourceMetadataConfig, ConfigError> {
+        let base_uri = self.base_uri.as_ref().ok_or(ConfigError::MissingBaseUri)?;
+        if !resource_path.starts_with('/') || resource_path.contains('#') {
+            return Err(ConfigError::InvalidResourcePath {
+                path: resource_path.to_owned(),
+            });
+        }
+        let relative =
+            resource_path
+                .parse::<http::Uri>()
+                .map_err(|_| ConfigError::InvalidResourcePath {
+                    path: resource_path.to_owned(),
+                })?;
+        if relative.scheme().is_some() || relative.authority().is_some() {
+            return Err(ConfigError::InvalidResourcePath {
+                path: resource_path.to_owned(),
+            });
+        }
+        let resource_uri = request_uri(Some(base_uri), None, &relative).ok_or_else(|| {
+            ConfigError::InvalidResourcePath {
+                path: resource_path.to_owned(),
+            }
+        })?;
+        self.build_resource_metadata(&resource_uri.to_string())
+    }
+
+    /// Reconstructs the externally visible request URI using the same mapping
+    /// passed to the validator for `DPoP` `htu` verification.
+    pub(crate) fn effective_request_uri(&self, uri: &http::Uri) -> Option<http::Uri> {
+        request_uri(self.base_uri.as_ref(), self.strip_prefix.as_deref(), uri)
     }
 
     /// Checks the given Pingora session.
@@ -447,8 +532,44 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             .and_then(|d| d.ssl_digest.as_ref())
             .and_then(|ssl| ssl.extension.get::<ClientCertDer>())
             .map(|c| c.0.as_slice());
-        self.check_request(&req.headers, &req.method, &req.uri, client_cert_der)
-            .await
+        self.check_request_with_metadata(
+            &req.headers,
+            &req.method,
+            &req.uri,
+            client_cert_der,
+            &self.metadata,
+            None,
+        )
+        .await
+    }
+
+    /// Checks a Pingora session while using resource-specific challenge
+    /// metadata selected by [`AuthProxy`](super::AuthProxy).
+    pub(crate) async fn check_with_metadata(
+        &self,
+        session: &Session,
+        metadata: &ValidatorMetadata,
+        audiences: &[String],
+    ) -> Outcome<V::Claims>
+    where
+        V::Claims: HasScopes,
+    {
+        let req = session.req_header();
+        let client_cert_der = session
+            .as_downstream()
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .and_then(|ssl| ssl.extension.get::<ClientCertDer>())
+            .map(|c| c.0.as_slice());
+        self.check_request_with_metadata(
+            &req.headers,
+            &req.method,
+            &req.uri,
+            client_cert_der,
+            metadata,
+            Some(audiences),
+        )
+        .await
     }
 
     /// Low-level token check using plain HTTP types.
@@ -470,8 +591,38 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     where
         V::Claims: HasScopes,
     {
+        self.check_request_with_metadata(
+            headers,
+            method,
+            uri,
+            client_cert_der,
+            &self.metadata,
+            None,
+        )
+        .await
+    }
+
+    async fn check_request_with_metadata(
+        &self,
+        headers: &http::HeaderMap,
+        method: &http::Method,
+        uri: &http::Uri,
+        client_cert_der: Option<&[u8]>,
+        metadata: &ValidatorMetadata,
+        resource_audiences: Option<&[String]>,
+    ) -> Outcome<V::Claims>
+    where
+        V::Claims: HasScopes,
+    {
         let (outcome, category) = self
-            .check_request_categorized(headers, method, uri, client_cert_der)
+            .check_request_categorized(
+                headers,
+                method,
+                uri,
+                client_cert_der,
+                metadata,
+                resource_audiences,
+            )
             .await;
         category.emit(self.metrics_name.as_deref());
         outcome
@@ -486,6 +637,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         method: &http::Method,
         uri: &http::Uri,
         client_cert_der: Option<&[u8]>,
+        metadata: &ValidatorMetadata,
+        resource_audiences: Option<&[String]>,
     ) -> (Outcome<V::Claims>, CheckOutcome)
     where
         V::Claims: HasScopes,
@@ -499,11 +652,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         let rule = match self.routes.resolve(path, method) {
             Ok(matched) => matched.rule(),
             Err(reason) => {
-                log::warn!("path-confusion guard denied {path:?}: {reason}");
-                return (
-                    self.bad_request(reason.message()),
-                    CheckOutcome::PathConfusion,
-                );
+                log::warn!("route guard denied {path:?}: {reason}");
+                return Self::route_denial(metadata, &reason);
             }
         };
 
@@ -525,7 +675,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         let Some(full_uri) = request_uri(self.base_uri.as_ref(), self.strip_prefix.as_deref(), uri)
         else {
             return (
-                self.bad_request("Invalid request URI"),
+                Self::bad_request_with_metadata(metadata, "Invalid request URI"),
                 CheckOutcome::InvalidRequest,
             );
         };
@@ -545,7 +695,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 // per consumer would clone them repeatedly on a path an attacker chooses
                 // how often to trigger.
                 let challenge = err.challenge();
-                let rejection = self.metadata.rejection_from(&err, &challenge, scope_param);
+                let rejection = metadata.rejection_from(&err, &challenge, scope_param);
                 // Classify from the same error: a server-side failure is a 5xx that was
                 // never a token judgement, so labelling it `invalid_token` would both
                 // overstate rejections and hide the outage. The error is asked rather than
@@ -566,7 +716,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 // No token present.
                 match rule.token {
                     TokenRequirement::Required => {
-                        let challenges = self.metadata.unauthenticated_challenges(scope_param);
+                        let challenges = metadata.unauthenticated_challenges(scope_param);
                         (
                             Outcome::Deny {
                                 status: http::StatusCode::UNAUTHORIZED,
@@ -589,9 +739,14 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             }
             Ok(Some(validated)) => {
                 // Token present and valid — run rule checks.
-                if let Some((outcome, category)) =
-                    self.check_rule(rule, &validated, scope_param, dpop_nonce.as_deref())
-                {
+                if let Some((outcome, category)) = Self::check_rule(
+                    rule,
+                    &validated,
+                    scope_param,
+                    dpop_nonce.as_deref(),
+                    metadata,
+                    resource_audiences,
+                ) {
                     return (outcome, category);
                 }
 
@@ -610,21 +765,49 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// Runs audience, scope, and custom check against the rule.
     /// Returns `Some((Outcome::Deny, category))` if any check fails, `None` if all pass.
     fn check_rule(
-        &self,
         rule: &Rule<V::Claims>,
         validated: &ValidatedRequest<V::Claims>,
         scope_param: Option<&str>,
         dpop_nonce: Option<&str>,
+        metadata: &ValidatorMetadata,
+        resource_audiences: Option<&[String]>,
     ) -> Option<(Outcome<V::Claims>, CheckOutcome)>
     where
         V::Claims: HasScopes,
     {
-        // Audience check.
+        // The protected-resource binding is the primary audience boundary. RFC
+        // 8707 permits an authorization server to use the resource URI itself
+        // or map it to another identifier, so AuthProxy supplies the configured
+        // acceptable values for the selected resource.
+        if let Some(audiences) = resource_audiences
+            && !audiences
+                .iter()
+                .any(|audience| validated.aud.contains(audience))
+        {
+            let challenges = metadata.challenges(
+                Some(&InvalidToken(
+                    "The access token audience does not match the protected resource",
+                )),
+                scope_param,
+                None,
+            );
+            return Some((
+                Outcome::Deny {
+                    status: http::StatusCode::UNAUTHORIZED,
+                    challenges,
+                    dpop_nonce: dpop_nonce.map(String::from),
+                    retry_after: None,
+                },
+                CheckOutcome::InvalidToken,
+            ));
+        }
+
+        // A rule can additionally narrow the accepted audiences.
         // Returns 401 (not 403) per RFC 6750 §3.1: a token whose audience does
         // not include this resource server is "invalid for other reasons" and
         // maps to the `invalid_token` error code.
         if !rule.audiences.is_empty() && !rule.audiences.iter().any(|a| validated.aud.contains(a)) {
-            let challenges = self.metadata.challenges(
+            let challenges = metadata.challenges(
                 Some(&InvalidToken("The access token audience does not match")),
                 scope_param,
                 None,
@@ -644,11 +827,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         if !rule.scopes.is_empty() {
             for required in &rule.scopes {
                 if !validated.claims.has_scope(required) {
-                    let challenges = self.metadata.challenges(
-                        Some(&InsufficientScope::default()),
-                        scope_param,
-                        None,
-                    );
+                    let challenges =
+                        metadata.challenges(Some(&InsufficientScope::default()), scope_param, None);
                     return Some((
                         Outcome::Deny {
                             status: http::StatusCode::FORBIDDEN,
@@ -671,7 +851,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                         code: TokenErrorCode::InsufficientScope,
                         description: desc,
                     };
-                    let challenges = self.metadata.challenges(Some(&err), None, None);
+                    let challenges = metadata.challenges(Some(&err), None, None);
                     return Some((
                         Outcome::Deny {
                             status: http::StatusCode::FORBIDDEN,
@@ -687,7 +867,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                         code: TokenErrorCode::InvalidToken,
                         description: desc,
                     };
-                    let challenges = self.metadata.challenges(Some(&err), None, None);
+                    let challenges = metadata.challenges(Some(&err), None, None);
                     return Some((
                         Outcome::Deny {
                             status: http::StatusCode::UNAUTHORIZED,

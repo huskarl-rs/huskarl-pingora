@@ -26,8 +26,19 @@
 //!   `DPoP-Nonce` headers are propagated automatically.
 //! - **Credential stripping** — `Authorization` and `DPoP` headers are removed
 //!   before forwarding to upstream by default.
-//! - **[RFC 9728] resource metadata** — optionally serves a
-//!   `/.well-known/oauth-protected-resource` JSON endpoint.
+//! - **[RFC 9728] resource metadata** — each [`AuthProxy`] can bind one logical
+//!   protected resource to its token audience, while a server-level
+//!   [`ResourceMetadataProxy`] publishes the documents collected from all such
+//!   integrations under `/.well-known/oauth-protected-resource[/path]`.
+//!
+//! # Multiple resource servers
+//!
+//! Build one resource-bound [`AuthProxy`] per protected subtree, then place
+//! those independent proxies behind a `ProxyHttp` router. Publish the returned
+//! metadata endpoints through a separate router branch so metadata requests do
+//! not enter any resource server's early-filter lifecycle. See the
+//! `multi_resource_proxy` example for a complete two-validator, two-upstream
+//! Pingora server using `pingora-proxy-router`.
 //!
 //! [RFC 9728]: https://datatracker.ietf.org/doc/html/rfc9728
 
@@ -46,14 +57,14 @@ pub(crate) mod uri;
 pub use ctx::{AuthCtx, HasAuthState};
 pub use error::ConfigError;
 pub use guard::{ClientCertDer, Guard, GuardBuilder};
-pub use huskarl_route_guard::MethodMatch;
 pub use outcome::Outcome;
-pub use proxy::AuthProxy;
+pub use proxy::{AudienceBinding, AuthProxy, ResourceMetadataEndpoint, ResourceMetadataProxy};
 pub use rule::{CheckError, Rule, TokenRequirement};
 pub use scopes::HasScopes;
 
+pub use crate::method::MethodMatch;
 #[doc(no_inline)]
 pub use crate::path_confusion::{
-    CaseSensitivity, DecodeLayers, DenyReason, PathConfusion, StructuralChar, StructuralClass,
-    StructuralClasses, StructuralProbe,
+    CaseSensitivity, DecodeDepth, GuardMode, ResolveError, ResolveErrorKind, StructuralChar,
+    StructuralClass, StructuralClasses, StructuralProbe,
 };

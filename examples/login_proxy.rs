@@ -39,8 +39,8 @@ use huskarl::{
 };
 use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_pingora::login::{
-    CaseSensitivity, CookieSession, CookieSessionStore, DecodeLayers, LoginConfig, LoginCtx,
-    LoginEngine, LoginProxy, LoginRule, LogoutConfig, PathConfusion, SessionLifetime,
+    CaseSensitivity, CookieSession, CookieSessionStore, DecodeDepth, GuardMode, LoginConfig,
+    LoginCtx, LoginEngine, LoginProxy, LoginRule, LogoutConfig, SessionLifetime,
 };
 use huskarl_reqwest::ReqwestClient;
 use huskarl_resource_server::core::client_auth::NoAuth;
@@ -220,7 +220,7 @@ fn main() {
             .inner(inner)
             .engine(engine)
             .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_layers(DecodeLayers::Single)
+            .decode_depth(DecodeDepth::UpToOne)
             // `subtree` applies a rule to a path and everything beneath it;
             // `route` matches a single exact path.
             //
@@ -235,13 +235,12 @@ fn main() {
             // Everything else falls through to the default (`required`),
             // redirecting unauthenticated browsers through the auth-code flow.
             //
-            // Path-confusion protection is ON by default (`RejectStructural`): a
+            // Path-confusion protection is ON by default (`RejectAmbiguous`): a
             // request carrying a structural byte in a route position the table makes
             // able to change which rule matches (e.g. `/x/../dashboard`,
-            // `/dashboard/..;/admin`) is rejected with 400, while the raw path is
-            // still forwarded. `::reject_non_canonical()` is a stricter,
-            // defense-in-depth alternative; `::off()` disables it.
-            .path_confusion(PathConfusion::reject_structural())
+            // `/dashboard/..;/admin`) is rejected with 400. Allowed paths are forwarded unchanged. `GuardMode::RequireCanonical` is a stricter,
+            // defense-in-depth alternative; `GuardMode::Disabled` disables it.
+            .guard_mode(GuardMode::RejectAmbiguous)
             .build()
             .expect("valid LoginProxy configuration")
     });

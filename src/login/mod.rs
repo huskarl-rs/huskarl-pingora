@@ -52,12 +52,12 @@ pub use huskarl_login::{
     LogoutConfig, PersistFailurePolicy, SessionError, SessionLifetime, StoreBackedSessionStore,
     engine::LoginEngine,
 };
-pub use huskarl_route_guard::MethodMatch;
 pub use proxy::{LoginProxy, LoginProxyBuilder, RouteConfigError};
 pub use rule::{CheckError, LoginRule};
 
+pub use crate::method::MethodMatch;
 #[doc(no_inline)]
 pub use crate::path_confusion::{
-    CaseSensitivity, DecodeLayers, DenyReason, PathConfusion, StructuralChar, StructuralClass,
-    StructuralClasses, StructuralProbe,
+    CaseSensitivity, DecodeDepth, GuardMode, ResolveError, ResolveErrorKind, StructuralChar,
+    StructuralClass, StructuralClasses, StructuralProbe,
 };

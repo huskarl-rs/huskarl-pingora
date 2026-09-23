@@ -1566,6 +1566,7 @@ dependencies = [
  "subtle",
  "tokio",
  "url",
+ "wasip3",
  "web-time",
  "zeroize",
 ]
@@ -1667,6 +1668,7 @@ dependencies = [
  "pingora-http",
  "pingora-proxy",
  "pingora-proxy-delegate",
+ "pingora-proxy-router",
  "rand 0.10.2",
  "serde_json",
  "strum 0.27.2",
@@ -1705,7 +1707,6 @@ dependencies = [
  "sha2",
  "snafu",
  "strum 0.27.2",
- "tokio",
  "web-time",
 ]
 
@@ -1713,7 +1714,6 @@ dependencies = [
 name = "huskarl-route-guard"
 version = "0.1.0"
 dependencies = [
- "bon",
  "http",
 ]
 
@@ -2599,13 +2599,26 @@ dependencies = [
 
 [[package]]
 name = "pingora-proxy-delegate"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fa4405b29da3cbc19b034fef5bc4eeec1d0334a272d98ce113cf5d764bb6b3c"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "pingora-proxy-router"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "pingora-cache",
+ "pingora-core",
+ "pingora-http",
+ "pingora-proxy",
+ "pingora-proxy-delegate",
+ "tokio",
 ]
 
 [[package]]
@@ -4139,7 +4152,16 @@ version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
- "wit-bindgen",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "wasip3"
+version = "0.9.0+wasi-0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1d5749fdf69bb9400562eba50f8f25f5cd800ef4b74300038b6f99ae7409674"
+dependencies = [
+ "wit-bindgen 0.62.0",
 ]
 
 [[package]]
@@ -4347,6 +4369,12 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wit-bindgen"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53cb4b5556c3a791e86838ea287782bdafa704d55b0e68b5b81a3a16b9ea5f4b"
 
 [[package]]
 name = "wnaf"
