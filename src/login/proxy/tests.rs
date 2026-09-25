@@ -506,6 +506,7 @@ async fn session_cookie_is_stripped_but_application_cookies_are_preserved() {
     upstream
         .insert_header("Cookie", "mock-session=secret; theme=dark")
         .unwrap();
+    upstream.insert_header("X-App", "preserved").unwrap();
 
     proxy
         .upstream_request_filter(&mut session, &mut upstream, &mut ctx)
@@ -516,6 +517,12 @@ async fn session_cookie_is_stripped_but_application_cookies_are_preserved() {
         upstream.headers.get(http::header::COOKIE).unwrap(),
         "theme=dark"
     );
+    let mut wire = Vec::new();
+    upstream.header_to_h1_wire(&mut wire);
+    let wire = String::from_utf8(wire).unwrap();
+    assert!(wire.contains("Cookie: theme=dark\r\n"));
+    assert!(wire.contains("X-App: preserved\r\n"));
+    assert!(!wire.contains("mock-session"));
 }
 
 #[tokio::test]
@@ -541,6 +548,11 @@ async fn cookie_header_is_removed_when_it_only_contains_the_session_cookie() {
         .unwrap();
 
     assert!(upstream.headers.get(http::header::COOKIE).is_none());
+    let mut wire = Vec::new();
+    upstream.header_to_h1_wire(&mut wire);
+    let wire = String::from_utf8(wire).unwrap();
+    assert!(!wire.contains("Cookie:"));
+    assert!(!wire.contains("mock-session"));
 }
 
 // ── Optional routes ──────────────────────────────────────────────

@@ -674,8 +674,14 @@ where
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        self.engine
-            .strip_session_credentials(&mut upstream_request.headers);
+        // Pingora's header map is read-only; use its mutation methods to keep
+        // the case-preserving header metadata in sync with the cookie values.
+        let mut headers = upstream_request.headers.clone();
+        self.engine.strip_session_credentials(&mut headers);
+        upstream_request.remove_header(&http::header::COOKIE);
+        for value in headers.get_all(http::header::COOKIE) {
+            upstream_request.append_header("Cookie", value.clone())?;
+        }
 
         self.inner
             .upstream_request_filter(session, upstream_request, ctx)
