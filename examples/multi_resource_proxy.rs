@@ -18,8 +18,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use huskarl_pingora::{
     resource::{
-        AudienceBinding, AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, HasAuthState,
-        ResourceMetadataProxy,
+        AudienceBinding, AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, GuardConfig,
+        HasAuthState, ResourceMetadataProxy,
     },
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
@@ -184,11 +184,12 @@ async fn main() {
     )
     .await;
 
+    // Both upstreams have the same downstream parsing assumptions.
+    let path_guard = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
     let inventory_guard = Guard::builder()
         .validator(inventory_validator)
         .base_uri(base_uri.clone())
-        .case_sensitivity(CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(path_guard.clone())
         .build()
         .expect("failed to build inventory guard");
     let (inventory, inventory_metadata) = AuthProxy::new(
@@ -207,8 +208,7 @@ async fn main() {
     let payments_guard = Guard::builder()
         .validator(payments_validator)
         .base_uri(base_uri)
-        .case_sensitivity(CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(path_guard)
         .build()
         .expect("failed to build payments guard");
     let (payments, payments_metadata) = AuthProxy::new(

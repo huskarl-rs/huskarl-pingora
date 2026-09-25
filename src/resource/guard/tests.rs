@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use super::*;
 use crate::{
+    path_confusion::DecodeDepth,
     resource::test_support::{
         ChallengeCounter, CountingError, MockClaims, MockError, MockErrorKind,
         mock_validator_metadata,
@@ -118,10 +119,13 @@ fn build_guard(
     validator: MockValidator,
     routes: Vec<(&str, Rule<MockClaims>)>,
 ) -> Guard<MockValidator> {
-    let mut builder = Guard::builder()
-        .validator(validator)
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(crate::resource::DecodeDepth::UpToOne);
+    let mut builder =
+        Guard::builder()
+            .validator(validator)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ));
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
@@ -136,8 +140,10 @@ fn build_guard_with_base_uri(
 ) -> Guard<MockValidator> {
     let mut builder = Guard::builder()
         .validator(validator)
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .base_uri(base_uri.parse().unwrap())
         .maybe_strip_prefix(strip_prefix);
     for (pattern, rule) in routes {
@@ -183,8 +189,10 @@ fn subtree_guard(
 ) -> Guard<MockValidator> {
     Guard::builder()
         .validator(validator)
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .subtree(pattern, rule)
         .build()
         .unwrap()
@@ -327,8 +335,10 @@ async fn one_origin_can_back_distinct_resource_guards() {
         let request_path = format!("/{resource_path}/item");
         let guard = Guard::builder()
             .validator(MockValidator::no_token())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            ))
             .base_uri("https://api.example.com".parse().unwrap())
             .route(&request_path, Rule::required())
             .build()
@@ -404,8 +414,10 @@ async fn explicit_validator_metadata_url_is_not_overwritten() {
 
     let guard = Guard::builder()
         .validator(CustomUrlValidator(MockValidator::no_token()))
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/api", Rule::required())
         .build()
         .unwrap();
@@ -443,8 +455,10 @@ fn resource_metadata_rejects_invalid_resource_identifiers() {
     ] {
         let guard = Guard::builder()
             .validator(MockValidator::no_token())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            ))
             .route("/api", Rule::required())
             .build()
             .unwrap();
@@ -466,8 +480,10 @@ fn invalid_dpop_base_uri_is_a_build_error() {
     ] {
         let result = Guard::builder()
             .validator(MockValidator::no_token())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            ))
             .base_uri(base_uri.parse().unwrap())
             .build();
 
@@ -563,8 +579,10 @@ async fn optional_route_valid_token_forwards_with_token() {
 async fn default_rule_applies_to_unmatched_paths() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/health", Rule::public())
         .default(Rule::optional())
         .build()
@@ -821,8 +839,10 @@ async fn subtree_covers_path_and_descendants() {
 async fn subtree_exact_route_carve_out_wins() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .subtree("/admin", Rule::required())
         .route("/admin/health", Rule::public())
         .build()
@@ -921,8 +941,10 @@ async fn guard_400_challenges_carry_no_scope_hint() {
     // Unreconstructable URI (strip_prefix mismatch): same rule-independent 400.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .base_uri("https://api.example.com".parse().unwrap())
         .strip_prefix("/proxy")
         .default(Rule::required().scopes(["admin"]))
@@ -967,8 +989,10 @@ async fn blob_subtree_tolerates_structural_byte_in_key() {
     // inside the blob — but a climb that escapes it still denies.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .blob_subtree("/files", Rule::public())
         .build()
         .unwrap();
@@ -988,8 +1012,10 @@ async fn method_specific_rule_closes_other_methods_no_backtrack() {
     // A method gap denies rather than escaping into a broader public catch-all.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/{*rest}", Rule::public()) // catch-all, any method, public
         .route("/admin", Rule::public().method(http::Method::GET)) // GET /admin public
         .build()
@@ -1012,8 +1038,10 @@ async fn method_wildcard_fallback_is_per_terminal() {
     // and it is not inherited from a broader catch-all (see the test above).
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/admin", Rule::public().method(http::Method::GET)) // GET public
         .route("/admin", Rule::required()) // every other method requires a token
         .build()
@@ -1031,8 +1059,10 @@ async fn method_gap_denies_with_public_default() {
     // An unlisted method denies even when the default policy is public.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .default(Rule::public()) // permissive fallback
         .route("/admin", Rule::required().method(http::Method::POST)) // only POST is protected
         .build()
@@ -1054,8 +1084,10 @@ fn blob_subtree_with_nested_route_is_build_error() {
     // A more-specific route under the blob would let a structural byte relocate into it.
     let result = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .blob_subtree("/files", Rule::public())
         .route("/files/secret", Rule::required())
         .build();
@@ -1083,8 +1115,10 @@ async fn plain_subtree_scopes_structural_byte_to_its_uniformity() {
     // could now relocate the path across a rule boundary, so it goes back to denying.
     let nested = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .subtree("/files", Rule::public())
         .route("/files/secret", Rule::required())
         .build()
@@ -1134,10 +1168,14 @@ async fn guard_off_allows_traversal() {
     // (required) rule and is denied for the missing token (401), not 400.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(
+            crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_mode(crate::resource::GuardMode::Disabled),
+        )
         .subtree("/admin", Rule::required().scopes(["admin"]))
-        .guard_mode(crate::resource::GuardMode::Disabled)
         .build()
         .unwrap();
 
@@ -1152,8 +1190,10 @@ fn build_rejects_pattern_with_empty_segment() {
     // An interior empty segment is not representable in the route grammar.
     let result = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/a/b", Rule::public())
         .route("/a//b", Rule::required())
         .build();
@@ -1169,8 +1209,10 @@ fn build_rejects_traversal_pattern() {
     // `/x/../b` carries a `..` dot-segment → non-canonical.
     let result = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/x/../b", Rule::required())
         .build();
     assert!(matches!(
@@ -1185,11 +1227,15 @@ fn build_allows_noncanonical_pattern_when_guard_off() {
     // pattern carrying a structural byte (here `%2f`) is accepted as a literal route.
     let result = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(
+            crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_mode(crate::resource::GuardMode::Disabled),
+        )
         .route("/a/b", Rule::public())
         .route("/a%2fb", Rule::required())
-        .guard_mode(crate::resource::GuardMode::Disabled)
         .build();
     assert!(result.is_ok());
 }
@@ -1200,8 +1246,10 @@ fn build_rejects_public_rule_with_check() {
     // for public routes. Reject it at build time rather than store a dead check.
     let result = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/health", Rule::public().check(|_| Ok(())))
         .build();
     assert!(matches!(
@@ -1214,8 +1262,10 @@ fn build_rejects_public_rule_with_check() {
 fn build_rejects_public_default_rule_with_check() {
     let result = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .default(Rule::public().check(|_| Ok(())))
         .build();
     assert!(matches!(
@@ -1229,8 +1279,10 @@ fn build_allows_distinct_canonical_trailing_slash_routes() {
     // Both `/admin` and `/admin/` are canonical (no structural bytes) → no conflict.
     let result = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/admin", Rule::public())
         .route("/admin/", Rule::required())
         .build();
@@ -1243,8 +1295,10 @@ fn build_allows_distinct_canonical_trailing_slash_routes() {
 async fn structural_case_opt_in_catches_relocation() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Insensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Insensitive,
+            DecodeDepth::UpToOne,
+        ))
         .subtree("/admin", Rule::required())
         .build()
         .unwrap();
@@ -1274,10 +1328,14 @@ async fn hygiene_rejects_noncanonical_even_when_same_rule() {
     // RejectStructural allows it (inert blob key) — but strict hygiene rejects it.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(
+            crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_mode(GuardMode::RequireCanonical),
+        )
         .subtree("/files", Rule::public())
-        .guard_mode(GuardMode::RequireCanonical)
         .build()
         .unwrap();
 
@@ -1290,10 +1348,14 @@ async fn hygiene_allows_canonical_path() {
     use crate::resource::GuardMode;
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(
+            crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_mode(GuardMode::RequireCanonical),
+        )
         .subtree("/files", Rule::public())
-        .guard_mode(GuardMode::RequireCanonical)
         .build()
         .unwrap();
 
@@ -1322,10 +1384,14 @@ async fn custom_probe_denies_aliased_prefix() {
     use crate::resource::StructuralClasses;
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(
+            crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_structural_classes(StructuralClasses::new().with_probe(DangerPrefixProbe)),
+        )
         .subtree("/admin", Rule::required().scopes(["admin"]))
-        .structural_classes(StructuralClasses::new().with_probe(DangerPrefixProbe))
         .build()
         .unwrap();
 
@@ -1342,12 +1408,17 @@ async fn structural_overlong_opt_in_catches_relocation() {
     // the structural scan reveals the `..` and denies it.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
-        .subtree("/admin", Rule::required())
-        .structural_classes(
-            StructuralClasses::new().with_overlong([StructuralChar::Slash, StructuralChar::Dot]),
+        .path_guard(
+            crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_structural_classes(
+                StructuralClasses::new()
+                    .with_overlong([StructuralChar::Slash, StructuralChar::Dot]),
+            ),
         )
+        .subtree("/admin", Rule::required())
         .build()
         .unwrap();
 
@@ -1373,8 +1444,10 @@ async fn structural_null_truncation_denied_by_default() {
     // path), so the default configuration denies the `%00` — no opt-in needed.
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .subtree("/admin", Rule::required())
         .build()
         .unwrap();
@@ -1674,8 +1747,10 @@ async fn rejection_builds_exactly_one_challenge() {
     let counter = std::sync::Arc::new(ChallengeCounter::default());
     let guard = Guard::builder()
         .validator(CountingValidator(std::sync::Arc::clone(&counter)))
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/api", Rule::required())
         .build()
         .unwrap();
@@ -1750,8 +1825,10 @@ fn metrics_name_label_present_when_configured() {
     let (_, counters) = with_metrics(async {
         let guard = Guard::builder()
             .validator(MockValidator::no_token())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            ))
             .metrics_name("edge")
             .route("/health", Rule::public())
             .build()
@@ -1777,9 +1854,13 @@ fn metrics_name_label_present_when_configured() {
 async fn disabled_guard_still_denies_method_gaps() {
     let guard = Guard::builder()
         .validator(MockValidator::no_token())
-        .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
-        .guard_mode(crate::resource::GuardMode::Disabled)
+        .path_guard(
+            crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_mode(crate::resource::GuardMode::Disabled),
+        )
         .default(Rule::public())
         .route("/admin", Rule::public().method(http::Method::GET))
         .build()
@@ -1796,9 +1877,13 @@ async fn configured_analysis_budget_applies_to_encoded_paths() {
     for (budget, allowed) in [(8, false), (64, true)] {
         let guard = Guard::builder()
             .validator(MockValidator::no_token())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(DecodeDepth::UpToOne)
-            .max_analysis_path_len(budget)
+            .path_guard(
+                crate::resource::GuardConfig::new(
+                    crate::resource::CaseSensitivity::Sensitive,
+                    DecodeDepth::UpToOne,
+                )
+                .with_max_analysis_path_len(budget),
+            )
             .subtree("/files", Rule::public())
             .build()
             .unwrap();

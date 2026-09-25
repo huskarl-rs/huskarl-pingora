@@ -39,7 +39,7 @@ use huskarl::{
 };
 use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_pingora::login::{
-    CaseSensitivity, CookieSession, CookieSessionStore, DecodeDepth, GuardMode, LoginConfig,
+    CaseSensitivity, CookieSession, CookieSessionStore, DecodeDepth, GuardConfig, LoginConfig,
     LoginCtx, LoginEngine, LoginProxy, LoginRule, LogoutConfig, SessionLifetime,
 };
 use huskarl_reqwest::ReqwestClient;
@@ -219,8 +219,10 @@ fn main() {
         LoginProxy::builder()
             .inner(inner)
             .engine(engine)
-            .case_sensitivity(CaseSensitivity::Sensitive)
-            .decode_depth(DecodeDepth::UpToOne)
+            .path_guard(GuardConfig::new(
+                CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            ))
             // `subtree` applies a rule to a path and everything beneath it;
             // `route` matches a single exact path.
             //
@@ -240,7 +242,6 @@ fn main() {
             // able to change which rule matches (e.g. `/x/../dashboard`,
             // `/dashboard/..;/admin`) is rejected with 400. Allowed paths are forwarded unchanged. `GuardMode::RequireCanonical` is a stricter,
             // defense-in-depth alternative; `GuardMode::Disabled` disables it.
-            .guard_mode(GuardMode::RejectAmbiguous)
             .build()
             .expect("valid LoginProxy configuration")
     });

@@ -65,6 +65,6 @@ pub use scopes::HasScopes;
 pub use crate::method::MethodMatch;
 #[doc(no_inline)]
 pub use crate::path_confusion::{
-    CaseSensitivity, DecodeDepth, GuardMode, ResolveError, ResolveErrorKind, StructuralChar,
-    StructuralClass, StructuralClasses, StructuralProbe,
+    CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, ResolveError, ResolveErrorKind,
+    StructuralChar, StructuralClass, StructuralClasses, StructuralProbe,
 };

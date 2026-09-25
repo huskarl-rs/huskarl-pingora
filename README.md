@@ -108,13 +108,30 @@ at the prefix boundary. If that correspondence cannot be established, resolve
 and authorize the rewritten path with a guard configured for the destination
 rules before dispatching it.
 
+## Shared configuration
+
+Both `LoginProxy::builder()` and `Guard::builder()` require
+`.path_guard(GuardConfig::new(case_sensitivity, decode_depth))`. Configure the
+mode, additional structural classes, and analysis budget on that `GuardConfig`
+with `with_mode`, `with_structural_classes`, and `with_max_analysis_path_len`.
+These replace the separate `case_sensitivity`, `decode_depth`, `guard_mode`,
+`structural_classes`, and `max_analysis_path_len` builder setters.
+
+`GuardConfig` is re-exported by both `login` and `resource`, and is also
+available in `path_confusion`. Clone one configuration for guards with the same
+downstream parsing assumptions, or pass it directly to a
+`huskarl_route_guard::RuleRouter`. Sharing configuration does not share route
+rules: each layer still needs the authorization boundaries described above.
+Decode depth can differ by layer, so only reuse a configuration where its
+assumptions hold.
+
 ## Opt-in classes and encodings
 
 The always-on alphabet is encoded slash, dot-segments, `;`-matrix-params, and
 `%00`/raw-NUL truncation — the forms whose legitimate-traffic cost is near nil. A
 backend that considers *more* paths equivalent needs the matching toggle on
-[`StructuralClasses`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/struct.StructuralClasses.html), passed via the builder's
-`structural_classes`:
+[`StructuralClasses`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/struct.StructuralClasses.html), passed via
+`GuardConfig::with_structural_classes`:
 
 - [`with_backslash()`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/struct.StructuralClasses.html#method.with_backslash) — `\`/`%5C`
   as a separator (Windows/IIS);
@@ -128,11 +145,11 @@ backend that considers *more* paths equivalent needs the matching toggle on
 Each toggle is a per-deployment security decision: it is how you tell the guard
 which paths your backend considers equivalent. Example:
 `StructuralClasses::new().with_backslash()`. (Case and decode depth are **not**
-here — they are separate, required builder declarations; see below.)
+here — they are required arguments to `GuardConfig::new`; see below.)
 
 ## Decode depth
 
-The builder requires [`DecodeDepth`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.DecodeDepth.html), with no default.
+`GuardConfig::new` requires [`DecodeDepth`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.DecodeDepth.html), with no default.
 Declare `UpToOne` when downstream performs at most one whole-path percent decode,
 or `UpToTwo` when it may perform up to two. Count actual decoding passes across
 intermediaries and the origin, rather than the number of processes. More than
@@ -141,7 +158,7 @@ two passes are outside the supported model.
 ## Case-insensitive backends
 
 Path matching here is **case-sensitive** (and so is the route matcher), but whether that
-matches your upstream is a security fact the library cannot infer — so the builder
+matches your upstream is a security fact the library cannot infer — so `GuardConfig::new`
 **requires** you to declare it with
 [`CaseSensitivity`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.CaseSensitivity.html); there is no default. A case-folding
 upstream — IIS, ASP.NET, servlet containers on Windows, or anything serving files
@@ -166,9 +183,9 @@ so a differently-cased request can reach a route *without that route's checks*
 rejects recognized structural forms and complete percent escapes even within a
 uniform subtree. [`GuardMode::Disabled`](https://docs.rs/huskarl_route_guard/latest/huskarl_route_guard/config/enum.GuardMode.html#variant.Disabled)
 disables ambiguity analysis, but still validates path input and denies unlisted
-methods. Select the mode with `.guard_mode(...)`.
+methods. Select the mode with `GuardConfig::with_mode(...)`.
 
-`.max_analysis_path_len(...)` sets the analysis budget in original path bytes
+`GuardConfig::with_max_analysis_path_len(...)` sets the analysis budget in original path bytes
 (default: 8,192). With custom probes it applies to every path; disabled mode
 bypasses the budget. This is not an overall request-size limit.
 
@@ -187,7 +204,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl_pingora::{
-    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, Rule},
+    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, GuardConfig, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
         validator::rfc9068::Rfc9068Validator,
@@ -251,8 +268,10 @@ async fn main() {
     //    (`Rule::required()`), so the whole proxy is closed by default.
     let guard = Guard::builder()
         .validator(validator)
-        .case_sensitivity(CaseSensitivity::Sensitive) // required: declare backend case behavior
-        .decode_depth(DecodeDepth::UpToOne) // required: declare decode depth behind this layer
+        .path_guard(GuardConfig::new(
+            CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .subtree("/api", Rule::required().scopes(["api"])) // /api and below
         .route("/health", Rule::public()) // exactly /health
         .build()

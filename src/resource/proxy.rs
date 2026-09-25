@@ -153,7 +153,7 @@ fn split_resource_metadata(
 /// # Example
 ///
 /// ```
-/// # use huskarl_pingora::resource::{AuthProxy, CaseSensitivity, DecodeDepth, Guard, Rule};
+/// # use huskarl_pingora::resource::{AuthProxy, CaseSensitivity, DecodeDepth, GuardConfig, Guard, Rule};
 /// # fn build<V, P>(my_proxy: P, validator: V)
 /// # where
 /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -162,8 +162,7 @@ fn split_resource_metadata(
 /// let guard = Guard::builder()
 ///     .validator(validator)
 ///     .base_uri("https://gateway.example".parse().expect("valid URI"))
-///     .case_sensitivity(CaseSensitivity::Sensitive)
-///     .decode_depth(DecodeDepth::UpToOne)
+///     .path_guard(GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
 ///     .subtree("/public", Rule::public()) // /public and everything under it
 ///     .build()
 ///     .expect("route");
@@ -176,7 +175,7 @@ fn split_resource_metadata(
 /// publisher:
 ///
 /// ```
-/// # use huskarl_pingora::resource::{AudienceBinding, AuthProxy, CaseSensitivity, DecodeDepth, Guard, ResourceMetadataProxy};
+/// # use huskarl_pingora::resource::{AudienceBinding, AuthProxy, CaseSensitivity, DecodeDepth, GuardConfig, Guard, ResourceMetadataProxy};
 /// # fn build<V, P>(my_proxy: P, validator: V) -> Result<(), huskarl_pingora::resource::ConfigError>
 /// # where
 /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -185,8 +184,7 @@ fn split_resource_metadata(
 /// let guard = Guard::builder()
 ///     .validator(validator)
 ///     .base_uri("https://gateway.example".parse().expect("valid URI"))
-///     .case_sensitivity(CaseSensitivity::Sensitive)
-///     .decode_depth(DecodeDepth::UpToOne)
+///     .path_guard(GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
 ///     .build()?;
 /// let (proxy, metadata) = AuthProxy::new(my_proxy, guard)
 ///     .with_protected_resource(
@@ -715,8 +713,10 @@ mod tests {
         let mut builder = Guard::builder()
             .validator(validator)
             .base_uri(base_uri.parse().unwrap())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(crate::resource::DecodeDepth::UpToOne);
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ));
         for (pattern, rule) in routes {
             builder = builder.route(pattern, rule);
         }
@@ -869,8 +869,10 @@ mod tests {
         let payments_guard = Guard::builder()
             .validator(MockValidator(MockOutcome::Missing))
             .base_uri("https://api.example.com".parse().unwrap())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(crate::resource::DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ))
             .build()
             .unwrap();
         let (_payments, payments_metadata) = AuthProxy::new(InnerProxy::new(), payments_guard)
@@ -879,8 +881,10 @@ mod tests {
         let inventory_guard = Guard::builder()
             .validator(MockValidator(MockOutcome::Missing))
             .base_uri("https://api.example.com".parse().unwrap())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(crate::resource::DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ))
             .build()
             .unwrap();
         let (_inventory, inventory_metadata) = AuthProxy::new(InnerProxy::new(), inventory_guard)
@@ -917,8 +921,10 @@ mod tests {
                 vec!["https://api.example.com/mcp/inventory".to_owned()],
             )))
             .base_uri("https://api.example.com".parse().unwrap())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(crate::resource::DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ))
             .default(Rule::required().strip_credentials(false))
             .build()
             .unwrap();
@@ -929,8 +935,10 @@ mod tests {
         let payments_guard = Guard::builder()
             .validator(MockValidator(MockOutcome::Missing))
             .base_uri("https://api.example.com".parse().unwrap())
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(crate::resource::DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ))
             .build()
             .unwrap();
         let (payments, payments_metadata) = AuthProxy::new(InnerProxy::new(), payments_guard)
@@ -1036,8 +1044,10 @@ mod tests {
             .validator(MockValidator(MockOutcome::Missing))
             .base_uri("https://api.example.com/gateway".parse().unwrap())
             .strip_prefix("/internal")
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(crate::resource::DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ))
             .build()
             .unwrap();
         let (proxy, metadata) = AuthProxy::new(InnerProxy::new(), guard)
@@ -1238,8 +1248,10 @@ mod tests {
     fn protected_resource_requires_a_base_uri_and_relative_subpath() {
         let guard = Guard::builder()
             .validator(MockValidator(MockOutcome::Missing))
-            .case_sensitivity(crate::resource::CaseSensitivity::Sensitive)
-            .decode_depth(crate::resource::DecodeDepth::UpToOne)
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ))
             .build()
             .unwrap();
         let missing_base = AuthProxy::new(InnerProxy::new(), guard)

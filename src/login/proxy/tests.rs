@@ -39,7 +39,10 @@ use pingora_proxy::{ProxyHttp, Session};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use super::*;
-use crate::login::{LoginCtx, LoginRule};
+use crate::{
+    login::{LoginCtx, LoginRule},
+    path_confusion::DecodeDepth,
+};
 
 // ── Mock session ─────────────────────────────────────────────────
 
@@ -335,8 +338,10 @@ async fn build_proxy_with_routes(
     let mut builder = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(build_engine(store).await)
-        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_depth(crate::login::DecodeDepth::UpToOne);
+        .path_guard(crate::login::GuardConfig::new(
+            crate::login::CaseSensitivity::Sensitive,
+            crate::login::DecodeDepth::UpToOne,
+        ));
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
@@ -440,8 +445,10 @@ async fn subtree_required_covers_path_and_descendants() {
     let proxy = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(engine)
-        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::login::GuardConfig::new(
+            crate::login::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .subtree("/dashboard", LoginRule::required())
         .build()
         .expect("valid routes");
@@ -635,8 +642,10 @@ async fn cors_preflight_not_passed_through_when_disabled() {
     let proxy = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
-        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::login::GuardConfig::new(
+            crate::login::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .cors_passthrough(false)
         .build()
         .expect("valid routes");
@@ -1004,9 +1013,13 @@ async fn build_structural_proxy(
     let mut builder = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
-        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
-        .guard_mode(guard_mode);
+        .path_guard(
+            crate::login::GuardConfig::new(
+                crate::login::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_mode(guard_mode),
+        );
     for (pattern, rule) in routes {
         builder = builder.subtree(pattern, rule);
     }
@@ -1129,8 +1142,10 @@ async fn build_rejects_pattern_with_empty_segment() {
     let result = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
-        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::login::GuardConfig::new(
+            crate::login::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/a/b", LoginRule::public())
         .route("/a//b", LoginRule::required())
         .build();
@@ -1146,8 +1161,10 @@ async fn build_rejects_check_on_public_rule() {
     let result = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
-        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
+        .path_guard(crate::login::GuardConfig::new(
+            crate::login::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
         .route("/health", LoginRule::public().check(admin_only))
         .build();
 
@@ -1171,7 +1188,10 @@ mod store_backed {
     use huskarl_login::testing::InMemoryExternalSessionStore;
 
     use super::*;
-    use crate::login::{LoginProxy, PersistedSessionState, StoreBackedSessionStore};
+    use crate::{
+        login::{LoginProxy, PersistedSessionState, StoreBackedSessionStore},
+        path_confusion::DecodeDepth,
+    };
 
     // ── In-memory external store, keyed by session key, with call counters ──
 
@@ -1236,8 +1256,10 @@ mod store_backed {
         LoginProxy::builder()
             .inner(StoreInner::new())
             .engine(build_engine(store).await)
-            .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-            .decode_depth(DecodeDepth::UpToOne)
+            .path_guard(crate::login::GuardConfig::new(
+                crate::login::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            ))
             .build()
             .expect("valid routes")
     }
@@ -1394,9 +1416,13 @@ async fn disabled_guard_denies_method_gaps_with_public_default() {
     let proxy = LoginProxy::builder()
         .inner(InnerProxy::new())
         .engine(build_engine(MockSessionDriver::default()).await)
-        .case_sensitivity(crate::login::CaseSensitivity::Sensitive)
-        .decode_depth(DecodeDepth::UpToOne)
-        .guard_mode(crate::login::GuardMode::Disabled)
+        .path_guard(
+            crate::login::GuardConfig::new(
+                crate::login::CaseSensitivity::Sensitive,
+                DecodeDepth::UpToOne,
+            )
+            .with_mode(crate::login::GuardMode::Disabled),
+        )
         .default(LoginRule::public())
         .route("/admin", LoginRule::public().method(http::Method::GET))
         .build()
@@ -1406,4 +1432,54 @@ async fn disabled_guard_denies_method_gaps_with_public_default() {
     assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
     assert_eq!(read_status(&mut client).await, 403);
     assert!(!proxy.inner.was_forwarded());
+}
+
+#[tokio::test]
+async fn shared_path_guard_config_preserves_downstream_assumptions() {
+    use crate::login::{CaseSensitivity, GuardConfig, StructuralClasses};
+
+    let config = GuardConfig::new(CaseSensitivity::Insensitive, DecodeDepth::UpToTwo)
+        .with_structural_classes(StructuralClasses::new().with_backslash())
+        .with_max_analysis_path_len(32);
+    let router = RuleRouter::from_registrations(
+        false,
+        config.clone(),
+        [
+            PathRegistration::subtree("/public").all(true),
+            PathRegistration::subtree("/admin").all(false),
+        ],
+    )
+    .unwrap();
+    let proxy = LoginProxy::builder()
+        .inner(InnerProxy::new())
+        .engine(build_engine(MockSessionDriver::default()).await)
+        .path_guard(config)
+        .subtree("/public", LoginRule::public())
+        .subtree("/admin", LoginRule::required())
+        .build()
+        .unwrap();
+
+    for (path, allowed) in [
+        ("/public/file", true),
+        ("/PUBLIC/file", false),
+        ("/public%252ffile", false),
+        ("/public%5cfile", false),
+        ("/public/long-encoded-file-name%20here", false),
+    ] {
+        assert_eq!(
+            router.resolve(path, &http::Method::GET).is_ok(),
+            allowed,
+            "{path}"
+        );
+        let (mut session, mut client) = make_session("GET", path, "").await;
+        let mut ctx = proxy.inner.new_ctx();
+        assert_eq!(
+            proxy.request_filter(&mut session, &mut ctx).await.unwrap(),
+            !allowed,
+            "{path}"
+        );
+        if !allowed {
+            assert_eq!(read_status(&mut client).await, 400, "{path}");
+        }
+    }
 }

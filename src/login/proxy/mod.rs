@@ -37,9 +37,7 @@ use super::{
 };
 use crate::{
     method::MethodMatch,
-    path_confusion::{
-        CaseSensitivity, DecodeDepth, GuardMode, ResolveError, ResolveErrorKind, StructuralClasses,
-    },
+    path_confusion::{ResolveError, ResolveErrorKind},
 };
 
 #[cfg(test)]
@@ -91,7 +89,7 @@ mod tests;
 /// # use std::sync::Arc;
 /// # use huskarl::grant::authorization_code::AuthorizationCodeGrant;
 /// # use huskarl_pingora::login::{
-/// #     CaseSensitivity, DecodeDepth, HasLoginSession, LoginConfig, LoginEngine, LoginProxy,
+/// #     CaseSensitivity, DecodeDepth, GuardConfig, HasLoginSession, LoginConfig, LoginEngine, LoginProxy,
 /// #     LoginRule, SessionDriver,
 /// # };
 /// # use pingora_proxy::ProxyHttp;
@@ -120,8 +118,7 @@ mod tests;
 /// let proxy = LoginProxy::builder()
 ///     .inner(my_upstream)
 ///     .engine(engine)
-///     .case_sensitivity(CaseSensitivity::Sensitive) // required: declare backend case behavior
-///     .decode_depth(DecodeDepth::UpToOne) // required: declare decode depth behind this layer
+///     .path_guard(GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
 ///     // Defaults to `LoginRule::required()` for paths that don't match.
 ///     // `subtree` covers a path and everything beneath it; `route` is one
 ///     // exact path.
@@ -175,30 +172,11 @@ where
         /// unless explicitly opened up.
         #[builder(default)]
         default: LoginRule<SD::SessionType>,
-        /// Whether the upstream resolves paths **case-insensitively** — a required
-        /// declaration the library cannot infer (see [`CaseSensitivity`]). There is no
-        /// default: every deployment must state it, because a case-folding backend
-        /// turns a differently-cased path into a route-confusion vector.
-        case_sensitivity: CaseSensitivity,
-        /// Whether more than one percent-decode pass happens behind this layer — a
-        /// CDN, WAF, or second proxy decoding in front of the upstream (see
-        /// [`DecodeDepth`]). Required, no default: decode depth is a deployment assumption
-        /// the library will not guess. When unsure, declare
-        /// [`UpToTwo`](DecodeDepth::UpToTwo) — the safe, deny-more direction.
-        decode_depth: DecodeDepth,
-        /// Which path-confusion guard to apply — denies requests whose path a
-        /// normalizing backend could route to a different rule than the one matched
-        /// on the raw path. Defaults to [`GuardMode::RejectAmbiguous`].
-        #[builder(default)]
-        guard_mode: GuardMode,
-        /// The structural classes and encodings the guard recognises beyond the
-        /// built-in classes. Defaults to [`StructuralClasses::new`].
-        #[builder(default)]
-        structural_classes: StructuralClasses,
-        /// Maximum original path length in bytes for ambiguity analysis.
-        /// With custom probes this applies to every path. Disabled mode bypasses it.
-        #[builder(default = 8192)]
-        max_analysis_path_len: usize,
+        /// Path-confusion configuration, including the required downstream case
+        /// sensitivity and decode depth. There is no default: declare these
+        /// assumptions with [`GuardConfig::new`]. Clone the configuration to share
+        /// it with other guards that have the same downstream parsing assumptions.
+        path_guard: GuardConfig,
         /// Decides how to react when the post-response session persist fails.
         ///
         /// Defaults to [`DefaultPersistFailurePolicy`]: fail closed when the
@@ -238,10 +216,6 @@ where
             return Err(RouteConfigError::PublicRuleWithCheck("<default>".into()));
         }
 
-        let config = GuardConfig::new(case_sensitivity, decode_depth)
-            .with_mode(guard_mode)
-            .with_structural_classes(structural_classes)
-            .with_max_analysis_path_len(max_analysis_path_len);
         let registrations = routes.into_iter().map(|(kind, pattern, rule)| {
             let method = rule.method_match().clone();
             let registration = match kind {
@@ -254,7 +228,7 @@ where
                 MethodMatch::OneOf(methods) => registration.methods(methods, rule),
             }
         });
-        let routes = RuleRouter::from_registrations(default, config, registrations)?;
+        let routes = RuleRouter::from_registrations(default, path_guard, registrations)?;
         Ok(Self {
             inner,
             engine,

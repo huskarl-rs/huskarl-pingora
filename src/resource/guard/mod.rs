@@ -16,9 +16,7 @@ use pingora_proxy::Session;
 use crate::{
     method::MethodMatch,
     metrics::CheckOutcome,
-    path_confusion::{
-        CaseSensitivity, DecodeDepth, GuardMode, ResolveError, ResolveErrorKind, StructuralClasses,
-    },
+    path_confusion::{ResolveError, ResolveErrorKind},
     resource::{
         error::{ConfigError, CustomCheckError, InvalidRequest, InvalidToken},
         outcome::Outcome,
@@ -73,7 +71,7 @@ pub struct ClientCertDer(pub Vec<u8>);
 /// # Example
 ///
 /// ```
-/// # use huskarl_pingora::resource::{CaseSensitivity, DecodeDepth, Guard, Rule};
+/// # use huskarl_pingora::resource::{CaseSensitivity, DecodeDepth, GuardConfig, Guard, Rule};
 /// # fn build<V>(my_validator: V)
 /// # where
 /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -83,8 +81,7 @@ pub struct ClientCertDer(pub Vec<u8>);
 ///     .validator(my_validator)
 ///     // Required: declare whether the upstream folds path case, and whether a
 ///     // decoding layer (CDN/WAF) sits in front of it.
-///     .case_sensitivity(CaseSensitivity::Sensitive)
-///     .decode_depth(DecodeDepth::UpToOne)
+///     .path_guard(GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
 ///     // `subtree` protects a path and everything beneath it (the usual intent).
 ///     .subtree("/admin", Rule::required().scopes(["admin"]))
 ///     .subtree("/public", Rule::public())
@@ -176,30 +173,11 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         /// Defaults to [`Rule::required()`].
         #[builder(default)]
         default: Rule<V::Claims>,
-        /// Whether the upstream resolves paths **case-insensitively** — a required
-        /// declaration the library cannot infer (see [`CaseSensitivity`]). There is no
-        /// default: every deployment must state it, because a case-folding backend
-        /// turns a differently-cased path into a route-confusion vector.
-        case_sensitivity: CaseSensitivity,
-        /// Whether more than one percent-decode pass happens behind this layer — a
-        /// CDN, WAF, or second proxy decoding in front of the upstream (see
-        /// [`DecodeDepth`]). Required, no default: decode depth is a deployment assumption
-        /// the library will not guess. When unsure, declare
-        /// [`UpToTwo`](DecodeDepth::UpToTwo) — the safe, deny-more direction.
-        decode_depth: DecodeDepth,
-        /// Which path-confusion guard to apply — denies requests whose path a
-        /// normalizing backend could route to a different rule than the one matched
-        /// on the raw path. Defaults to [`GuardMode::RejectAmbiguous`].
-        #[builder(default)]
-        guard_mode: GuardMode,
-        /// The structural classes and encodings the guard recognises beyond the
-        /// built-in classes. Defaults to [`StructuralClasses::new`].
-        #[builder(default)]
-        structural_classes: StructuralClasses,
-        /// Maximum original path length in bytes for ambiguity analysis.
-        /// With custom probes this applies to every path. Disabled mode bypasses it.
-        #[builder(default = 8192)]
-        max_analysis_path_len: usize,
+        /// Path-confusion configuration, including the required downstream case
+        /// sensitivity and decode depth. There is no default: declare these
+        /// assumptions with [`GuardConfig::new`]. Clone the configuration to share
+        /// it with other guards that have the same downstream parsing assumptions.
+        path_guard: GuardConfig,
         /// Optional value for the `name` label on emitted metrics (the
         /// `huskarl.resource.check` counter). Set it to tell guard instances apart when
         /// one process runs several; leave unset to omit the label.
@@ -236,10 +214,6 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         all_scopes.extend(default.scopes.iter().cloned());
         let scopes_supported: Vec<String> = all_scopes.into_iter().collect();
 
-        let config = GuardConfig::new(case_sensitivity, decode_depth)
-            .with_mode(guard_mode)
-            .with_structural_classes(structural_classes)
-            .with_max_analysis_path_len(max_analysis_path_len);
         let registrations = routes.into_iter().map(|(kind, pattern, rule)| {
             let method = rule.method.clone();
             let registration = match kind {
@@ -252,7 +226,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 MethodMatch::OneOf(methods) => registration.methods(methods, rule),
             }
         });
-        let routes = RuleRouter::from_registrations(default, config, registrations)?;
+        let routes = RuleRouter::from_registrations(default, path_guard, registrations)?;
 
         Ok(Self {
             validator,
@@ -303,7 +277,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
     /// subtree's catch-all, so you can layer exceptions:
     ///
     /// ```
-    /// # use huskarl_pingora::resource::{CaseSensitivity, DecodeDepth, Guard, Rule};
+    /// # use huskarl_pingora::resource::{CaseSensitivity, DecodeDepth, GuardConfig, Guard, Rule};
     /// # fn build<V>(my_validator: V)
     /// # where
     /// #     V: huskarl_pingora::resource_server::validator::AccessTokenValidator
@@ -311,8 +285,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
     /// # {
     /// let guard = Guard::builder()
     ///     .validator(my_validator)
-    ///     .case_sensitivity(CaseSensitivity::Sensitive)
-    ///     .decode_depth(DecodeDepth::UpToOne)
+    ///     .path_guard(GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
     ///     .subtree("/admin", Rule::required().scopes(["admin"]))
     ///     .route("/admin/health", Rule::public()) // exact carve-out wins
     ///     .build()
