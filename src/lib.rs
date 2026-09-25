@@ -49,14 +49,14 @@
 //!
 //! # Path confusion
 //!
-//! Rules are matched on the request path, but the **raw** path is forwarded
-//! upstream. If the proxy and the upstream disagree about what a path *means* —
+//! Rules are matched on the request path, which huskarl leaves unchanged.
+//! If the proxy and the upstream disagree about what a path *means* —
 //! a parser differential — a request can be authorized as one path while the
 //! upstream acts on another (`/x/../admin/secret`, `/admin%2fsecret`,
 //! `/admin/..;/secret`, …). Both proxies guard against this automatically, and
-//! it is **on by default**. The guard only ever *detects*: it denies with `400`,
-//! or allows and forwards the **raw** path unchanged — nothing synthesized ever
-//! reaches the upstream.
+//! it is **on by default**. The guard only ever *detects*: it denies the request
+//! or allows it without rewriting the path. An inner proxy can still rewrite it;
+//! see the forwarding and rewrite contract below.
 //!
 //! The default [`GuardMode::RejectAmbiguous`](path_confusion::GuardMode::RejectAmbiguous)
 //! checks whether the configured downstream parsing behaviors could select a
@@ -76,6 +76,41 @@
 //! Method-specific rules deny unlisted methods with `403 Forbidden`, even if
 //! the default rule is public. Register an all-method rule at the same path to
 //! supply an explicit fallback policy.
+//!
+//! ## Authorization across layers
+//!
+//! The path guard checks ambiguity against this proxy's configured rules only.
+//! A `LoginProxy` with only a default rule still enforces that login policy and
+//! performs input checks, but its ambiguity analysis cannot distinguish finer
+//! permission boundaries enforced by inner handlers. For example, if an inner
+//! handler restricts `/downloads/private` more than `/downloads/public`, a
+//! single outer login rule does not protect that distinction from path confusion.
+//!
+//! Represent those boundaries in the guarding layer's rule table, or guard them
+//! in the layer that makes the authorization decision, using its own rules and
+//! downstream parsing assumptions. Passing the outer guard does not establish
+//! that a path is unambiguous for every inner authorization decision.
+//!
+//! ## Forwarding and rewrite contract
+//!
+//! The baseline contract is to forward the checked path unchanged. The guard
+//! analyzes downstream parsing of that path; it does not model arbitrary rewrites
+//! performed by an inner proxy such as `RouterProxy`.
+//!
+//! A prefix replacement can preserve the guarantee only when every downstream
+//! interpretation of the rewritten path remains within the authorization policy
+//! checked before the rewrite. The rule table must cover the corresponding
+//! boundaries in the original path namespace, and the declared case sensitivity,
+//! decode depth, and structural classes must cover the full downstream pipeline,
+//! including any parsing performed by the rewrite itself.
+//!
+//! Applying the same prefix replacement consistently is not sufficient by itself:
+//! removing a prefix can change where `..` resolves, and decoding before selecting
+//! a prefix can change which rewrite applies. Verify the actual guard, rewrite,
+//! and downstream routing together, including encoded separators and traversal
+//! at the prefix boundary. If that correspondence cannot be established, resolve
+//! and authorize the rewritten path with a guard configured for the destination
+//! rules before dispatching it.
 //!
 //! ## Opt-in classes and encodings
 //!
