@@ -44,17 +44,17 @@ huskarl-route-guard = { version = "0.1", path = "../huskarl-route-guard", option
 bytes = { version = "1", optional = true }
 http = "1"
 log = "0.4"
-pingora-proxy-delegate = { version = "0.2", path = "../../personal/pingora-proxy-delegate" }
-pingora-error = "0.8"
-pingora-http = "0.8"
-pingora-proxy = { version = "0.8", default-features = false }
-pingora-cache = "0.8.0"
+pingora-proxy-delegate = { version = "0.2" }
+pingora-error = "0.9"
+pingora-http = "0.9"
+pingora-proxy = { version = "0.9", default-features = false }
+pingora-cache = "0.9"
 tokio = { version = "1", features = ["sync"] }
 
 # resource feature
 bon = { version = "3.9", optional = true }
 huskarl-resource-server = { version = "0.11", path = "../huskarl/huskarl-resource-server", default-features = false, optional = true }
-pingora-core = { version = "0.8", default-features = false, optional = true }
+pingora-core = { version = "0.9", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
 metrics = { version = "0.24", default-features = false, optional = true }
 strum = { version = "0.27", default-features = false, features = ["derive"], optional = true }
@@ -69,8 +69,8 @@ huskarl-resource-server = { version = "0.11", path = "../huskarl/huskarl-resourc
 huskarl-reqwest = { version = "0.9", path = "../huskarl/huskarl-reqwest", features = ["rustls-tls"] }
 huskarl-crypto-native = { version = "0.11", path = "../huskarl/huskarl-crypto-native" }
 hex = "0.4"
-pingora-core = { version = "0.8", features = ["rustls"] }
-pingora-proxy-router = { version = "0.1", path = "../../personal/pingora-proxy-delegate/router" }
+pingora-core = { version = "0.9", features = ["rustls"] }
+pingora-proxy-router = { version = "0.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util"] }
 url = "2"
 env_logger = "0.11"

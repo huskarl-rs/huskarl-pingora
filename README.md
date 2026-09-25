@@ -73,6 +73,11 @@ Method-specific rules deny unlisted methods with `403 Forbidden`, even if
 the default rule is public. Register an all-method rule at the same path to
 supply an explicit fallback policy.
 
+Integrations that resolve routes directly can use
+[`path_confusion::resolve_error_status`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/path_confusion/fn.resolve_error_status.html) to match both proxies: invalid or
+ambiguous input returns `400`, a missing method policy returns `403`, and an
+internal routing failure returns `500`.
+
 ## Authorization across layers
 
 The path guard checks ambiguity against this proxy's configured rules only.

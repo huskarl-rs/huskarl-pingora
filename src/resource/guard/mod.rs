@@ -16,7 +16,7 @@ use pingora_proxy::Session;
 use crate::{
     method::MethodMatch,
     metrics::CheckOutcome,
-    path_confusion::{ResolveError, ResolveErrorKind},
+    path_confusion::{ResolveError, ResolveErrorKind, resolve_error_status},
     resource::{
         error::{ConfigError, CustomCheckError, InvalidRequest, InvalidToken},
         outcome::Outcome,
@@ -343,29 +343,23 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         metadata: &ValidatorMetadata,
         reason: &ResolveError,
     ) -> (Outcome<V::Claims>, CheckOutcome) {
-        match reason.kind() {
+        let (challenges, outcome) = match reason.kind() {
             ResolveErrorKind::InvalidInput => (
-                Self::bad_request_with_metadata(metadata, reason.message()),
+                metadata.challenges(Some(&InvalidRequest(reason.message())), None, None),
                 CheckOutcome::PathConfusion,
             ),
-            kind => (
-                Outcome::Deny {
-                    status: if kind == ResolveErrorKind::PolicyDenied {
-                        http::StatusCode::FORBIDDEN
-                    } else {
-                        http::StatusCode::INTERNAL_SERVER_ERROR
-                    },
-                    challenges: Vec::new(),
-                    dpop_nonce: None,
-                    retry_after: None,
-                },
-                if kind == ResolveErrorKind::PolicyDenied {
-                    CheckOutcome::PolicyDenied
-                } else {
-                    CheckOutcome::ServerError
-                },
-            ),
-        }
+            ResolveErrorKind::PolicyDenied => (Vec::new(), CheckOutcome::PolicyDenied),
+            ResolveErrorKind::Internal => (Vec::new(), CheckOutcome::ServerError),
+        };
+        (
+            Outcome::Deny {
+                status: resolve_error_status(reason),
+                challenges,
+                dpop_nonce: None,
+                retry_after: None,
+            },
+            outcome,
+        )
     }
 
     /// Builds metadata advertisement for one RFC 9728 protected resource.

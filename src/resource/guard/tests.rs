@@ -1772,6 +1772,43 @@ async fn rejection_builds_exactly_one_challenge() {
     );
 }
 
+#[test]
+fn route_denial_preserves_challenges_and_metrics() {
+    let metadata = mock_validator_metadata(None);
+    for (error, expected_metric, has_challenges) in [
+        (
+            ResolveError::InvalidPathInput,
+            CheckOutcome::PathConfusion,
+            true,
+        ),
+        (
+            ResolveError::MethodNotConfigured,
+            CheckOutcome::PolicyDenied,
+            false,
+        ),
+        (
+            ResolveError::InvalidRuleId,
+            CheckOutcome::ServerError,
+            false,
+        ),
+    ] {
+        let (outcome, metric) = Guard::<MockValidator>::route_denial(&metadata, &error);
+        assert_eq!(metric, expected_metric);
+        assert_deny(&outcome, resolve_error_status(&error));
+        if let Outcome::Deny {
+            challenges,
+            dpop_nonce,
+            retry_after,
+            ..
+        } = outcome
+        {
+            assert_eq!(!challenges.is_empty(), has_challenges);
+            assert!(dpop_nonce.is_none());
+            assert!(retry_after.is_none());
+        }
+    }
+}
+
 /// The full classification table. `Expired` is unreachable through a challenge (it is
 /// RFC 6750 `invalid_token` on the wire), so only a validator that overrides
 /// `validation_outcome` reports it — covered here rather than end-to-end.

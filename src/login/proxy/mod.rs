@@ -37,7 +37,7 @@ use super::{
 };
 use crate::{
     method::MethodMatch,
-    path_confusion::{ResolveError, ResolveErrorKind},
+    path_confusion::{ResolveError, resolve_error_status},
 };
 
 #[cfg(test)]
@@ -341,11 +341,7 @@ where
         reason: &ResolveError,
     ) -> Result<bool> {
         log::warn!("route guard denied {path:?}: {reason}");
-        let status = match reason.kind() {
-            ResolveErrorKind::InvalidInput => http::StatusCode::BAD_REQUEST,
-            ResolveErrorKind::PolicyDenied => http::StatusCode::FORBIDDEN,
-            ResolveErrorKind::Internal => http::StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        let status = resolve_error_status(reason);
         let resp = self.engine.render_error(status, reason.message());
         write_login_response(session, resp, vec![]).await?;
         Ok(true)

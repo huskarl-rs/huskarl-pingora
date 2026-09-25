@@ -77,6 +77,11 @@
 //! the default rule is public. Register an all-method rule at the same path to
 //! supply an explicit fallback policy.
 //!
+//! Integrations that resolve routes directly can use
+//! [`path_confusion::resolve_error_status`] to match both proxies: invalid or
+//! ambiguous input returns `400`, a missing method policy returns `403`, and an
+//! internal routing failure returns `500`.
+//!
 //! ## Authorization across layers
 //!
 //! The path guard checks ambiguity against this proxy's configured rules only.
@@ -296,10 +301,8 @@ pub mod resource;
 /// Re-export of [`huskarl_resource_server`] for convenience.
 #[cfg(feature = "resource")]
 pub use huskarl_resource_server as resource_server;
-/// Re-export of [`huskarl_route_guard`]'s path-confusion configuration — the
-/// routing and path-confusion engine both proxies are built on.
 #[cfg(any(feature = "resource", feature = "login"))]
-pub use huskarl_route_guard::config as path_confusion;
+pub mod path_confusion;
 
 #[cfg(any(feature = "resource", feature = "login"))]
 mod method;
