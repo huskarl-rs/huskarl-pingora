@@ -63,3 +63,6 @@ the [explanations](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/
 For discovery setup and multiple resources, follow
 [Publish protected-resource metadata](docs/how_to/resource_metadata.md) and the
 [runnable two-resource example](examples/multi_resource_proxy.rs).
+
+Start with the [example progression](examples/README.md): one resource, multiple
+resources, custom publication, then browser login and rewritten deployments.

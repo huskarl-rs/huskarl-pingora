@@ -18,7 +18,11 @@
 //! Open http://localhost:6188/dashboard to sign in, then use its Sign out form.
 //! Full walkthrough: `docs/tutorial/browser_login.md`.
 //!
+//! For rewritten deployments, see examples/README.md (PUBLIC_BASE and INCOMING_PREFIX).
+//!
 //! Environment variables:
+//!   - `PUBLIC_BASE` — Public application base URL (default: REDIRECT_URI origin)
+//!   - `INCOMING_PREFIX` — Prefix received by this process (default: `/`)
 //!   - `ISSUER`        — Authorization server issuer URL (required)
 //!   - `CLIENT_ID`     — OAuth2 client ID (required)
 //!   - `REDIRECT_URI`  — Callback URL registered with the AS (required)
@@ -118,8 +122,6 @@ fn set_identity_header(
     Ok(())
 }
 
-// ── AES key ───────────────────────────────────────────────────────────────────
-
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -136,6 +138,26 @@ fn main() {
     );
     let upstream = std::env::var("UPSTREAM").unwrap_or_else(|_| "127.0.0.1:3001".into());
     let upstream_tls = std::env::var("UPSTREAM_TLS").is_ok();
+    let mapping = huskarl_login::core::url_mapping::PublicUrlMapping::new(
+        &std::env::var("PUBLIC_BASE").unwrap_or(base_url.clone()),
+        &std::env::var("INCOMING_PREFIX").unwrap_or_else(|_| "/".into()),
+    )
+    .expect("invalid public/ingress URL mapping");
+    let callback = huskarl_login::url::callback_path(
+        &mapping,
+        &redirect_uri.parse().expect("invalid redirect URI"),
+        None,
+    )
+    .expect("callback URL must be covered by the mapping");
+    // Application route names are relative to the public base; mount them in
+    // the coordinates actually received by this process.
+    let incoming_path = |path: &str| {
+        mapping
+            .incoming_uri(&mapping.resource_url(path).expect("valid application path"))
+            .expect("application path must round-trip")
+            .path()
+            .to_owned()
+    };
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| "127.0.0.1:6188".into());
 
     // Use a temporary runtime for async setup, then drop it before
@@ -181,15 +203,21 @@ fn main() {
             .build();
 
         let login_config = LoginConfig::builder()
-            .callback_path(parsed_redirect.path().to_owned())
+            .url_mapping(mapping.clone())
+            .callback_path(callback.as_str().to_owned())
             .scope(vec!["openid".to_owned()])
             // Cookie sessions carry the refresh token, so bound the session
             // lifetime crate-side rather than delegating to the auth server.
             .session_lifetime(SessionLifetime::Bounded(std::time::Duration::from_hours(8)))
             .logout(
                 LogoutConfig::builder()
-                    .path("/logout")
-                    .post_logout_redirect_uri(format!("{base_url}/signed-out"))
+                    .path(incoming_path("/logout"))
+                    .post_logout_redirect_uri(
+                        mapping
+                            .resource_url("/signed-out")
+                            .expect("signed-out URL")
+                            .to_string(),
+                    )
                     .build()
                     .expect("failed to build logout config"),
             )
@@ -228,13 +256,13 @@ fn main() {
             //
             // Protect the whole dashboard area — `/dashboard`, `/dashboard/`,
             // and every page under it.
-            .subtree("/dashboard", LoginRule::required())
+            .subtree(&incoming_path("/dashboard"), LoginRule::required())
             // Liveness probe — exact path, skip session handling entirely.
-            .route("/health", LoginRule::public())
-            .route("/signed-out", LoginRule::public())
+            .route(incoming_path("/health"), LoginRule::public())
+            .route(incoming_path("/signed-out"), LoginRule::public())
             // Landing page — exact path; render publicly but personalize if the
             // user is already signed in.
-            .route("/", LoginRule::optional())
+            .route(incoming_path("/"), LoginRule::optional())
             // Everything else falls through to the default (`required`),
             // redirecting unauthenticated browsers through the auth-code flow.
             //
@@ -257,7 +285,10 @@ fn main() {
 
     println!("Listening on {listen}, forwarding to {upstream}");
     println!("Callback URL: {redirect_uri}");
-    println!("Logout URL:   {base_url}/logout");
+    println!(
+        "Logout URL:   {}",
+        mapping.resource_url("/logout").expect("logout URL")
+    );
     server.run_forever();
 }
 

@@ -40,8 +40,8 @@
 //! those independent proxies behind a `ProxyHttp` router. Publish the returned
 //! metadata endpoints through a separate router branch so metadata requests do
 //! not enter any resource server's early-filter lifecycle. See the
-//! `multi_resource_proxy` example for a complete two-validator, two-upstream
-//! Pingora server using `pingora-proxy-router`.
+//! `multi_resource_proxy` example for built-in assembly, or `publication_proxy`
+//! for server-owned routing using `pingora-proxy-router`.
 //!
 //! [RFC 9728]: https://datatracker.ietf.org/doc/html/rfc9728
 

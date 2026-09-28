@@ -112,7 +112,7 @@ forwarded requests.
 
 ## Complete Pingora consumer
 
-The [multi-resource example](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/multi_resource_proxy.rs)
+The [advanced publication example](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/publication_proxy.rs)
 consumes metadata contributions in its own server router and optionally serves
 an operator-supplied `security.txt` alongside them. Its router checks resource
 relationships, reserves exact publication paths for all methods, and rejects

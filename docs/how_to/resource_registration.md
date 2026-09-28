@@ -37,7 +37,7 @@ checks consistency. `build` consumes the fallback route, application route-slot
 lens, and a server-wide `GuardConfig`. Path ambiguity is checked before selecting
 a branch or invoking its early hooks. The existing router still owns hook
 delegation and module initialization. For composition with unrelated public
-endpoints, the `multi_resource_proxy` example consumes the contributions directly
+endpoints, the advanced `publication_proxy` example consumes the contributions directly
 in its own server router, alongside an operator-supplied `security.txt`.
 
 Metadata publication has an independent mapping. For the resource above, its

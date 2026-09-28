@@ -91,6 +91,14 @@ name = "jwt_proxy"
 required-features = ["resource"]
 
 [[example]]
+name = "resource_proxy"
+required-features = ["resource"]
+
+[[example]]
+name = "publication_proxy"
+required-features = ["resource"]
+
+[[example]]
 name = "multi_resource_proxy"
 required-features = ["resource"]
 

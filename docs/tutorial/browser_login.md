@@ -114,3 +114,10 @@ window. Rotation and concurrent refresh require their own deployment checks.
 - [Troubleshoot a proxy](crate::_docs::how_to::troubleshooting).
 - For refresh deployment, use the shared
   [rotation guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/rotation/).
+
+## Rewritten deployments
+
+The example also accepts `PUBLIC_BASE` and `INCOMING_PREFIX`. It derives the
+callback using the shared mapping and mounts application and logout routes in
+ingress coordinates. See the [worked mapping example](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/README.md#browser-login-and-rewrites)
+before adapting the localhost setup to a front proxy.

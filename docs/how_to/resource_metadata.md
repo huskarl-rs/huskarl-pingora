@@ -99,23 +99,23 @@ enforce operation permissions, add scoped rules to each guard as in the
 single-resource setup above. Metadata and unauthenticated challenge checks do
 not require healthy upstreams; successful forwarding does.
 
-The example's listener and upstream connections are plain HTTP; terminate public
-HTTPS at a trusted entry point. `PUBLIC_BASE` may include a public path prefix.
-`INCOMING_PREFIX` describes the application ingress prefix and
-`METADATA_INCOMING_PREFIX` separately describes the metadata ingress prefix; both
-default to `/`. Configure the front proxy to perform those rewrites.
-Pingora supports resource identifiers containing queries; its publisher matches
-the derived endpoint's path and query exactly.
+The simple example uses an origin-root `PUBLIC_BASE` and no ingress rewrite.
+Its listener and upstream connections are plain HTTP; terminate public HTTPS at
+a trusted entry point. For rewrites or publication alongside other well-known
+endpoints, use the advanced example below.
 
 ## Publish alongside security.txt
 
-The example owns its server router and consumes the metadata returned by each
+The advanced `publication_proxy` example owns its server router and consumes the metadata returned by each
 `AuthProxy`, independently of `ResourceAssembly`. Set `SECURITY_TXT_FILE` to an
 operator-maintained UTF-8 file to add `/.well-known/security.txt`. The server
 loads the file at startup; restart to publish changes. Supply a valid security.txt
 with your contact details and expiry. The example serves its bytes without
 validating the document, and advertises a one-hour cache lifetime.
 
+`PUBLIC_BASE` may include a public prefix in this advanced example.
+`INCOMING_PREFIX` describes the application ingress prefix;
+`METADATA_INCOMING_PREFIX` describes publication ingress. Both default to `/`.
 Both publications share the configured metadata ingress mapping in this example;
 that is a deployment choice, not a library requirement. Other well-known paths
 are left to the server's fallback. Unknown queries on a reserved OAuth metadata
@@ -130,7 +130,7 @@ PUBLIC_BASE=https://api.example.com/gateway \
 INCOMING_PREFIX=/edge \
 METADATA_INCOMING_PREFIX=/discovery \
 SECURITY_TXT_FILE=/etc/my-service/security.txt \
-cargo run --example multi_resource_proxy --features resource
+cargo run --example publication_proxy --features resource
 ```
 
 The front proxy must implement these mappings:
@@ -149,7 +149,7 @@ The example does not rewrite forwarded upstream paths.
 Run the example's integration tests without issuer or upstream services:
 
 ```sh
-cargo test --example multi_resource_proxy
+cargo test --example publication_proxy
 ```
 
 They drive the server router through Pingora's real HTTP request runner using
