@@ -27,55 +27,27 @@ pub(crate) fn request_uri(
     let Some(base) = base_uri else {
         return Some(req_uri.clone());
     };
+    let mapping = crate::resource_server::core::url_mapping::PublicUrlMapping::new(
+        &base.to_string(),
+        strip_prefix.unwrap_or("/"),
+    )
+    .ok()?;
+    legacy_request_uri(&mapping, req_uri)
+}
 
-    let req_path = req_uri.path();
-    let stripped = match strip_prefix {
-        Some(prefix) => {
-            // Only strip when the prefix ends at a segment boundary, so that
-            // `/proxy` matches `/proxy` and `/proxy/...` but not `/proxyX`.
-            // A raw byte-prefix match would collapse `/proxyX` and `/proxy/X`
-            // onto the same reconstructed URI, weakening DPoP `htu` binding.
-            match req_path.strip_prefix(prefix) {
-                Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
-                _ => {
-                    log::warn!("strip_prefix {prefix:?} did not match request path {req_path:?}");
-                    return None;
-                }
-            }
-        }
-        None => req_path,
-    };
-
-    let base_path = base.path().trim_end_matches('/');
-    let new_path = if stripped.starts_with('/') {
-        format!("{base_path}{stripped}")
+/// Keeps the joining slash when a legacy ingress prefix consumes the whole path.
+pub(crate) fn legacy_request_uri(
+    mapping: &crate::resource_server::core::url_mapping::PublicUrlMapping,
+    req_uri: &http::Uri,
+) -> Option<http::Uri> {
+    if req_uri.path() == mapping.incoming_prefix() {
+        let subpath = req_uri
+            .query()
+            .map_or_else(|| "/".to_owned(), |q| format!("/?{q}"));
+        mapping.resource_url(&subpath).ok()
     } else {
-        format!("{base_path}/{stripped}")
-    };
-
-    let path_and_query = match req_uri.query() {
-        Some(q) => format!("{new_path}?{q}"),
-        None => new_path,
-    };
-
-    let mut parts = http::uri::Parts::default();
-    parts.scheme = base.scheme().cloned();
-    parts.authority = base.authority().cloned();
-    parts.path_and_query = match path_and_query.parse() {
-        Ok(pq) => Some(pq),
-        Err(e) => {
-            log::warn!("failed to parse reconstructed path_and_query {path_and_query:?}: {e}");
-            return None;
-        }
-    };
-    http::Uri::from_parts(parts)
-        .map_err(|e| {
-            log::warn!(
-                "failed to reconstruct DPoP URI from base {base:?} and path {path_and_query:?}: {e}"
-            );
-            e
-        })
-        .ok()
+        mapping.public_url(req_uri).ok()
+    }
 }
 
 #[cfg(test)]

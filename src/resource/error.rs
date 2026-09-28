@@ -33,6 +33,8 @@ pub enum ConfigError {
     PublicRuleWithConstraints(String),
     /// Failed to serialize resource metadata.
     Metadata(serde_json::Error),
+    /// Invalid mapping between ingress paths and public URLs.
+    UrlMapping(crate::resource_server::core::url_mapping::MappingError),
     /// Validator metadata unexpectedly could not produce a resource document.
     ResourceMetadataDocumentUnavailable,
     /// The derived RFC 9728 resource identifier is invalid.
@@ -133,6 +135,7 @@ impl std::fmt::Display for ConfigError {
                  that can never be enforced: the token validator is not called for public routes"
             ),
             Self::Metadata(_) => f.write_str("failed to serialize resource metadata"),
+            Self::UrlMapping(source) => write!(f, "invalid public URL mapping: {source}"),
             Self::ResourceMetadataDocumentUnavailable => {
                 f.write_str("validator metadata could not produce an RFC 9728 document")
             }
@@ -201,6 +204,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Metadata(e) => Some(e),
+            Self::UrlMapping(e) => Some(e),
             Self::ResourceMetadataUrl { source, .. } => Some(source),
             Self::Route { .. }
             | Self::PublicRuleWithConstraints(_)

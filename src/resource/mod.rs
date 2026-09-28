@@ -73,3 +73,6 @@ pub use crate::path_confusion::{
     CaseSensitivity, DecodeDepth, GuardConfig, GuardMode, ResolveError, ResolveErrorKind,
     StructuralChar, StructuralClass, StructuralClasses, StructuralProbe,
 };
+
+/// Validated assembly of independently authenticated resources.
+pub mod assembly;

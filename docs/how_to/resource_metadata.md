@@ -8,6 +8,11 @@ You need a trusted public HTTPS origin, a validator for each resource, and the
 audiences your provider puts in access tokens. A logical resource can have many
 endpoints; it gets one metadata document, not one per endpoint.
 
+To integrate with an existing server or export metadata for a separate publisher,
+use [publication contributions](crate::_docs::how_to::publication_contributions).
+
+For a server hosting several resources, prefer the [shared registration assembly](crate::_docs::how_to::resource_registration). It derives mounts and metadata from one validated definition; the lower-level APIs below remain available for custom routing.
+
 ## Choose identifiers and audiences
 
 For an origin of `https://api.example.com`, this guide uses:
@@ -66,7 +71,7 @@ protection for the whole listener. Keep discovery outside token validation.
 
 Build a separate `Guard` and resource-bound `AuthProxy` for payments. Publish
 both returned endpoints through one `ResourceMetadataProxy`. In a multi-resource
-server, route the well-known namespace to that publisher in a separate branch,
+server, route the registered metadata paths to that publisher in a separate branch,
 and route each protected subtree to its own auth proxy. Selection must happen
 in the router's early phase so metadata requests never enter an auth branch's
 early-filter lifecycle.

@@ -5,6 +5,7 @@
 //! returned by any number of those integrations at the server root.
 
 use bytes::Bytes;
+pub use huskarl_resource_server::resource::AudienceBinding;
 use pingora_error::{Error, Result};
 use pingora_http::RequestHeader;
 use pingora_proxy::{ProxyHttp, Session};
@@ -27,37 +28,6 @@ use crate::{
     },
 };
 
-/// How an RFC 8707 resource identifier maps to access-token audience values.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum AudienceBinding {
-    /// The token's `aud` claim must contain the protected-resource identifier
-    /// exactly as configured.
-    ResourceIdentifier,
-    /// The authorization server maps the resource identifier to one of these
-    /// token audience values.
-    Mapped(Vec<String>),
-}
-
-impl AudienceBinding {
-    /// Declares audience values produced by an authorization server that maps
-    /// the resource identifier to another URI or opaque identifier.
-    pub fn mapped<I, T>(audiences: I) -> Self
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<String>,
-    {
-        Self::Mapped(audiences.into_iter().map(Into::into).collect())
-    }
-
-    fn into_audiences(self, resource: &str) -> Vec<String> {
-        match self {
-            Self::ResourceIdentifier => vec![resource.to_owned()],
-            Self::Mapped(audiences) => audiences,
-        }
-    }
-}
-
 struct ProtectedResourceBinding {
     resource_path: String,
     validator_metadata: ValidatorMetadata,
@@ -69,13 +39,14 @@ struct ProtectedResourceBinding {
 /// Obtain this together with a configured [`AuthProxy`] from
 /// [`AuthProxy::with_protected_resource`], then add it to the server-level
 /// [`ResourceMetadataProxy`]. Keeping this value separate lets each resource server
-/// use its own guard, validator, and public base mapping while one outer proxy
-/// owns the shared well-known namespace.
+/// use its own guard, validator, and public base mapping. An external publisher
+/// can consume [`publication`](Self::publication) without mounting a local proxy.
 #[derive(Clone)]
 pub struct ResourceMetadataEndpoint {
     resource_uri: http::Uri,
     resource_origin: String,
     endpoint_uri: http::Uri,
+    incoming_uri: http::Uri,
     body: Bytes,
 }
 
@@ -96,6 +67,16 @@ impl ResourceMetadataEndpoint {
         &self.resource_uri
     }
 
+    /// Exports the same prepared bytes used by this handler, without mounting it.
+    /// The consumer owns routing, refresh, and HTTP serving policy.
+    #[must_use]
+    pub fn publication(&self) -> huskarl_resource_server::resource::ResourcePublication<'_> {
+        huskarl_resource_server::resource::ResourcePublication {
+            uri: &self.endpoint_uri,
+            body: &self.body,
+        }
+    }
+
     /// Returns the absolute canonical URL at which this document is published.
     #[must_use]
     pub fn uri(&self) -> &http::Uri {
@@ -103,7 +84,25 @@ impl ResourceMetadataEndpoint {
     }
 
     fn path_and_query(&self) -> Option<&http::uri::PathAndQuery> {
-        self.endpoint_uri.path_and_query()
+        self.incoming_uri.path_and_query()
+    }
+
+    /// Maps the canonical public endpoint into incoming request coordinates.
+    /// The advertised URL and prepared document remain unchanged.
+    ///
+    /// # Errors
+    /// Rejects mappings that cannot represent the canonical endpoint exactly.
+    pub fn with_mapping(
+        mut self,
+        mapping: &huskarl_resource_server::core::url_mapping::PublicUrlMapping,
+    ) -> std::result::Result<Self, huskarl_resource_server::core::url_mapping::MappingError> {
+        self.incoming_uri = mapping.incoming_uri(&self.endpoint_uri)?;
+        Ok(self)
+    }
+    /// Incoming dispatch URI; matching includes its path and query.
+    #[must_use]
+    pub fn incoming_uri(&self) -> &http::Uri {
+        &self.incoming_uri
     }
 
     fn matches(&self, uri: &http::Uri) -> bool {
@@ -132,6 +131,7 @@ fn split_resource_metadata(
         ResourceMetadataEndpoint {
             resource_uri,
             resource_origin,
+            incoming_uri: endpoint_uri.clone(),
             endpoint_uri,
             body: Bytes::from(body),
         },
@@ -323,6 +323,29 @@ where
     }
 }
 
+impl<P, V, E> AuthProxy<P, V, E>
+where
+    V: AccessTokenValidator + ProvideValidatorMetadata,
+{
+    /// Binds a shared resource definition and supplies its URL mapping to the
+    /// guard. Any explicit guard mapping must agree. Publish metadata separately.
+    /// # Errors
+    /// Rejects already bound proxies, inconsistent mappings, or invalid metadata.
+    pub fn with_resource_definition(
+        mut self,
+        definition: &crate::resource_server::resource::ResourceDefinition,
+    ) -> std::result::Result<(Self, ResourceMetadataEndpoint), crate::resource::ConfigError> {
+        if self.protected_resource.is_some() {
+            return Err(crate::resource::ConfigError::ProtectedResourceAlreadyConfigured);
+        }
+        self.guard.bind_resource_mapping(definition.mapping())?;
+        let config = self.guard.build_resource_metadata(definition.resource())?;
+        let (binding, endpoint) = split_resource_metadata(config, definition.audiences().to_vec());
+        self.protected_resource = Some(binding);
+        Ok((self, endpoint))
+    }
+}
+
 fn resource_path_matches(resource_path: &str, request_path: &str) -> bool {
     if resource_path == "/" || resource_path == request_path {
         return true;
@@ -337,8 +360,9 @@ fn resource_path_matches(resource_path: &str, request_path: &str) -> bool {
 ///
 /// [`publish`](Self::publish) every endpoint returned by
 /// [`AuthProxy::with_protected_resource`]. Use the resulting proxy as the
-/// explicit well-known branch of a server-level router. It owns only the shared
-/// metadata namespace and does not perform access-token validation.
+/// explicit metadata branch of a server-level router. It matches only registered
+/// endpoints and delegates misses to its inner proxy. It does not perform
+/// access-token validation or claim other well-known protocols.
 #[must_use]
 pub struct ResourceMetadataProxy<P> {
     inner: P,
@@ -839,6 +863,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_export_and_mapped_handler_share_bound_metadata() {
+        use huskarl_resource_server::core::url_mapping::PublicUrlMapping;
+        use tokio::io::AsyncReadExt;
+
+        let (auth, metadata) = build_auth_proxy(MockValidator(MockOutcome::Missing), vec![])
+            .with_protected_resource("/app?tenant=one", AudienceBinding::ResourceIdentifier)
+            .unwrap();
+        let canonical = metadata.publication().uri.clone();
+        let exported = metadata.publication().body.to_vec();
+        let json: serde_json::Value = serde_json::from_slice(&exported).unwrap();
+        assert_eq!(json["resource"], metadata.resource().to_string());
+        assert_eq!(
+            auth.protected_resource
+                .as_ref()
+                .unwrap()
+                .validator_metadata
+                .resource_metadata,
+            Some(canonical.to_string())
+        );
+        let wrong = PublicUrlMapping::new("https://other.example", "/").unwrap();
+        assert!(metadata.clone().with_mapping(&wrong).is_err());
+        let mapping =
+            PublicUrlMapping::new("https://api.example.com/.well-known", "/discovery").unwrap();
+        let metadata = metadata.with_mapping(&mapping).unwrap();
+        assert_eq!(metadata.uri(), &canonical);
+        assert_eq!(metadata.publication().body, exported);
+        let incoming = metadata
+            .incoming_uri()
+            .path_and_query()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            incoming,
+            "/discovery/oauth-protected-resource/app?tenant=one"
+        );
+
+        // Binding alone does not install a local publication endpoint.
+        let (mut session, _client) = make_session("GET", canonical.path()).await;
+        let _ = auth
+            .request_filter(&mut session, &mut auth.new_ctx())
+            .await
+            .unwrap();
+        assert_ne!(
+            session.response_written().map(|h| h.status.as_u16()),
+            Some(200)
+        );
+
+        let publisher = ResourceMetadataProxy::new(InnerProxy::new())
+            .publish(metadata)
+            .unwrap();
+        for (method, status) in [("GET", 200), ("HEAD", 200), ("POST", 405)] {
+            let (mut session, mut client) = make_session(method, &incoming).await;
+            let mut ctx = publisher.inner.new_ctx();
+            assert!(
+                publisher
+                    .request_filter(&mut session, &mut ctx)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(session.response_written().unwrap().status.as_u16(), status);
+            if status == 200 {
+                assert_eq!(
+                    session.response_written().unwrap().headers["content-type"],
+                    "application/json"
+                );
+            }
+            drop(session);
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).await.unwrap();
+            let boundary = wire.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            assert_eq!(
+                &wire[boundary..],
+                if method == "GET" {
+                    exported.as_slice()
+                } else {
+                    &[]
+                }
+            );
+        }
+        assert!(!*publisher.inner.request_filter_called.lock().unwrap());
+    }
+
+    #[tokio::test]
     async fn metadata_endpoint_serves_json() {
         let (auth, metadata) = build_auth_proxy(MockValidator(MockOutcome::Missing), vec![])
             .with_protected_resource("/", AudienceBinding::ResourceIdentifier)
@@ -1093,6 +1200,67 @@ mod tests {
                 200
             );
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_prefix_preserves_root_resource_binding() {
+        use crate::resource_server::{
+            core::url_mapping::PublicUrlMapping, resource::ResourceDefinition,
+        };
+
+        let mapping = PublicUrlMapping::new("https://api.example.com/v1", "/proxy").unwrap();
+        let policy = crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            crate::resource::DecodeDepth::UpToOne,
+        );
+        let guard = Guard::builder()
+            .validator(MockValidator(MockOutcome::ValidFor(
+                MockClaims { scopes: None },
+                vec!["https://api.example.com/v1/".to_owned()],
+            )))
+            .base_uri(mapping.public_base().clone())
+            .strip_prefix("/proxy")
+            .path_guard(policy.clone())
+            .build()
+            .unwrap();
+        let (proxy, _) = AuthProxy::new(InnerProxy::new(), guard)
+            .with_protected_resource("/", AudienceBinding::ResourceIdentifier)
+            .unwrap();
+        for path in ["/proxy", "/proxy?", "/proxy?q=a%20b"] {
+            let uri: http::Uri = path.parse().unwrap();
+            let expected = format!("https://api.example.com/v1/{}", &path[6..]);
+            assert_eq!(
+                proxy.guard.effective_request_uri(&uri).unwrap(),
+                expected.as_str()
+            );
+            let (mut session, _client) = make_session("GET", path).await;
+            let mut ctx = proxy.new_ctx();
+            assert!(!proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+            assert!(ctx.validated_token().is_some());
+        }
+
+        // Explicit mappings keep the distinction between the bare base and its slash.
+        let guard = Guard::builder()
+            .validator(MockValidator(MockOutcome::Missing))
+            .url_mapping(mapping.clone())
+            .path_guard(policy)
+            .build()
+            .unwrap();
+        let uri = "/proxy?q=a%20b".parse().unwrap();
+        assert_eq!(
+            guard.effective_request_uri(&uri).unwrap(),
+            "https://api.example.com/v1?q=a%20b"
+        );
+
+        // Binding a definition also switches a legacy guard to exact mapping semantics.
+        let definition =
+            ResourceDefinition::new(mapping, "/", AudienceBinding::ResourceIdentifier).unwrap();
+        let mut guard = proxy.guard;
+        guard.bind_resource_mapping(definition.mapping()).unwrap();
+        assert_eq!(
+            guard.effective_request_uri(&uri).unwrap(),
+            "https://api.example.com/v1?q=a%20b"
+        );
     }
 
     #[tokio::test]
@@ -1616,5 +1784,275 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(session.response_written().unwrap().status.as_u16(), 200);
+    }
+    #[tokio::test]
+    async fn resource_assembly_maps_routes_and_publishes_metadata_separately() {
+        use crate::{
+            resource::assembly::ResourceAssembly,
+            resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition},
+        };
+        for (base, prefix, path) in [
+            ("https://api.example.com", "/", "/app/items"),
+            ("https://api.example.com/gateway", "/", "/app/items"),
+            (
+                "https://api.example.com/gateway",
+                "/edge",
+                "/edge/app/items",
+            ),
+        ] {
+            let mapping = PublicUrlMapping::new(base, prefix).unwrap();
+            let definition = ResourceDefinition::new(
+                mapping.clone(),
+                "/app",
+                AudienceBinding::ResourceIdentifier,
+            )
+            .unwrap();
+            let policy = crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            );
+            let guard = Guard::builder()
+                .validator(MockValidator(MockOutcome::ValidFor(
+                    MockClaims { scopes: None },
+                    definition.audiences().to_vec(),
+                )))
+                .path_guard(policy.clone())
+                .build()
+                .unwrap();
+            let proxy = ResourceAssembly::new(
+                PublicUrlMapping::new("https://api.example.com", "/metadata-ingress").unwrap(),
+            )
+            .register(&definition, guard, InnerProxy::new())
+            .unwrap()
+            .build(
+                route(InnerProxy::new()),
+                context_lens!(TestContext, ctx => ctx.route),
+                policy,
+            )
+            .unwrap();
+            let (mut session, _client) = make_session("GET", path).await;
+            let mut ctx = proxy.new_ctx();
+            proxy
+                .early_request_filter(&mut session, &mut ctx)
+                .await
+                .unwrap();
+            assert!(!proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+            assert!(ctx.validated_token().is_some());
+            let (mut session, _client) = make_session(
+                "GET",
+                &format!("/metadata-ingress{}", definition.metadata_uri().path()),
+            )
+            .await;
+            let mut ctx = proxy.new_ctx();
+            proxy
+                .early_request_filter(&mut session, &mut ctx)
+                .await
+                .unwrap();
+            assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+            assert_eq!(session.response_written().unwrap().status.as_u16(), 200);
+            assert!(ctx.validated_token().is_none());
+            let (mut session, _client) = make_session(
+                "GET",
+                &format!("{}/../outside", definition.incoming_mount()),
+            )
+            .await;
+            let mut ctx = proxy.new_ctx();
+            assert!(
+                proxy
+                    .early_request_filter(&mut session, &mut ctx)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !ctx.route.is_selected(),
+                "ambiguous paths must fail before selecting a branch"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_definition_rejects_a_guard_with_another_mapping() {
+        use crate::resource_server::{
+            core::url_mapping::PublicUrlMapping, resource::ResourceDefinition,
+        };
+        let definition = ResourceDefinition::new(
+            PublicUrlMapping::new("https://api.example.com/gateway", "/edge").unwrap(),
+            "/app",
+            AudienceBinding::ResourceIdentifier,
+        )
+        .unwrap();
+        let proxy = build_auth_proxy(MockValidator(MockOutcome::Missing), vec![]);
+        assert!(proxy.with_resource_definition(&definition).is_err());
+    }
+    #[tokio::test]
+    async fn root_resource_reserves_metadata_and_never_uses_application_fallback_for_query_misses()
+    {
+        use crate::{
+            resource::assembly::ResourceAssembly,
+            resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition},
+        };
+        let mapping = PublicUrlMapping::new("https://api.example.com", "/").unwrap();
+        let definition =
+            ResourceDefinition::new(mapping.clone(), "/", AudienceBinding::ResourceIdentifier)
+                .unwrap();
+        let policy = crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            crate::resource::DecodeDepth::UpToOne,
+        );
+        let guard = Guard::builder()
+            .validator(MockValidator(MockOutcome::Missing))
+            .path_guard(policy.clone())
+            .build()
+            .unwrap();
+        let proxy = ResourceAssembly::new(mapping)
+            .register(&definition, guard, InnerProxy::new())
+            .unwrap()
+            .build(
+                route(InnerProxy::new()),
+                context_lens!(TestContext, ctx => ctx.route),
+                policy,
+            )
+            .unwrap();
+        for (method, path, expected) in [
+            ("GET", "/.well-known/oauth-protected-resource", 200),
+            ("HEAD", "/.well-known/oauth-protected-resource", 200),
+            ("POST", "/.well-known/oauth-protected-resource", 405),
+            (
+                "GET",
+                "/.well-known/oauth-protected-resource?wrong=query",
+                404,
+            ),
+            ("GET", "/", 401),
+            ("GET", "/private", 401),
+            ("GET", "/.well-known/other", 401),
+            ("GET", "/.well-known/oauth-protected-resource/child", 401),
+            ("GET", "/.well-known/oauth-protected-resource-other", 401),
+        ] {
+            let (mut session, _client) = make_session(method, path).await;
+            let mut ctx = proxy.new_ctx();
+            proxy
+                .early_request_filter(&mut session, &mut ctx)
+                .await
+                .unwrap();
+            assert!(
+                proxy.request_filter(&mut session, &mut ctx).await.unwrap(),
+                "{path} must not forward"
+            );
+            assert_eq!(
+                session.response_written().unwrap().status.as_u16(),
+                expected,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn definition_supplies_an_unconfigured_guard_mapping_and_pingora_rejects_route_syntax() {
+        use crate::{
+            resource::assembly::ResourceAssembly,
+            resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition},
+        };
+        let mapping = PublicUrlMapping::new("https://api.example.com/gateway", "/edge").unwrap();
+        let definition =
+            ResourceDefinition::new(mapping.clone(), "/app", AudienceBinding::ResourceIdentifier)
+                .unwrap();
+        let policy = crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            crate::resource::DecodeDepth::UpToOne,
+        );
+        let guard = Guard::builder()
+            .validator(MockValidator(MockOutcome::Missing))
+            .path_guard(policy.clone())
+            .build()
+            .unwrap();
+        let (proxy, _) = AuthProxy::new(InnerProxy::new(), guard)
+            .with_resource_definition(&definition)
+            .unwrap();
+        assert_eq!(
+            proxy
+                .guard
+                .effective_request_uri(&"/edge/app/items?q=a%20b".parse().unwrap())
+                .unwrap(),
+            "https://api.example.com/gateway/app/items?q=a%20b"
+        );
+        let definition =
+            ResourceDefinition::new(mapping, "/{tenant}", AudienceBinding::ResourceIdentifier)
+                .unwrap();
+        let guard = Guard::builder()
+            .validator(MockValidator(MockOutcome::Missing))
+            .path_guard(policy)
+            .build()
+            .unwrap();
+        assert!(
+            ResourceAssembly::new(PublicUrlMapping::new("https://api.example.com", "/").unwrap())
+                .register(&definition, guard, InnerProxy::new())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_can_replace_the_exact_mount_without_exempting_descendants() {
+        use crate::{
+            resource::assembly::ResourceAssembly,
+            resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition},
+        };
+        let definition = ResourceDefinition::new(
+            PublicUrlMapping::new("https://api.example.com", "/").unwrap(),
+            "/app",
+            AudienceBinding::ResourceIdentifier,
+        )
+        .unwrap();
+        let metadata_mapping = PublicUrlMapping::new(
+            "https://api.example.com/.well-known/oauth-protected-resource",
+            "/",
+        )
+        .unwrap();
+        let policy = crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            crate::resource::DecodeDepth::UpToOne,
+        );
+        let guard = Guard::builder()
+            .validator(MockValidator(MockOutcome::Missing))
+            .path_guard(policy.clone())
+            .build()
+            .unwrap();
+        let proxy = ResourceAssembly::new(metadata_mapping)
+            .register(&definition, guard, InnerProxy::new())
+            .unwrap()
+            .build(
+                route(InnerProxy::new()),
+                context_lens!(TestContext, ctx => ctx.route),
+                policy,
+            )
+            .unwrap();
+        for (path, status) in [
+            ("/app", 200),
+            ("/app/", 401),
+            ("/app/private", 401),
+            ("/app/private/..", 401),
+            ("/app?unknown", 404),
+        ] {
+            let (mut session, _client) = make_session("GET", path).await;
+            let mut ctx = proxy.new_ctx();
+            proxy
+                .early_request_filter(&mut session, &mut ctx)
+                .await
+                .unwrap();
+            assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+            assert_eq!(
+                session.response_written().unwrap().status.as_u16(),
+                status,
+                "{path}"
+            );
+        }
+        let (mut session, _client) = make_session("GET", "/app/../app").await;
+        let mut ctx = proxy.new_ctx();
+        assert!(
+            proxy
+                .early_request_filter(&mut session, &mut ctx)
+                .await
+                .is_err()
+        );
+        assert!(!ctx.route.is_selected());
     }
 }

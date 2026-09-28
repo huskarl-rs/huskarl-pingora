@@ -117,6 +117,8 @@ pub struct Guard<V: AccessTokenValidator + ProvideValidatorMetadata> {
     scopes_supported: Vec<String>,
     base_uri: Option<http::Uri>,
     strip_prefix: Option<String>,
+    request_mapping: Option<crate::resource_server::core::url_mapping::PublicUrlMapping>,
+    legacy_mapping: bool,
     /// Optional value for the `name` label on emitted metrics, distinguishing guard
     /// instances when one process runs several. `None` omits the label.
     metrics_name: Option<String>,
@@ -179,6 +181,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         /// proof could be replayed across origins. Set `base_uri` whenever you accept
         /// DPoP-bound tokens.
         base_uri: Option<http::Uri>,
+        /// Validated public/ingress mapping. Do not combine with `base_uri` or `strip_prefix`.
+        url_mapping: Option<crate::resource_server::core::url_mapping::PublicUrlMapping>,
         /// Path prefix to strip from the request path before prepending the
         /// `base_uri` path during `DPoP` URI reconstruction.
         ///
@@ -201,6 +205,21 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         #[builder(into)]
         metrics_name: Option<String>,
     ) -> Result<Self, ConfigError> {
+        let legacy_mapping = url_mapping.is_none();
+        let (base_uri, strip_prefix) = if let Some(mapping) = url_mapping {
+            if base_uri.is_some() || strip_prefix.is_some() {
+                return Err(ConfigError::InvalidBaseUri {
+                    base_uri: mapping.public_base().to_string(),
+                    reason: "url_mapping cannot be combined with base_uri or strip_prefix",
+                });
+            }
+            (
+                Some(mapping.public_base().clone()),
+                (mapping.incoming_prefix() != "/").then(|| mapping.incoming_prefix().to_owned()),
+            )
+        } else {
+            (base_uri, strip_prefix)
+        };
         // Reject public rules with audience or scope constraints — they can never
         // be enforced because the token validator is skipped for public routes.
         for (_kind, pattern, rule) in &routes {
@@ -212,9 +231,17 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             return Err(ConfigError::PublicRuleWithConstraints("<default>".into()));
         }
 
-        if let Some(base_uri) = base_uri.as_ref() {
-            validate_base_uri(base_uri)?;
-        }
+        let request_mapping = base_uri
+            .as_ref()
+            .map(|base| {
+                validate_base_uri(base)?;
+                crate::resource_server::core::url_mapping::PublicUrlMapping::new(
+                    &base.to_string(),
+                    strip_prefix.as_deref().unwrap_or("/"),
+                )
+                .map_err(ConfigError::UrlMapping)
+            })
+            .transpose()?;
         let metadata = validator.validator_metadata(None);
 
         // Collect unique scopes from all route rules and the default rule.
@@ -238,6 +265,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
             scopes_supported,
             base_uri,
             strip_prefix,
+            request_mapping,
+            legacy_mapping,
             metrics_name,
         })
     }
@@ -398,36 +427,26 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 resource: resource.to_owned(),
                 source,
             })?;
-        let derived = metadata_url.to_string();
 
-        let mut metadata = self.validator.validator_metadata(Some(resource));
-        if let Some(configured) = metadata.resource_metadata.as_ref()
-            && configured != &derived
-        {
-            return Err(ConfigError::ResourceMetadataUrlMismatch {
-                configured: configured.clone(),
+        let (metadata, body) = crate::resource_server::resource::prepare_metadata(
+            resource,
+            &self.validator,
+            self.scopes_supported.clone(),
+        )
+        .map_err(|error| match error {
+            crate::resource_server::resource::ResourceError::MetadataUrlMismatch {
+                configured,
                 derived,
-            });
-        }
-        metadata.resource = Some(resource.to_owned());
-        metadata.resource_metadata = Some(derived);
-
-        let Some(document) = metadata.to_resource_metadata() else {
-            return Err(ConfigError::ResourceMetadataDocumentUnavailable);
-        };
+            } => ConfigError::ResourceMetadataUrlMismatch {
+                configured,
+                derived,
+            },
+            crate::resource_server::resource::ResourceError::Serialization { source } => {
+                ConfigError::Metadata(source)
+            }
+            _ => ConfigError::ResourceMetadataDocumentUnavailable,
+        })?;
         let endpoint_uri = metadata_url.as_uri().clone();
-
-        let mut value = serde_json::to_value(&document)?;
-
-        if !self.scopes_supported.is_empty()
-            && let Some(obj) = value.as_object_mut()
-        {
-            // Only insert if the metadata doesn't already provide scopes_supported.
-            obj.entry("scopes_supported")
-                .or_insert_with(|| serde_json::Value::from(self.scopes_supported.clone()));
-        }
-
-        let body = serde_json::to_vec(&value)?;
         let resource_origin = format!(
             "{}://{}",
             resource_uri.scheme_str().unwrap_or_default(),
@@ -480,7 +499,42 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// Reconstructs the externally visible request URI using the same mapping
     /// passed to the validator for `DPoP` `htu` verification.
     pub(crate) fn effective_request_uri(&self, uri: &http::Uri) -> Option<http::Uri> {
-        request_uri(self.base_uri.as_ref(), self.strip_prefix.as_deref(), uri)
+        self.request_mapping.as_ref().map_or_else(
+            || Some(uri.clone()),
+            |mapping| {
+                if self.legacy_mapping {
+                    super::uri::legacy_request_uri(mapping, uri)
+                } else {
+                    mapping.public_url(uri).ok()
+                }
+            },
+        )
+    }
+
+    pub(crate) fn bind_resource_mapping(
+        &mut self,
+        mapping: &crate::resource_server::core::url_mapping::PublicUrlMapping,
+    ) -> Result<(), ConfigError> {
+        if self
+            .request_mapping
+            .as_ref()
+            .is_some_and(|configured| configured != mapping)
+            || self
+                .strip_prefix
+                .as_deref()
+                .is_some_and(|prefix| prefix != mapping.incoming_prefix())
+        {
+            return Err(ConfigError::InvalidBaseUri {
+                base_uri: mapping.public_base().to_string(),
+                reason: "resource definition and guard URL mappings differ",
+            });
+        }
+        self.base_uri = Some(mapping.public_base().clone());
+        self.strip_prefix =
+            (mapping.incoming_prefix() != "/").then(|| mapping.incoming_prefix().to_owned());
+        self.request_mapping = Some(mapping.clone());
+        self.legacy_mapping = false;
+        Ok(())
     }
 
     /// Checks the given Pingora session.
@@ -634,8 +688,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         }
 
         // 2. Call the validator.
-        let Some(full_uri) = request_uri(self.base_uri.as_ref(), self.strip_prefix.as_deref(), uri)
-        else {
+        let Some(full_uri) = self.effective_request_uri(uri) else {
             return (
                 Self::bad_request_with_metadata(metadata, "Invalid request URI"),
                 CheckOutcome::InvalidRequest,

@@ -26,9 +26,15 @@ pub mod tutorial {
 )]
 #[cfg_attr(
     feature = "resource",
-    doc = "[Build a bearer-token proxy](how_to::resource_proxy) or [publish protected-resource metadata](how_to::resource_metadata)."
+    doc = "[Build a bearer-token proxy](how_to::resource_proxy) or [publish protected-resource metadata](how_to::resource_metadata), or [assemble shared resource registrations](how_to::resource_registration)."
 )]
 pub mod how_to {
+    #[cfg(feature = "resource")]
+    #[doc = include_str!("../docs/how_to/publication_contributions.md")]
+    pub mod publication_contributions {}
+    #[cfg(feature = "resource")]
+    #[doc = include_str!("../docs/how_to/resource_registration.md")]
+    pub mod resource_registration {}
     #[cfg(any(feature = "login", feature = "resource"))]
     #[doc = include_str!("../docs/how_to/user_caching.md")]
     pub mod user_caching {}
@@ -67,6 +73,10 @@ pub mod how_to {
     doc = "Read [Login proxy lifecycle](explanation::login_lifecycle)."
 )]
 pub mod explanation {
+    /// Contribution boundary for independently owned metadata publication.
+    #[cfg(feature = "resource")]
+    #[doc = include_str!("../docs/explanation/endpoint_publication.md")]
+    pub mod endpoint_publication {}
     #[cfg(any(feature = "login", feature = "resource"))]
     #[doc = include_str!("../docs/explanation/path_confusion.md")]
     pub mod path_confusion {}

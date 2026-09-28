@@ -18,11 +18,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use huskarl_pingora::{
     resource::{
-        AudienceBinding, AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, GuardConfig,
-        HasAuthState, ResourceMetadataProxy,
+        AudienceBinding, AuthCtx, CaseSensitivity, DecodeDepth, Guard, GuardConfig, HasAuthState,
+        assembly::ResourceAssembly,
     },
     resource_server::{
-        core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
+        core::{
+            jwk::JwksSource, server_metadata::AuthorizationServerMetadata,
+            url_mapping::PublicUrlMapping,
+        },
+        resource::ResourceDefinition,
         validator::{ValidatedRequest, rfc9068::Rfc9068Validator},
     },
 };
@@ -30,7 +34,7 @@ use huskarl_reqwest::ReqwestClient;
 use pingora_core::{server::Server, upstreams::peer::HttpPeer};
 use pingora_error::Result;
 use pingora_proxy::{ProxyHttp, Session, http_proxy_service};
-use pingora_proxy_router::{RouteSlot, Router, context_lens, route};
+use pingora_proxy_router::{RouteSlot, context_lens, route};
 
 type Claims = huskarl_pingora::resource_server::validator::rfc9068::Rfc9068AccessTokenClaims;
 
@@ -118,25 +122,6 @@ impl ProxyHttp for NotFound {
     }
 }
 
-fn resource_path_matches(resource: &str, request: &str) -> bool {
-    request == resource
-        || request
-            .strip_prefix(resource)
-            .is_some_and(|remainder| remainder.starts_with('/'))
-}
-
-fn resource_identifier(base: &str, path: &str) -> String {
-    format!("{}{path}", base.trim_end_matches('/'))
-}
-
-fn audience_binding(resource: &str, audience: &str) -> AudienceBinding {
-    if audience == resource {
-        AudienceBinding::ResourceIdentifier
-    } else {
-        AudienceBinding::mapped([audience])
-    }
-}
-
 async fn build_validator(issuer: &str, audience: &str) -> Rfc9068Validator {
     let http_client = ReqwestClient::builder()
         .mtls(huskarl_reqwest::mtls::NoMtls)
@@ -165,22 +150,50 @@ async fn main() {
 
     let public_base =
         std::env::var("PUBLIC_BASE").unwrap_or_else(|_| "https://api.example.com".into());
-    let base_uri: http::Uri = public_base.parse().expect("PUBLIC_BASE must be a URI");
-    let inventory_resource = resource_identifier(&public_base, INVENTORY_PATH);
-    let payments_resource = resource_identifier(&public_base, PAYMENTS_PATH);
-    let inventory_audience =
-        std::env::var("INVENTORY_AUDIENCE").unwrap_or_else(|_| inventory_resource.clone());
-    let payments_audience =
-        std::env::var("PAYMENTS_AUDIENCE").unwrap_or_else(|_| payments_resource.clone());
+    let mapping = PublicUrlMapping::new(
+        &public_base,
+        &std::env::var("INCOMING_PREFIX").unwrap_or_else(|_| "/".into()),
+    )
+    .expect("invalid public URL mapping");
+    let inventory_definition = ResourceDefinition::new(
+        mapping.clone(),
+        INVENTORY_PATH,
+        std::env::var("INVENTORY_AUDIENCE").map_or(AudienceBinding::ResourceIdentifier, |value| {
+            AudienceBinding::mapped([value])
+        }),
+    )
+    .expect("invalid inventory resource");
+    let payments_definition = ResourceDefinition::new(
+        mapping.clone(),
+        PAYMENTS_PATH,
+        std::env::var("PAYMENTS_AUDIENCE").map_or(AudienceBinding::ResourceIdentifier, |value| {
+            AudienceBinding::mapped([value])
+        }),
+    )
+    .expect("invalid payments resource");
+    let inventory_resource = inventory_definition.resource();
+    let payments_resource = payments_definition.resource();
+    let inventory_audience = &inventory_definition.audiences()[0];
+    let payments_audience = &payments_definition.audiences()[0];
+    let origin = format!(
+        "{}://{}",
+        mapping.public_base().scheme_str().unwrap(),
+        mapping.public_base().authority().unwrap()
+    );
+    let metadata_mapping = PublicUrlMapping::new(
+        &origin,
+        &std::env::var("METADATA_INCOMING_PREFIX").unwrap_or_else(|_| "/".into()),
+    )
+    .expect("invalid metadata mapping");
 
     let inventory_validator = build_validator(
         &std::env::var("INVENTORY_ISSUER").expect("INVENTORY_ISSUER is required"),
-        &inventory_audience,
+        inventory_audience,
     )
     .await;
     let payments_validator = build_validator(
         &std::env::var("PAYMENTS_ISSUER").expect("PAYMENTS_ISSUER is required"),
-        &payments_audience,
+        payments_audience,
     )
     .await;
 
@@ -188,65 +201,40 @@ async fn main() {
     let path_guard = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
     let inventory_guard = Guard::builder()
         .validator(inventory_validator)
-        .base_uri(base_uri.clone())
         .path_guard(path_guard.clone())
         .build()
         .expect("failed to build inventory guard");
-    let (inventory, inventory_metadata) = AuthProxy::new(
-        Upstream {
-            address: std::env::var("INVENTORY_UPSTREAM")
-                .unwrap_or_else(|_| "127.0.0.1:3001".into()),
-        },
-        inventory_guard,
-    )
-    .with_protected_resource(
-        INVENTORY_PATH,
-        audience_binding(&inventory_resource, &inventory_audience),
-    )
-    .expect("failed to configure inventory resource");
 
     let payments_guard = Guard::builder()
         .validator(payments_validator)
-        .base_uri(base_uri)
-        .path_guard(path_guard)
+        .path_guard(path_guard.clone())
         .build()
         .expect("failed to build payments guard");
-    let (payments, payments_metadata) = AuthProxy::new(
-        Upstream {
-            address: std::env::var("PAYMENTS_UPSTREAM").unwrap_or_else(|_| "127.0.0.1:3002".into()),
-        },
-        payments_guard,
-    )
-    .with_protected_resource(
-        PAYMENTS_PATH,
-        audience_binding(&payments_resource, &payments_audience),
-    )
-    .expect("failed to configure payments resource");
-
-    let metadata = ResourceMetadataProxy::new(NotFound)
-        .publish(inventory_metadata)
-        .and_then(|proxy| proxy.publish(payments_metadata))
-        .expect("failed to publish resource metadata");
-    let metadata = route(metadata);
-    let inventory = route(inventory);
-    let payments = route(payments);
-    let proxy = Router::new(
-        move |session: &Session, _ctx: &AppContext| {
-            let path = session.req_header().uri.path();
-            let selected = if path.starts_with("/.well-known/oauth-protected-resource") {
-                Some(Arc::clone(&metadata))
-            } else if resource_path_matches(INVENTORY_PATH, path) {
-                Some(Arc::clone(&inventory))
-            } else if resource_path_matches(PAYMENTS_PATH, path) {
-                Some(Arc::clone(&payments))
-            } else {
-                None
-            };
-            Ok(selected)
-        },
-        route(NotFound),
-        context_lens!(AppContext, ctx => ctx.route),
-    );
+    let proxy = ResourceAssembly::new(metadata_mapping)
+        .register(
+            &inventory_definition,
+            inventory_guard,
+            Upstream {
+                address: std::env::var("INVENTORY_UPSTREAM")
+                    .unwrap_or_else(|_| "127.0.0.1:3001".into()),
+            },
+        )
+        .expect("failed to register inventory")
+        .register(
+            &payments_definition,
+            payments_guard,
+            Upstream {
+                address: std::env::var("PAYMENTS_UPSTREAM")
+                    .unwrap_or_else(|_| "127.0.0.1:3002".into()),
+            },
+        )
+        .expect("failed to register payments")
+        .build(
+            route(NotFound),
+            context_lens!(AppContext, ctx => ctx.route),
+            path_guard,
+        )
+        .expect("invalid resource assembly");
 
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:6188".into());
     let mut server = Server::new(None).expect("failed to create server");
