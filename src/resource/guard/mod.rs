@@ -47,8 +47,15 @@ mod tests;
 ///
 /// # Example
 ///
-/// ```ignore
-/// use huskarl_pingora::ClientCertDer;
+/// With Pingora's `rustls` feature enabled:
+///
+/// ```no_run
+/// use std::{any::Any, sync::Arc};
+/// use async_trait::async_trait;
+/// use huskarl_pingora::resource::ClientCertDer;
+/// use pingora_core::{listeners::TlsAccept, protocols::tls::TlsRef};
+///
+/// struct MyApp;
 ///
 /// #[async_trait]
 /// impl TlsAccept for MyApp {
@@ -56,9 +63,8 @@ mod tests;
 ///         &self,
 ///         ssl: &TlsRef,
 ///     ) -> Option<Arc<dyn Any + Send + Sync>> {
-///         ssl.peer_certificate()
-///             .and_then(|cert| cert.to_der().ok())
-///             .map(|der| Arc::new(ClientCertDer(der)) as _)
+///         ssl.peer_certificate_der()
+///             .map(|der| Arc::new(ClientCertDer(der.to_vec())) as _)
 ///     }
 /// }
 /// ```
@@ -556,8 +562,10 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     ///
     /// Emits the `huskarl.resource.check` counter once, with an `outcome` label naming
     /// what this call resolved to — `forward` for a success, or the specific deny reason
-    /// (`path_confusion`, `unauthenticated`, `invalid_token`, `insufficient_scope`,
-    /// `invalid_request`). The label set is closed; the request path is never a label.
+    /// (`path_confusion`, `policy_denied`, `unauthenticated`, `invalid_token`,
+    /// `expired`, `unrecognized_issuer`, `binding_error`, `nonce_required`,
+    /// `insufficient_scope`, `invalid_request`, `server_error`).
+    /// The label set is closed; the request path is never a label.
     pub async fn check_request(
         &self,
         headers: &http::HeaderMap,
