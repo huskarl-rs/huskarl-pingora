@@ -13,6 +13,7 @@ use pingora_proxy_delegate::proxy_http_delegate;
 use crate::{
     resource::{
         ctx::HasAuthState,
+        error_body::{ErrorBody, ErrorDetails},
         guard::{Guard, ResourceMetadataConfig},
         outcome::Outcome,
         response::{
@@ -197,16 +198,17 @@ fn split_resource_metadata(
 /// # }
 /// ```
 #[must_use]
-pub struct AuthProxy<P, V>
+pub struct AuthProxy<P, V, E = ()>
 where
     V: AccessTokenValidator + ProvideValidatorMetadata,
 {
     inner: P,
     guard: Guard<V>,
     protected_resource: Option<ProtectedResourceBinding>,
+    error_body: E,
 }
 
-impl<P, V> std::fmt::Debug for AuthProxy<P, V>
+impl<P, V, E> std::fmt::Debug for AuthProxy<P, V, E>
 where
     V: AccessTokenValidator + ProvideValidatorMetadata,
 {
@@ -234,6 +236,26 @@ where
             inner,
             guard,
             protected_resource: None,
+            error_body: (),
+        }
+    }
+}
+
+impl<P, V, E> AuthProxy<P, V, E>
+where
+    V: AccessTokenValidator + ProvideValidatorMetadata,
+{
+    /// Configures a custom rejection body, preserving protocol status and headers.
+    ///
+    /// Uses structured failure details for validation, audience, scope, custom
+    /// checks, and path-policy denials. Defaults to an empty body. Metadata
+    /// responses and browser-login pages use separate configuration.
+    pub fn error_body<NewE: ErrorBody>(self, error_body: NewE) -> AuthProxy<P, V, NewE> {
+        AuthProxy {
+            inner: self.inner,
+            guard: self.guard,
+            protected_resource: self.protected_resource,
+            error_body,
         }
     }
 
@@ -419,12 +441,13 @@ where
 }
 
 #[proxy_http_delegate(self.inner)]
-impl<P, V> ProxyHttp for AuthProxy<P, V>
+impl<P, V, E> ProxyHttp for AuthProxy<P, V, E>
 where
     P: ProxyHttp + Send + Sync,
     P::CTX: HasAuthState<V::Claims> + Send + Sync,
     V: AccessTokenValidator + ProvideValidatorMetadata + Send + Sync,
     V::Claims: HasScopes + Send + Sync,
+    E: ErrorBody,
 {
     type CTX = P::CTX;
 
@@ -462,17 +485,26 @@ where
                 ctx.set_strip_credentials(strip_credentials);
             }
             Outcome::Deny {
+                details,
                 status,
                 challenges,
                 dpop_nonce,
                 retry_after,
             } => {
+                let body = self.error_body.error_body(&ErrorDetails {
+                    status,
+                    error_code: details.error_code,
+                    error_description: details.error_description.as_deref(),
+                    required_scopes: details.required_scopes.as_deref(),
+                    challenges: &challenges,
+                });
                 write_challenge_response(
                     session,
                     status,
                     &challenges,
                     dpop_nonce.as_deref(),
                     retry_after,
+                    &body,
                 )
                 .await?;
                 return Ok(true);
@@ -560,6 +592,7 @@ mod tests {
         Valid(MockClaims),
         ValidFor(MockClaims, Vec<String>),
         Invalid,
+        Server,
     }
 
     struct MockValidator(MockOutcome);
@@ -603,11 +636,15 @@ mod tests {
                     introspection_jwt: None,
                 })),
                 MockOutcome::Invalid => Err(MockError::invalid_token()),
+                MockOutcome::Server => Err(MockError(
+                    crate::resource::test_support::MockErrorKind::ServerError,
+                )),
             };
             Box::pin(async move {
                 ValidationResult {
                     outcome,
-                    dpop_nonce: None,
+                    dpop_nonce: matches!(self.0, MockOutcome::Server)
+                        .then(|| "server-nonce".to_owned()),
                 }
             })
         }
@@ -1360,5 +1397,138 @@ mod tests {
             .unwrap();
 
         assert!(resp.headers.get("dpop-nonce").is_none());
+    }
+    #[derive(Clone)]
+    struct JsonErrors;
+
+    impl crate::resource::ErrorBody for JsonErrors {
+        fn error_body(
+            &self,
+            details: &crate::resource::ErrorDetails<'_>,
+        ) -> crate::resource::ErrorBodyResponse {
+            crate::resource::ErrorBodyResponse::new(
+                serde_json::json!({
+                    "status": details.status.as_u16(),
+                    "error": details.error_code.map(|code| code.as_str()),
+                    "description": details.error_description,
+                    "scopes": details.required_scopes,
+                    "challenges": details.challenges,
+                })
+                .to_string(),
+                http::HeaderValue::from_static("application/json"),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_body_uses_guard_details_and_preserves_resource_binding() {
+        use tokio::io::AsyncReadExt as _;
+        for (outcome, scopes, expected_status, expected_code) in [
+            (MockOutcome::Missing, vec![], 401, None),
+            (MockOutcome::Server, vec![], 503, None),
+            (MockOutcome::Invalid, vec![], 401, Some("invalid_token")),
+            (
+                MockOutcome::ValidFor(MockClaims { scopes: None }, vec!["api".into()]),
+                vec!["read"],
+                403,
+                Some("insufficient_scope"),
+            ),
+            (
+                MockOutcome::ValidFor(MockClaims { scopes: None }, vec!["wrong".into()]),
+                vec![],
+                401,
+                Some("invalid_token"),
+            ),
+        ] {
+            let (proxy, metadata) = build_auth_proxy(
+                MockValidator(outcome),
+                vec![("/api", Rule::required().scopes(scopes))],
+            )
+            .error_body(JsonErrors)
+            .with_protected_resource("/api", AudienceBinding::mapped(["api"]))
+            .unwrap();
+            // Reconfiguration after binding must preserve the binding as well.
+            let proxy = proxy.error_body(JsonErrors);
+            let (mut session, mut client) = make_session("GET", "/api").await;
+            assert!(
+                proxy
+                    .request_filter(&mut session, &mut proxy.new_ctx())
+                    .await
+                    .unwrap()
+            );
+            let resp = session.response_written().unwrap();
+            assert_eq!(resp.status.as_u16(), expected_status);
+            assert_eq!(resp.headers["content-type"], "application/json");
+            assert_eq!(resp.headers["cache-control"], "no-store");
+            if expected_status == 503 {
+                assert!(!resp.headers.contains_key("www-authenticate"));
+                assert_eq!(resp.headers["retry-after"], "42");
+                assert_eq!(resp.headers["dpop-nonce"], "server-nonce");
+            } else {
+                assert!(
+                    resp.headers["www-authenticate"]
+                        .to_str()
+                        .unwrap()
+                        .contains(metadata.uri().to_string().as_str())
+                );
+            }
+            drop(session);
+            let mut wire = String::new();
+            client.read_to_string(&mut wire).await.unwrap();
+            let (_, body) = wire.split_once("\r\n\r\n").unwrap();
+            let json: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(json["status"], expected_status);
+            assert_eq!(json["error"], serde_json::json!(expected_code));
+            if expected_status == 503 {
+                assert!(json["description"].is_null());
+                assert!(json["scopes"].is_null());
+                assert_eq!(json["challenges"], serde_json::json!([]));
+            }
+            if expected_status == 403 {
+                assert_eq!(json["scopes"], serde_json::json!(["read"]));
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct NeverRender;
+    impl crate::resource::ErrorBody for NeverRender {
+        fn error_body(
+            &self,
+            _: &crate::resource::ErrorDetails<'_>,
+        ) -> crate::resource::ErrorBodyResponse {
+            panic!("successful requests and metadata must not render errors")
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_body_does_not_run_for_success_or_metadata() {
+        let (proxy, metadata) = build_auth_proxy(
+            MockValidator(MockOutcome::ValidFor(
+                MockClaims { scopes: None },
+                vec!["api".into()],
+            )),
+            vec![],
+        )
+        .error_body(NeverRender)
+        .with_protected_resource("/api", AudienceBinding::mapped(["api"]))
+        .unwrap();
+        let (mut session, _client) = make_session("GET", "/api").await;
+        assert!(
+            !proxy
+                .request_filter(&mut session, &mut proxy.new_ctx())
+                .await
+                .unwrap()
+        );
+        let path = metadata.uri().path().to_owned();
+        let publisher = ResourceMetadataProxy::new(proxy).publish(metadata).unwrap();
+        let (mut session, _client) = make_session("GET", &path).await;
+        assert!(
+            publisher
+                .request_filter(&mut session, &mut publisher.new_ctx())
+                .await
+                .unwrap()
+        );
+        assert_eq!(session.response_written().unwrap().status.as_u16(), 200);
     }
 }

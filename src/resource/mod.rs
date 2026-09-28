@@ -44,6 +44,7 @@
 
 mod ctx;
 pub(crate) mod error;
+pub mod error_body;
 mod guard;
 mod outcome;
 mod proxy;
@@ -56,6 +57,7 @@ pub(crate) mod uri;
 
 pub use ctx::{AuthCtx, HasAuthState};
 pub use error::ConfigError;
+pub use error_body::{ErrorBody, ErrorBodyResponse, ErrorDetails, FailureDetails};
 pub use guard::{ClientCertDer, Guard, GuardBuilder};
 pub use outcome::Outcome;
 pub use proxy::{AudienceBinding, AuthProxy, ResourceMetadataEndpoint, ResourceMetadataProxy};

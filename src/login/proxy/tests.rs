@@ -64,14 +64,17 @@ fn default_session_state() -> SessionState {
 /// A fabricated owed persist pairing `session` with a minimal refresh
 /// response — the deferred save a post-response commit retries (a failed
 /// eager refresh persist; see [`LoadedSession::ActivePending`]).
-fn owed_persist_for<S>(session: S) -> huskarl_login::engine::PendingPersist<S> {
+fn owed_persist_for<S: huskarl_login::Session>(
+    session: S,
+) -> huskarl_login::engine::PendingPersist<S> {
     let token_response = huskarl::grant::core::RawTokenResponse::builder()
         .access_token(huskarl::core::secrets::SecretString::new("access-token"))
         .token_type("Bearer")
         .build()
         .into_token_response(None, SystemTime::now())
         .unwrap();
-    huskarl_login::engine::PendingPersist::new(session, token_response)
+    let revision = session.state().refresh_revision;
+    huskarl_login::engine::PendingPersist::new(session, token_response, revision)
 }
 
 fn owed_persist() -> huskarl_login::engine::PendingPersist<MockSession> {
@@ -1388,7 +1391,7 @@ mod store_backed {
             .unwrap();
 
         assert_eq!(external.calls().compare_and_swaps, 1);
-        assert_eq!(external.calls().saves, 0);
+        assert_eq!(external.calls().inserts, 1);
         assert_eq!(external.calls().deletes, 0);
     }
 

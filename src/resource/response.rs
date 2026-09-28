@@ -11,6 +11,7 @@ use pingora_error::{Error, ErrorType::InternalError};
 use pingora_http::{IntoCaseHeaderName, ResponseHeader};
 use pingora_proxy::Session;
 
+use super::ErrorBodyResponse;
 use crate::resource_server::core::platform::Duration;
 
 // ── Header helpers ───────────────────────────────────────────────────────────
@@ -98,6 +99,7 @@ pub(crate) async fn write_challenge_response(
     challenges: &[String],
     dpop_nonce: Option<&str>,
     retry_after: Option<Duration>,
+    body: &ErrorBodyResponse,
 ) -> Result<(), Box<Error>> {
     let capacity = challenges.len()
         + 2
@@ -141,7 +143,7 @@ pub(crate) async fn write_challenge_response(
     insert_header(
         &mut resp,
         http::header::CONTENT_LENGTH,
-        0,
+        body.body.len(),
         "failed to set content-length header",
     )?;
     insert_header(
@@ -151,7 +153,23 @@ pub(crate) async fn write_challenge_response(
         "failed to set cache-control header",
     )?;
 
-    session.write_response_header(Box::new(resp), true).await?;
+    if let Some(content_type) = &body.content_type {
+        insert_header(
+            &mut resp,
+            http::header::CONTENT_TYPE,
+            content_type.clone(),
+            "failed to set content-type header",
+        )?;
+    }
+    let send_body = session.req_header().method != http::Method::HEAD && !body.body.is_empty();
+    session
+        .write_response_header(Box::new(resp), !send_body)
+        .await?;
+    if send_body {
+        session
+            .write_response_body(Some(body.body.clone()), true)
+            .await?;
+    }
 
     Ok(())
 }
@@ -260,6 +278,7 @@ mod tests {
             &challenges,
             None,
             None,
+            &ErrorBodyResponse::default(),
         )
         .await
         .unwrap();
@@ -288,6 +307,7 @@ mod tests {
             &["Bearer".to_owned()],
             Some("server-nonce-abc"),
             None,
+            &ErrorBodyResponse::default(),
         )
         .await
         .unwrap();
@@ -306,6 +326,7 @@ mod tests {
             &["Bearer".to_owned()],
             None,
             None,
+            &ErrorBodyResponse::default(),
         )
         .await
         .unwrap();
@@ -324,6 +345,7 @@ mod tests {
             &[],
             None,
             Some(Duration::from_secs(30)),
+            &ErrorBodyResponse::default(),
         )
         .await
         .unwrap();
@@ -349,6 +371,7 @@ mod tests {
                 &[],
                 None,
                 Some(interval),
+                &ErrorBodyResponse::default(),
             )
             .await
             .unwrap();
@@ -371,6 +394,7 @@ mod tests {
             &["Bearer error=\"insufficient_scope\"".to_owned()],
             None,
             None,
+            &ErrorBodyResponse::default(),
         )
         .await
         .unwrap();
@@ -399,6 +423,7 @@ mod tests {
             &[malicious],
             None,
             None,
+            &ErrorBodyResponse::default(),
         )
         .await;
 
@@ -428,5 +453,37 @@ mod tests {
         assert_eq!(resp.headers.get("allow").unwrap(), "GET, HEAD");
         assert_eq!(resp.headers.get("content-length").unwrap(), "0");
         assert_eq!(resp.headers.get("cache-control").unwrap(), "no-store");
+    }
+    #[tokio::test]
+    async fn custom_body_preserves_headers_and_head_semantics() {
+        for method in ["GET", "HEAD"] {
+            let (mut session, mut client) = make_session(method, "/api").await;
+            let body =
+                ErrorBodyResponse::new("unavailable", http::HeaderValue::from_static("text/plain"));
+            let challenges = vec!["Bearer realm=\"api\"".into(), "DPoP realm=\"api\"".into()];
+            write_challenge_response(
+                &mut session,
+                http::StatusCode::UNAUTHORIZED,
+                &challenges,
+                Some("nonce"),
+                Some(Duration::from_millis(1500)),
+                &body,
+            )
+            .await
+            .unwrap();
+            let resp = session.response_written().unwrap();
+            assert_eq!(resp.status.as_u16(), 401);
+            assert_eq!(resp.headers.get_all("www-authenticate").iter().count(), 2);
+            assert_eq!(resp.headers["dpop-nonce"], "nonce");
+            assert_eq!(resp.headers["retry-after"], "2");
+            assert_eq!(resp.headers["cache-control"], "no-store");
+            assert_eq!(resp.headers["content-type"], "text/plain");
+            assert_eq!(resp.headers["content-length"], "11");
+            drop(session);
+            let mut wire = String::new();
+            client.read_to_string(&mut wire).await.unwrap();
+            let (_, sent_body) = wire.split_once("\r\n\r\n").unwrap();
+            assert_eq!(sent_body, if method == "HEAD" { "" } else { "unavailable" });
+        }
     }
 }

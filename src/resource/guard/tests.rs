@@ -1932,3 +1932,50 @@ async fn configured_analysis_budget_applies_to_encoded_paths() {
         }
     }
 }
+
+#[tokio::test]
+async fn body_details_hide_server_errors_and_untrusted_route_policy() {
+    for (validator, path) in [
+        (MockValidator::rejecting(MockErrorKind::ServerError), "/api"),
+        (MockValidator::no_token(), "/api"),
+        (MockValidator::no_token(), "/api/../api"),
+    ] {
+        let guard = build_guard(
+            validator,
+            vec![("/api", Rule::required().scopes(["secret"]))],
+        );
+        let Outcome::Deny {
+            status, details, ..
+        } = check(&guard, &http::Method::GET, path).await
+        else {
+            panic!("expected denial")
+        };
+        if status.is_server_error() || status == http::StatusCode::UNAUTHORIZED {
+            assert!(details.error_code.is_none());
+            assert!(details.error_description.is_none());
+        }
+        assert!(details.required_scopes.is_none());
+    }
+}
+
+#[tokio::test]
+async fn custom_check_body_details_preserve_description_without_parsing_headers() {
+    let message = "denied \"quoted\" <script>";
+    let guard = build_guard(
+        MockValidator::valid(MockClaims { scopes: None }),
+        vec![(
+            "/api",
+            Rule::required()
+                .check(move |_| Err(crate::resource::rule::CheckError::Forbidden(message.into()))),
+        )],
+    );
+    let Outcome::Deny { details, .. } = check(&guard, &http::Method::GET, "/api").await else {
+        panic!("expected denial")
+    };
+    assert_eq!(
+        details.error_code,
+        Some(crate::resource_server::error::TokenErrorCode::InsufficientScope)
+    );
+    assert_eq!(details.error_description.as_deref(), Some(message));
+    assert!(details.required_scopes.is_none());
+}

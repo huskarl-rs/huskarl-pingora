@@ -18,7 +18,7 @@ pub mod tutorial {
 /// Start with [Deploy a proxy](how_to::deployment) before exposing it beyond localhost.
 #[cfg_attr(
     any(feature = "login", feature = "resource"),
-    doc = "Choose [route policies](how_to::routes), [configure the path guard](how_to::path_guard), or [troubleshoot a proxy](how_to::troubleshooting)."
+    doc = "Choose [route policies](how_to::routes), [configure the path guard](how_to::path_guard), [customize error responses](how_to::error_responses), or [troubleshoot a proxy](how_to::troubleshooting)."
 )]
 #[cfg_attr(
     feature = "login",
@@ -29,6 +29,9 @@ pub mod tutorial {
     doc = "[Build a bearer-token proxy](how_to::resource_proxy)."
 )]
 pub mod how_to {
+    #[cfg(any(feature = "login", feature = "resource"))]
+    #[doc = include_str!("../docs/how_to/error_responses.md")]
+    pub mod error_responses {}
     #[doc = include_str!("../docs/how_to/deployment.md")]
     pub mod deployment {}
     #[cfg(any(feature = "login", feature = "resource"))]

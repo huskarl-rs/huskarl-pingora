@@ -18,6 +18,7 @@ use crate::{
     metrics::CheckOutcome,
     path_confusion::{ResolveError, ResolveErrorKind, resolve_error_status},
     resource::{
+        FailureDetails,
         error::{ConfigError, CustomCheckError, InvalidRequest, InvalidToken},
         outcome::Outcome,
         rule::{CheckError, Rule, TokenRequirement},
@@ -332,6 +333,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     ) -> Outcome<V::Claims> {
         let challenges = metadata.challenges(Some(&InvalidRequest(msg)), None, None);
         Outcome::Deny {
+            details: FailureDetails::from_challenge(&InvalidRequest(msg).challenge(), None),
             status: http::StatusCode::BAD_REQUEST,
             challenges,
             dpop_nonce: None,
@@ -353,6 +355,14 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         };
         (
             Outcome::Deny {
+                details: if reason.kind() == ResolveErrorKind::InvalidInput {
+                    FailureDetails::from_challenge(
+                        &InvalidRequest(reason.message()).challenge(),
+                        None,
+                    )
+                } else {
+                    FailureDetails::default()
+                },
                 status: resolve_error_status(reason),
                 challenges,
                 dpop_nonce: None,
@@ -671,6 +681,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 let outcome = CheckOutcome::from_validation(err.validation_outcome(&challenge));
                 (
                     Outcome::Deny {
+                        details: FailureDetails::from_challenge(&challenge, scope_param),
                         status: rejection.status,
                         challenges: rejection.www_authenticate,
                         dpop_nonce,
@@ -686,6 +697,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                         let challenges = metadata.unauthenticated_challenges(scope_param);
                         (
                             Outcome::Deny {
+                                details: FailureDetails::default(),
                                 status: http::StatusCode::UNAUTHORIZED,
                                 challenges,
                                 dpop_nonce,
@@ -729,8 +741,24 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         }
     }
 
-    /// Runs audience, scope, and custom check against the rule.
-    /// Returns `Some((Outcome::Deny, category))` if any check fails, `None` if all pass.
+    fn deny_error(
+        metadata: &ValidatorMetadata,
+        error: &impl ToRfc6750Error,
+        scope: Option<&str>,
+        dpop_nonce: Option<&str>,
+    ) -> Outcome<V::Claims> {
+        let challenge = error.challenge();
+        let rejection = metadata.rejection_from(error, &challenge, scope);
+        Outcome::Deny {
+            details: FailureDetails::from_challenge(&challenge, scope),
+            status: rejection.status,
+            challenges: rejection.www_authenticate,
+            dpop_nonce: dpop_nonce.map(str::to_owned),
+            retry_after: rejection.retry_after,
+        }
+    }
+
+    /// Runs audience, scope, and custom checks against the rule.
     fn check_rule(
         rule: &Rule<V::Claims>,
         validated: &ValidatedRequest<V::Claims>,
@@ -742,112 +770,66 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     where
         V::Claims: HasScopes,
     {
-        // The protected-resource binding is the primary audience boundary. RFC
-        // 8707 permits an authorization server to use the resource URI itself
-        // or map it to another identifier, so AuthProxy supplies the configured
-        // acceptable values for the selected resource.
-        if let Some(audiences) = resource_audiences
-            && !audiences
+        // A protected-resource binding and the rule can independently narrow audiences.
+        let audience_error = if resource_audiences.is_some_and(|audiences| {
+            !audiences
                 .iter()
                 .any(|audience| validated.aud.contains(audience))
+        }) {
+            Some("The access token audience does not match the protected resource")
+        } else if !rule.audiences.is_empty()
+            && !rule.audiences.iter().any(|a| validated.aud.contains(a))
         {
-            let challenges = metadata.challenges(
-                Some(&InvalidToken(
-                    "The access token audience does not match the protected resource",
-                )),
-                scope_param,
-                None,
-            );
+            Some("The access token audience does not match")
+        } else {
+            None
+        };
+        if let Some(message) = audience_error {
             return Some((
-                Outcome::Deny {
-                    status: http::StatusCode::UNAUTHORIZED,
-                    challenges,
-                    dpop_nonce: dpop_nonce.map(String::from),
-                    retry_after: None,
-                },
+                Self::deny_error(metadata, &InvalidToken(message), scope_param, dpop_nonce),
                 CheckOutcome::InvalidToken,
             ));
         }
-
-        // A rule can additionally narrow the accepted audiences.
-        // Returns 401 (not 403) per RFC 6750 §3.1: a token whose audience does
-        // not include this resource server is "invalid for other reasons" and
-        // maps to the `invalid_token` error code.
-        if !rule.audiences.is_empty() && !rule.audiences.iter().any(|a| validated.aud.contains(a)) {
-            let challenges = metadata.challenges(
-                Some(&InvalidToken("The access token audience does not match")),
-                scope_param,
-                None,
-            );
+        if rule
+            .scopes
+            .iter()
+            .any(|required| !validated.claims.has_scope(required))
+        {
             return Some((
-                Outcome::Deny {
-                    status: http::StatusCode::UNAUTHORIZED,
-                    challenges,
-                    dpop_nonce: dpop_nonce.map(String::from),
-                    retry_after: None,
-                },
-                CheckOutcome::InvalidToken,
+                Self::deny_error(
+                    metadata,
+                    &InsufficientScope::default(),
+                    scope_param,
+                    dpop_nonce,
+                ),
+                CheckOutcome::InsufficientScope,
             ));
         }
-
-        // Scope check.
-        if !rule.scopes.is_empty() {
-            for required in &rule.scopes {
-                if !validated.claims.has_scope(required) {
-                    let challenges =
-                        metadata.challenges(Some(&InsufficientScope::default()), scope_param, None);
-                    return Some((
-                        Outcome::Deny {
-                            status: http::StatusCode::FORBIDDEN,
-                            challenges,
-                            dpop_nonce: dpop_nonce.map(String::from),
-                            retry_after: None,
-                        },
-                        CheckOutcome::InsufficientScope,
-                    ));
-                }
-            }
+        if let Some(check_fn) = &rule.check
+            && let Err(error) = check_fn(validated)
+        {
+            let (code, description, outcome) = match error {
+                CheckError::Forbidden(description) => (
+                    TokenErrorCode::InsufficientScope,
+                    description,
+                    CheckOutcome::InsufficientScope,
+                ),
+                CheckError::InvalidToken(description) => (
+                    TokenErrorCode::InvalidToken,
+                    description,
+                    CheckOutcome::InvalidToken,
+                ),
+            };
+            return Some((
+                Self::deny_error(
+                    metadata,
+                    &CustomCheckError { code, description },
+                    None,
+                    dpop_nonce,
+                ),
+                outcome,
+            ));
         }
-
-        // Custom check.
-        if let Some(check_fn) = &rule.check {
-            match check_fn(validated) {
-                Ok(()) => {}
-                Err(CheckError::Forbidden(desc)) => {
-                    let err = CustomCheckError {
-                        code: TokenErrorCode::InsufficientScope,
-                        description: desc,
-                    };
-                    let challenges = metadata.challenges(Some(&err), None, None);
-                    return Some((
-                        Outcome::Deny {
-                            status: http::StatusCode::FORBIDDEN,
-                            challenges,
-                            dpop_nonce: dpop_nonce.map(String::from),
-                            retry_after: None,
-                        },
-                        CheckOutcome::InsufficientScope,
-                    ));
-                }
-                Err(CheckError::InvalidToken(desc)) => {
-                    let err = CustomCheckError {
-                        code: TokenErrorCode::InvalidToken,
-                        description: desc,
-                    };
-                    let challenges = metadata.challenges(Some(&err), None, None);
-                    return Some((
-                        Outcome::Deny {
-                            status: http::StatusCode::UNAUTHORIZED,
-                            challenges,
-                            dpop_nonce: dpop_nonce.map(String::from),
-                            retry_after: None,
-                        },
-                        CheckOutcome::InvalidToken,
-                    ));
-                }
-            }
-        }
-
         None
     }
 }

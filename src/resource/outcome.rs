@@ -33,6 +33,8 @@ pub enum Outcome<C> {
     /// response to the session.
     #[non_exhaustive]
     Deny {
+        /// Structured client-facing details for a custom response body.
+        details: super::FailureDetails,
         /// The HTTP status code (401, 403, etc.).
         status: http::StatusCode,
         /// `WWW-Authenticate` challenge header values.
@@ -68,6 +70,7 @@ impl<C> std::fmt::Debug for Outcome<C> {
                 challenges,
                 dpop_nonce,
                 retry_after,
+                ..
             } => f
                 .debug_struct("Deny")
                 .field("status", status)
