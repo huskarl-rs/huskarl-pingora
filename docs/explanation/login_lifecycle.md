@@ -35,3 +35,6 @@ For the full engine model, read
 [Token refresh](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/explanation/refresh/).
 For the upstream process boundary, follow
 [Forward session identity](crate::_docs::how_to::identity).
+
+Before rollout, follow [Deploy a proxy](crate::_docs::how_to::deployment) for
+refresh concurrency, cookie delivery, and logout limits.

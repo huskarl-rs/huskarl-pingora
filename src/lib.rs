@@ -15,6 +15,24 @@
 //! by default. `default-jws-verifier-platform` supplies native token verification;
 //! without it, provide a verifier platform explicitly.
 //!
+//! # Deployment limits
+//!
+//! Before deploying browser login beyond localhost:
+//!
+//! - Use HTTPS and configure the public HTTPS redirect URI; its scheme controls
+//!   secure cookies, even when TLS terminates before Pingora.
+//! - Persist cookie keys and share compatible key rings across replicas. Shared
+//!   keys let replicas read sessions; they do not coordinate refresh exchanges.
+//! - Check provider rules for simultaneous refresh-token exchanges. The
+//!   engine does not prevent them, even within one replica.
+//! - Cookie sessions cannot prevent an older response from restoring browser
+//!   state after refresh or logout. Local logout does not end provider SSO.
+//! - Restrict upstream access to trusted proxy connections and replace incoming
+//!   identity headers before forwarding authenticated identity.
+//!
+//! Follow the [deployment guide](_docs::how_to::deployment) for configuration,
+//! session-store choices, cookie delivery, and rollout checks.
+//!
 //! # Documentation
 //!
 //! - **Learn:** follow a [tutorial](_docs::tutorial) from setup to a working proxy.

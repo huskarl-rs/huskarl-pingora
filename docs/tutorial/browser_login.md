@@ -105,6 +105,8 @@ window. Rotation and concurrent refresh require their own deployment checks.
 
 ## Next steps
 
+- [Review deployment limits](crate::_docs::how_to::deployment) before exposing the proxy beyond localhost.
+
 - [Forward identity to an upstream](crate::_docs::how_to::identity).
 - [Choose route policies](crate::_docs::how_to::routes) and
   [configure the path guard](crate::_docs::how_to::path_guard).
