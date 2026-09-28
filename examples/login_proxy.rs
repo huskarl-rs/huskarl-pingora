@@ -7,23 +7,25 @@
 //! # Usage
 //!
 //! ```sh
+//! export COOKIE_KEY="$(openssl rand -hex 32)"
 //! ISSUER=https://auth.example.com \
 //! CLIENT_ID=my-client \
 //! REDIRECT_URI=http://localhost:6188/callback \
 //! cargo run --example login_proxy --features login
 //! ```
 //!
-//! Then open http://localhost:6188 in your browser. Navigate to
-//! http://localhost:6188/logout to log out.
+//! First run `python3 examples/login_upstream.py` in another terminal.
+//! Open http://localhost:6188/dashboard to sign in, then use its Sign out form.
+//! Full walkthrough: `docs/tutorial/browser_login.md`.
 //!
 //! Environment variables:
 //!   - `ISSUER`        — Authorization server issuer URL (required)
 //!   - `CLIENT_ID`     — OAuth2 client ID (required)
 //!   - `REDIRECT_URI`  — Callback URL registered with the AS (required)
-//!   - `COOKIE_KEY`    — 32-byte AES-256 key, hex-encoded (optional; random if absent)
-//!   - `UPSTREAM`      — Upstream host:port (default: `localhost:3000`)
+//!   - `COOKIE_KEY`    — 32-byte AES-256 key, hex-encoded (required; keep stable across restarts)
+//!   - `UPSTREAM`      — Upstream host:port (default: `127.0.0.1:3001`)
 //!   - `UPSTREAM_TLS`  — Set to enable TLS to the upstream (SNI derived from hostname)
-//!   - `LISTEN`        — Listen address (default: `0.0.0.0:6188`)
+//!   - `LISTEN`        — Listen address (default: `127.0.0.1:6188`)
 
 use std::sync::Arc;
 
@@ -32,15 +34,16 @@ use huskarl::{
     core::{
         crypto::seal::AeadV1Sealer,
         jwk::OctBytes,
-        secrets::{ProvidedSecret, Secret as _, SecretBytes},
+        secrets::{EnvVarSecret, Secret as _, encodings::HexEncoding},
         server_metadata::AuthorizationServerMetadata,
     },
     grant::authorization_code::AuthorizationCodeGrant,
 };
-use huskarl_crypto_native::aead::AesGcmKey;
+use huskarl_crypto_native::{NativeVerifierPlatform, aead::AesGcmKey};
+use huskarl_login::Session as _;
 use huskarl_pingora::login::{
-    CaseSensitivity, CookieSession, CookieSessionStore, DecodeDepth, GuardConfig, LoginConfig,
-    LoginCtx, LoginEngine, LoginProxy, LoginRule, LogoutConfig, SessionLifetime,
+    CaseSensitivity, CookieSession, CookieSessionStore, DecodeDepth, GuardConfig, HasLoginSession,
+    LoginConfig, LoginCtx, LoginEngine, LoginProxy, LoginRule, LogoutConfig, SessionLifetime,
 };
 use huskarl_reqwest::ReqwestClient;
 use huskarl_resource_server::core::client_auth::NoAuth;
@@ -83,8 +86,9 @@ impl ProxyHttp for Upstream {
         &self,
         _session: &mut Session,
         upstream_request: &mut RequestHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<()> {
+        set_identity_header(upstream_request, ctx)?;
         // Rewrite the Host header to match the upstream, so TLS upstreams
         // see the correct hostname rather than the proxy's listen address.
         if !self.sni.is_empty() {
@@ -102,29 +106,19 @@ impl ProxyHttp for Upstream {
     }
 }
 
-// ── AES key ───────────────────────────────────────────────────────────────────
-
-/// Loads or generates the 32-byte AES-256 key for cookie encryption.
-fn load_or_generate_key_bytes() -> Vec<u8> {
-    match std::env::var("COOKIE_KEY") {
-        Ok(hex) => hex::decode(hex.trim()).expect("COOKIE_KEY must be valid hex"),
-        Err(_) => {
-            let bytes: [u8; 32] = rand::random();
-            println!("No COOKIE_KEY set — using a random key. Sessions will not survive restarts.");
-            println!("To persist sessions across restarts, set:");
-            println!("  COOKIE_KEY={}", hex::encode(bytes));
-            bytes.to_vec()
-        }
+// The upstream must accept this assertion only from the trusted proxy.
+fn set_identity_header(
+    request: &mut RequestHeader,
+    ctx: &LoginCtx<(), CookieSession>,
+) -> Result<()> {
+    request.remove_header("X-Authenticated-Subject");
+    if let Some(subject) = ctx.login_state().session.as_ref().and_then(|s| s.sub()) {
+        request.insert_header("X-Authenticated-Subject", subject)?;
     }
+    Ok(())
 }
 
-async fn aes_key_from_bytes(bytes: Vec<u8>) -> AesGcmKey {
-    AesGcmKey::from_secret(
-        ProvidedSecret::new(SecretBytes::new(bytes)).mapped(OctBytes::new("A256GCM")),
-    )
-    .await
-    .expect("failed to load AES-256 key (expected 32 bytes)")
-}
+// ── AES key ───────────────────────────────────────────────────────────────────
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -140,9 +134,9 @@ fn main() {
         parsed_redirect.scheme(),
         parsed_redirect.authority()
     );
-    let upstream = std::env::var("UPSTREAM").unwrap_or_else(|_| "localhost:3000".into());
+    let upstream = std::env::var("UPSTREAM").unwrap_or_else(|_| "127.0.0.1:3001".into());
     let upstream_tls = std::env::var("UPSTREAM_TLS").is_ok();
-    let listen = std::env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:6188".into());
+    let listen = std::env::var("LISTEN").unwrap_or_else(|_| "127.0.0.1:6188".into());
 
     // Use a temporary runtime for async setup, then drop it before
     // server.run_forever() which creates its own runtime.
@@ -167,12 +161,18 @@ fn main() {
             .client_auth(NoAuth)
             .http_client(http_client)
             .redirect_uri(redirect_uri.clone())
+            .jws_verifier_platform(Arc::new(NativeVerifierPlatform))
             .build()
             .await
             .expect("failed to build authorization code grant");
 
-        let key_bytes = load_or_generate_key_bytes();
-        let cipher = Arc::new(aes_key_from_bytes(key_bytes).await);
+        let cipher = AesGcmKey::from_secret(
+            EnvVarSecret::new("COOKIE_KEY", &HexEncoding)
+                .expect("COOKIE_KEY must contain a hex-encoded 32-byte key")
+                .mapped(OctBytes::new("A256GCM")),
+        )
+        .await
+        .expect("failed to load AES-256 cookie key");
 
         let session_store = CookieSessionStore::builder()
             .sealer(AeadV1Sealer::new(cipher))
@@ -189,7 +189,7 @@ fn main() {
             .logout(
                 LogoutConfig::builder()
                     .path("/logout")
-                    .maybe_end_session_endpoint(metadata.end_session_endpoint)
+                    .post_logout_redirect_uri(format!("{base_url}/signed-out"))
                     .build()
                     .expect("failed to build logout config"),
             )
@@ -231,6 +231,7 @@ fn main() {
             .subtree("/dashboard", LoginRule::required())
             // Liveness probe — exact path, skip session handling entirely.
             .route("/health", LoginRule::public())
+            .route("/signed-out", LoginRule::public())
             // Landing page — exact path; render publicly but personalize if the
             // user is already signed in.
             .route("/", LoginRule::optional())
@@ -258,4 +259,54 @@ fn main() {
     println!("Callback URL: {redirect_uri}");
     println!("Logout URL:   {base_url}/logout");
     server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use huskarl_login::SessionState;
+
+    use super::*;
+
+    #[test]
+    fn forwarded_identity_replaces_all_client_values_and_clears_anonymous_values()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        for subject in [None, Some("provider-subject")] {
+            let mut request = RequestHeader::build("GET", b"/dashboard", None)?;
+            request.append_header("X-Authenticated-Subject", "forged-one")?;
+            request.append_header("x-authenticated-subject", "forged-two")?;
+            let mut ctx = LoginCtx::new(());
+            if let Some(subject) = subject {
+                let now = SystemTime::now();
+                ctx.login_state_mut().session = Some(CookieSession::from(
+                    SessionState::builder()
+                        .created_at(now)
+                        .token_expiry(now + Duration::from_secs(3600))
+                        .sub(subject.to_owned())
+                        .build(),
+                ));
+            }
+            set_identity_header(&mut request, &ctx)?;
+            let values: Vec<_> = request
+                .headers
+                .get_all("X-Authenticated-Subject")
+                .iter()
+                .collect();
+            match subject {
+                None => assert!(values.is_empty()),
+                Some(subject) => {
+                    assert_eq!(values.len(), 1);
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("X-Authenticated-Subject")
+                            .and_then(|h| h.to_str().ok()),
+                        Some(subject)
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }

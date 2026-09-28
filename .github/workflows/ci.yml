@@ -74,6 +74,16 @@ jobs:
         run: cargo test --doc --all-features
         working-directory: huskarl-pingora
 
+      - name: Build strict documentation for supported feature sets
+        run: |
+          cargo doc --no-deps --no-default-features
+          cargo doc --no-deps --no-default-features --features login
+          cargo doc --no-deps --no-default-features --features resource
+          cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+        working-directory: huskarl-pingora
+
       - name: Check generated README
         run: |
           cargo install cargo-reedme --version 0.6.1 --locked

@@ -12,6 +12,10 @@
 //! single exact path. See the [crate-level routing notes](crate#routing) for why
 //! the choice matters.
 //!
+//! Follow the [browser login tutorial](crate::_docs::tutorial::browser_login)
+//! for a complete proxy and upstream setup. See [identity forwarding](crate::_docs::how_to::identity)
+//! for the boundary between the proxy context and an upstream service.
+//!
 //! Session management is built in via two modes:
 //!
 //! - **Cookie sessions** ([`CookieSessionStore`]) — encrypt the full session

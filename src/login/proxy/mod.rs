@@ -65,17 +65,18 @@ mod tests;
 ///   itself in `request_filter`, or proxying failed. The response is
 ///   already sent at that point, so any `Set-Cookie` values the store
 ///   returns are dropped with a warning: external stores persist fine,
-///   cookie-backed stores cannot. (Token refreshes are persisted eagerly
-///   inside [`LoginEngine::load_session`], so what's at stake here is an
-///   activity touch or a retry of a failed eager persist.)
+///   cookie-backed stores cannot. Eager refresh persistence prepares cookie
+///   updates but does not deliver them: even a successful cookie save depends
+///   on the response reaching the browser. See the
+///   [lifecycle explanation](crate::_docs::explanation::login_lifecycle).
 ///
 /// # Session credential stripping
 ///
 /// Before forwarding, this proxy removes the session driver's cookies from the
 /// inbound `Cookie` header, including cookie-session chunks and key-id sidecars.
-/// Unrelated application cookies are preserved. Identity reaches the application
-/// through the session object in the context, so the upstream never needs the
-/// replayable browser credential.
+/// Unrelated application cookies are preserved. The inner proxy can read identity
+/// from its session context. A separate upstream service needs an explicit
+/// identity assertion; see [Forward session identity](crate::_docs::how_to::identity).
 ///
 /// # Type parameters
 ///
