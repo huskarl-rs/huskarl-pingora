@@ -66,6 +66,11 @@ impl<C> Clone for Rule<C> {
 }
 
 impl<C> Rule<C> {
+    pub(crate) fn public_constraints_requested(&self) -> bool {
+        self.token == TokenRequirement::None
+            && (!self.audiences.is_empty() || !self.scopes.is_empty() || self.check.is_some())
+    }
+
     fn with_requirement(token: TokenRequirement) -> Self {
         Self {
             token,

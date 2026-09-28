@@ -33,6 +33,7 @@ use huskarl_login::{
     SessionErrorKind, SessionLifetime, SessionPolicy, SessionState,
     core::crypto::seal::{AeadSealerUnsealer, AeadV1Sealer},
 };
+use huskarl_route_guard::PathRegistration;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::RequestHeader;
 use pingora_proxy::{ProxyHttp, Session};

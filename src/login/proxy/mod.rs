@@ -21,7 +21,7 @@ use huskarl_login::{
         LoadedSession, LoginEngine, LoginResponse, SetCookies, error_chain, is_cors_preflight,
     },
 };
-use huskarl_route_guard::{GuardConfig, PathRegistration, RuleRouter, RuleRouterError};
+use huskarl_route_guard::{GuardConfig, RuleRouter, RuleRouterError};
 use pingora_error::{
     Error,
     ErrorType::{HTTPStatus, InternalError},
@@ -36,8 +36,8 @@ use super::{
     rule::{CheckError, LoginRule},
 };
 use crate::{
-    method::MethodMatch,
     path_confusion::{ResolveError, resolve_error_status},
+    routing::RouteKind,
 };
 
 #[cfg(test)]
@@ -219,15 +219,7 @@ where
 
         let registrations = routes.into_iter().map(|(kind, pattern, rule)| {
             let method = rule.method_match().clone();
-            let registration = match kind {
-                RouteKind::Exact => PathRegistration::path(pattern),
-                RouteKind::Subtree => PathRegistration::subtree(&pattern),
-                RouteKind::Blob => PathRegistration::exclusive_subtree(&pattern),
-            };
-            match method {
-                MethodMatch::Any => registration.all(rule),
-                MethodMatch::OneOf(methods) => registration.methods(methods, rule),
-            }
+            kind.registration(pattern, method, rule)
         });
         let routes = RuleRouter::from_registrations(default, path_guard, registrations)?;
         Ok(Self {
@@ -294,15 +286,6 @@ where
         self.routes.push((RouteKind::Blob, path.to_owned(), rule));
         self
     }
-}
-
-/// How a registration on the [`LoginProxy`] builder is lowered onto
-/// [`RuleRouter::builder`] at build time — an exact `route`, a `subtree`, or an
-/// exclusive `blob_subtree`.
-enum RouteKind {
-    Exact,
-    Subtree,
-    Blob,
 }
 
 impl<P, SD> LoginProxy<P, SD>
@@ -538,11 +521,11 @@ where
         let req = session.req_header();
         let uri = req.uri.clone();
         let method = req.method.clone();
-        let headers = req.headers.clone();
+        let headers = &req.headers;
 
         // Preflights stay session-free but still cross the structural path guard;
         // non-browser clients can manufacture preflight-shaped requests.
-        if self.cors_passthrough && is_cors_preflight(&method, &headers) {
+        if self.cors_passthrough && is_cors_preflight(&method, headers) {
             if let Err(reason) = self.routes.resolve(uri.path(), &method) {
                 return self
                     .serve_path_confusion(session, uri.path(), &reason)
@@ -555,7 +538,7 @@ where
         // they take precedence over any user-registered route.
         if let Some(resp) = self
             .engine
-            .try_handle_login_route(&method, &headers, &uri)
+            .try_handle_login_route(&method, headers, &uri)
             .await
         {
             write_login_response(session, resp, vec![]).await?;
@@ -585,7 +568,7 @@ where
             LoginRule::Required { check, .. } => (true, check),
         };
 
-        let loaded = match self.engine.load_session(&headers).await {
+        let loaded = match self.engine.load_session(headers).await {
             Ok(l) => l,
             Err(e) => {
                 log::error!("failed to load session: {}", error_chain(&e));
@@ -630,12 +613,12 @@ where
             // No usable session. set_cookies carries clears for stale
             // cookies the engine decided to drop (expired, refresh failed).
             if required {
-                let resp = self.engine.redirect_to_login(&headers, &uri).await;
+                let resp = self.engine.redirect_to_login(headers, &uri).await;
                 write_login_response(session, resp, set_cookies.into_headers()).await?;
                 return Ok(true);
             }
             ctx.login_state_mut()
-                .prepare_forward(None, None, headers, set_cookies);
+                .prepare_forward(None, None, headers.clone(), set_cookies);
             return self.inner.request_filter(session, ctx).await;
         };
 
@@ -650,7 +633,7 @@ where
             // the user is denied either way.
             let mut cookies = set_cookies.into_headers();
             if let Some(pending) = pending {
-                match pending.commit(&self.engine, &headers).await {
+                match pending.commit(&self.engine, headers).await {
                     Ok(more) => cookies.extend(more),
                     Err(e) => log::error!(
                         "failed to persist session on denied request: {}",
@@ -664,7 +647,7 @@ where
         }
 
         ctx.login_state_mut()
-            .prepare_forward(Some(sess), pending, headers, set_cookies);
+            .prepare_forward(Some(sess), pending, headers.clone(), set_cookies);
 
         self.inner.request_filter(session, ctx).await
     }

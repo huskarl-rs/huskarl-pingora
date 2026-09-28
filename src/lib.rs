@@ -77,3 +77,6 @@ pub mod path_confusion;
 
 #[cfg(any(feature = "resource", feature = "login"))]
 mod method;
+
+#[cfg(any(feature = "resource", feature = "login"))]
+mod routing;

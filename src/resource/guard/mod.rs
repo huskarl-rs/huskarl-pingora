@@ -10,11 +10,10 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use bon::bon;
-use huskarl_route_guard::{GuardConfig, PathRegistration, RuleRouter};
+use huskarl_route_guard::{GuardConfig, RuleRouter};
 use pingora_proxy::Session;
 
 use crate::{
-    method::MethodMatch,
     metrics::CheckOutcome,
     path_confusion::{ResolveError, ResolveErrorKind, resolve_error_status},
     resource::{
@@ -33,6 +32,7 @@ use crate::{
             metadata::{ProvideValidatorMetadata, ValidatorMetadata},
         },
     },
+    routing::RouteKind,
 };
 
 #[cfg(test)]
@@ -70,6 +70,15 @@ mod tests;
 /// }
 /// ```
 pub struct ClientCertDer(pub Vec<u8>);
+
+fn client_cert_der(session: &Session) -> Option<&[u8]> {
+    session
+        .as_downstream()
+        .digest()
+        .and_then(|d| d.ssl_digest.as_ref())
+        .and_then(|ssl| ssl.extension.get::<ClientCertDer>())
+        .map(|c| c.0.as_slice())
+}
 
 /// A guard that validates OAuth 2.0 access tokens against path-based rules.
 ///
@@ -195,17 +204,11 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         // Reject public rules with audience or scope constraints — they can never
         // be enforced because the token validator is skipped for public routes.
         for (_kind, pattern, rule) in &routes {
-            if rule.token == TokenRequirement::None
-                && (!rule.audiences.is_empty() || !rule.scopes.is_empty() || rule.check.is_some())
-            {
+            if rule.public_constraints_requested() {
                 return Err(ConfigError::PublicRuleWithConstraints(pattern.clone()));
             }
         }
-        if default.token == TokenRequirement::None
-            && (!default.audiences.is_empty()
-                || !default.scopes.is_empty()
-                || default.check.is_some())
-        {
+        if default.public_constraints_requested() {
             return Err(ConfigError::PublicRuleWithConstraints("<default>".into()));
         }
 
@@ -224,15 +227,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 
         let registrations = routes.into_iter().map(|(kind, pattern, rule)| {
             let method = rule.method.clone();
-            let registration = match kind {
-                RouteKind::Exact => PathRegistration::path(pattern),
-                RouteKind::Subtree => PathRegistration::subtree(&pattern),
-                RouteKind::Blob => PathRegistration::exclusive_subtree(&pattern),
-            };
-            match method {
-                MethodMatch::Any => registration.all(rule),
-                MethodMatch::OneOf(methods) => registration.methods(methods, rule),
-            }
+            kind.registration(pattern, method, rule)
         });
         let routes = RuleRouter::from_registrations(default, path_guard, registrations)?;
 
@@ -315,15 +310,6 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, S: guard_builder::State
         self.routes.push((RouteKind::Blob, path.to_owned(), rule));
         self
     }
-}
-
-/// How a registration on [`GuardBuilder`] is lowered onto [`RuleRouter::builder`] at
-/// build time — an exact [`route`](GuardBuilder::route), a [`subtree`](GuardBuilder::subtree),
-/// or an exclusive [`blob_subtree`](GuardBuilder::blob_subtree).
-enum RouteKind {
-    Exact,
-    Subtree,
-    Blob,
 }
 
 impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
@@ -510,12 +496,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         V::Claims: HasScopes,
     {
         let req = session.req_header();
-        let client_cert_der = session
-            .as_downstream()
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .and_then(|ssl| ssl.extension.get::<ClientCertDer>())
-            .map(|c| c.0.as_slice());
+        let client_cert_der = client_cert_der(session);
         self.check_request_with_metadata(
             &req.headers,
             &req.method,
@@ -539,12 +520,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         V::Claims: HasScopes,
     {
         let req = session.req_header();
-        let client_cert_der = session
-            .as_downstream()
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .and_then(|ssl| ssl.extension.get::<ClientCertDer>())
-            .map(|c| c.0.as_slice());
+        let client_cert_der = client_cert_der(session);
         self.check_request_with_metadata(
             &req.headers,
             &req.method,
