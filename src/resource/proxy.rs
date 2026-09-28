@@ -967,6 +967,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps the multi-resource routing scenario together"
+    )]
     async fn router_hosts_two_resource_servers_and_their_metadata() {
         let inventory_guard = Guard::builder()
             .validator(MockValidator(MockOutcome::ValidFor(

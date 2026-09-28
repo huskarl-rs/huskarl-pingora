@@ -62,8 +62,8 @@ jobs:
           cargo check --all-features
         working-directory: huskarl-pingora
 
-      - name: Lint library
-        run: cargo clippy --all-features --lib -- -D warnings
+      - name: Lint all targets
+        run: cargo clippy --all-features --all-targets -- -D warnings
         working-directory: huskarl-pingora
 
       - name: Run tests

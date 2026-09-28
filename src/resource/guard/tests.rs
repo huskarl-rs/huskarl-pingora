@@ -1512,10 +1512,12 @@ async fn cve_forwarded_uri_header_is_not_trusted() {
 
 // --- metrics: the `huskarl.resource.check` outcome counter ---
 
+type RecordedCounter = (String, Vec<(String, String)>, u64);
+
 /// Runs `fut` on a current-thread runtime with a thread-local debugging recorder
 /// installed, returning the captured counters as `(name, sorted (label, value) pairs,
 /// count)`. Mirrors the harness in `huskarl-login`.
-fn with_metrics<T>(fut: impl Future<Output = T>) -> (T, Vec<(String, Vec<(String, String)>, u64)>) {
+fn with_metrics<T>(fut: impl Future<Output = T>) -> (T, Vec<RecordedCounter>) {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     let recorder = DebuggingRecorder::new();
@@ -1548,7 +1550,7 @@ fn with_metrics<T>(fut: impl Future<Output = T>) -> (T, Vec<(String, Vec<(String
 }
 
 /// The value of `huskarl.resource.check` with exactly the `outcome` label, or 0.
-fn check_outcome_count(counters: &[(String, Vec<(String, String)>, u64)], outcome: &str) -> u64 {
+fn check_outcome_count(counters: &[RecordedCounter], outcome: &str) -> u64 {
     counters
         .iter()
         .find(|(name, labels, _)| {

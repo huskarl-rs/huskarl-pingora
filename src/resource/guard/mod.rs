@@ -51,6 +51,7 @@ mod tests;
 ///
 /// ```no_run
 /// use std::{any::Any, sync::Arc};
+///
 /// use async_trait::async_trait;
 /// use huskarl_pingora::resource::ClientCertDer;
 /// use pingora_core::{listeners::TlsAccept, protocols::tls::TlsRef};
