@@ -24,15 +24,21 @@ assert_eq!(inventory.incoming_mount(), "/edge/mcp/inventory");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Build the guard with its validator and route policies, then pass the definition,
+You can prepare a `BoundResource::new(definition, guard, inner)` and pass
+`bound.into_route()` to `ResourceAssembly::register_bound`. Its definition,
+authenticated branch, and metadata remain paired until the assembly consumes it.
+For a custom consuming server, see the publication contribution guide.
+
+Alternatively, build the guard with its validator and route policies, then pass the definition,
 guard, and inner proxy to `ResourceAssembly::register`. The definition supplies
 the guard's URL mapping; an explicitly configured guard mapping must agree.
 The assembly binds authentication, mounts its branch, collects metadata, and
 checks consistency. `build` consumes the fallback route, application route-slot
 lens, and a server-wide `GuardConfig`. Path ambiguity is checked before selecting
 a branch or invoking its early hooks. The existing router still owns hook
-delegation and module initialization. The `multi_resource_proxy` example shows
-the complete setup without separate dispatch predicates or identifier helpers.
+delegation and module initialization. For composition with unrelated public
+endpoints, the `multi_resource_proxy` example consumes the contributions directly
+in its own server router, alongside an operator-supplied `security.txt`.
 
 Metadata publication has an independent mapping. For the resource above, its
 canonical URL is

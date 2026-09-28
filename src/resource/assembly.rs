@@ -8,7 +8,7 @@ use pingora_proxy::{ProxyHttp, Session};
 use pingora_proxy_router::{Lens, Route, RouteSelector, RouteSlot, Router, route};
 
 use super::{
-    AuthProxy, ConfigError, Guard, HasAuthState, HasScopes, ResourceMetadataEndpoint,
+    BoundResource, ConfigError, Guard, HasAuthState, HasScopes, ResourceMetadataEndpoint,
     ResourceMetadataProxy,
 };
 use crate::resource_server::{
@@ -70,7 +70,7 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
     /// # Errors
     /// Rejects inconsistent mappings, overlapping mounts, or metadata conflicts.
     pub fn register<P, V>(
-        mut self,
+        self,
         definition: &ResourceDefinition,
         guard: Guard<V>,
         inner: P,
@@ -81,9 +81,20 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
         V::Claims: HasScopes + Send + Sync,
         C: HasAuthState<V::Claims>,
     {
+        let bound = BoundResource::new(definition.clone(), guard, inner)
+            .map_err(AssemblyError::Configuration)?;
+        self.register_bound(bound.into_route())
+    }
+
+    /// Registers an already bound router branch without preparing metadata again.
+    /// Publication remains separate from the authenticated branch.
+    /// # Errors
+    /// Rejects inconsistent mappings, overlapping mounts, or publication conflicts.
+    pub fn register_bound(mut self, bound: BoundResource<Route<C>>) -> Result<Self, AssemblyError> {
+        let (definition, proxy, endpoint) = bound.into_parts();
         let incoming = self
             .registry
-            .register(definition, &self.metadata_mapping)
+            .register(&definition, &self.metadata_mapping)
             .map_err(AssemblyError::Registration)?;
         if definition.incoming_mount().contains(['{', '}']) || incoming.path().contains(['{', '}'])
         {
@@ -92,14 +103,11 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
                 reason: "resource mounts must be literal Pingora paths",
             }));
         }
-        let (proxy, endpoint) = AuthProxy::new(inner, guard)
-            .with_resource_definition(definition)
-            .map_err(AssemblyError::Configuration)?;
         let endpoint = endpoint
             .with_mapping(&self.metadata_mapping)
             .map_err(|e| AssemblyError::Registration(ResourceError::Mapping { source: e }))?;
         self.branches
-            .push((definition.incoming_mount().to_owned(), route(proxy)));
+            .push((definition.incoming_mount().to_owned(), proxy));
         self.endpoints.push(endpoint);
         Ok(self)
     }

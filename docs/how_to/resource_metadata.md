@@ -99,16 +99,69 @@ enforce operation permissions, add scoped rules to each guard as in the
 single-resource setup above. Metadata and unauthenticated challenge checks do
 not require healthy upstreams; successful forwarding does.
 
-Use an origin without a path for this example's `PUBLIC_BASE`. Its listener and
-upstream connections are plain HTTP; terminate public HTTPS at a trusted entry
-point. If you introduce rewrites, align the guard's public URL mapping and
-router selection, and route canonical metadata URLs to the publisher.
+The example's listener and upstream connections are plain HTTP; terminate public
+HTTPS at a trusted entry point. `PUBLIC_BASE` may include a public path prefix.
+`INCOMING_PREFIX` describes the application ingress prefix and
+`METADATA_INCOMING_PREFIX` separately describes the metadata ingress prefix; both
+default to `/`. Configure the front proxy to perform those rewrites.
 Pingora supports resource identifiers containing queries; its publisher matches
 the derived endpoint's path and query exactly.
 
+## Publish alongside security.txt
+
+The example owns its server router and consumes the metadata returned by each
+`AuthProxy`, independently of `ResourceAssembly`. Set `SECURITY_TXT_FILE` to an
+operator-maintained UTF-8 file to add `/.well-known/security.txt`. The server
+loads the file at startup; restart to publish changes. Supply a valid security.txt
+with your contact details and expiry. The example serves its bytes without
+validating the document, and advertises a one-hour cache lifetime.
+
+Both publications share the configured metadata ingress mapping in this example;
+that is a deployment choice, not a library requirement. Other well-known paths
+are left to the server's fallback. Unknown queries on a reserved OAuth metadata
+path return 404. GET/HEAD are supported for security.txt and other methods return
+405; its handler ignores queries. No publication request enters a resource's
+authentication branch or its early hooks.
+
+For example, retain the issuer settings above and run with:
+
+```sh
+PUBLIC_BASE=https://api.example.com/gateway \
+INCOMING_PREFIX=/edge \
+METADATA_INCOMING_PREFIX=/discovery \
+SECURITY_TXT_FILE=/etc/my-service/security.txt \
+cargo run --example multi_resource_proxy --features resource
+```
+
+The front proxy must implement these mappings:
+
+| Public path | Incoming path at the example listener |
+| --- | --- |
+| `/gateway/mcp/inventory/items` | `/edge/mcp/inventory/items` |
+| `/.well-known/oauth-protected-resource/gateway/mcp/inventory` | `/discovery/.well-known/oauth-protected-resource/gateway/mcp/inventory` |
+| `/.well-known/security.txt` | `/discovery/.well-known/security.txt` |
+
+For local checks, request the incoming paths at `http://127.0.0.1:6188`. OAuth
+metadata and challenges must still contain the canonical public URLs. Requests
+using the original public paths directly at this rewritten listener return 404.
+The example does not rewrite forwarded upstream paths.
+
+Run the example's integration tests without issuer or upstream services:
+
+```sh
+cargo test --example multi_resource_proxy
+```
+
+They drive the server router through Pingora's real HTTP request runner using
+in-memory connections and a test-only validator. They verify a protected root,
+metadata and security.txt responses, method/query handling, ingress rewrites,
+and whether authentication or application hooks were invoked. The executable
+continues to use the real RFC 9068 validator configured from each issuer.
+
 ## Verify discovery and isolation
 
-Run these against the public HTTPS entry point. For a local routing check only,
+These commands use the default origin-root mapping. Run them against the public
+HTTPS entry point. For a local routing check only,
 you can point `BASE` at the example's HTTP listener; advertised resource and
 metadata URLs will still use `PUBLIC_BASE`.
 

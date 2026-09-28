@@ -168,6 +168,10 @@ is insufficient. Record which handler and authentication hooks ran.
 | Pingora local and forwarded publication responses | Selected branch receives lifecycle hooks and modules; existing finalization guarantees preserved |
 | Per-endpoint cache policy | One endpoint's headers do not become namespace-wide defaults; private application responses retain isolation |
 
+Adapter-specific `BoundResource` values keep the validated definition,
+authenticated branch, and metadata together until routing handoff. Convenience
+assemblies use the same binding path as custom consumers.
+
 The implementation exposes `ResourcePublication` from prepared metadata and both
 adapters, and adds validated Pingora ingress mapping. Tests compare exported and
 served bytes with bound authentication metadata. Existing assemblies retain their

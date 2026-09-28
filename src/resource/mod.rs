@@ -45,6 +45,7 @@
 //!
 //! [RFC 9728]: https://datatracker.ietf.org/doc/html/rfc9728
 
+mod bound;
 mod ctx;
 pub(crate) mod error;
 pub mod error_body;
@@ -58,6 +59,7 @@ pub mod scopes;
 pub(crate) mod test_support;
 pub(crate) mod uri;
 
+pub use bound::BoundResource;
 pub use ctx::{AuthCtx, HasAuthState};
 pub use error::ConfigError;
 pub use error_body::{ErrorBody, ErrorBodyResponse, ErrorDetails, FailureDetails};

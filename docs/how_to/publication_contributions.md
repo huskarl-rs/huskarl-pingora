@@ -1,9 +1,44 @@
 # Contribute metadata to an existing publisher
 
-Bind authentication once using `AuthProxy::with_resource_definition` (Pingora)
-or `ValidatorLayer::for_resource` (Axum). Each returns authentication and metadata
-separately. Keeping the metadata value does not mount it. Existing resource
-assemblies are optional conveniences for mounting these same contributions.
+For server integration, construct a `BoundResource` once. Its private fields keep
+its definition, authenticated branch, and prepared metadata together until the
+consuming server installs them. Existing low-level binding APIs remain available.
+
+Pingora exposes `resource::BoundResource`. Construct it with the definition,
+guard, and inner proxy; use `into_route()` when collecting heterogeneous branches.
+`ResourceAssembly::register_bound` consumes that routed bundle. Existing
+`ResourceAssembly::register` constructs the same bundle internally.
+
+Axum exposes `resource_router::BoundResource`. Construct it with the definition,
+validator, scopes, and relative application router; authentication is applied
+before the bundle is returned. `ResourceRouter::register_bound` consumes it, and
+`ResourceRouter::register` delegates to that same path.
+
+For a custom server, call `definition()` and `metadata()` to inspect the bundle,
+and `into_parts()` at the routing boundary. That returns the matching definition,
+authenticated proxy/router, and publication contribution. Mount according to the
+definition; publish the metadata independently or export it. The consumer still
+owns overlaps, precedence, and framework nesting coordinates. The bundle prevents
+accidental mixing before handoff; it cannot prevent an arbitrary router from
+mounting the extracted parts incorrectly.
+
+```rust
+use huskarl_pingora::resource::{AuthProxy, BoundResource, ConfigError, Guard};
+use huskarl_pingora::resource_server::{
+    resource::ResourceDefinition,
+    validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata},
+};
+fn bind<P, V>(definition: ResourceDefinition, guard: Guard<V>, inner: P)
+    -> Result<BoundResource<AuthProxy<P, V>>, ConfigError>
+where V: AccessTokenValidator + ProvideValidatorMetadata
+{
+    BoundResource::new(definition, guard, inner)
+}
+```
+
+Neither constructing nor inspecting the bundle installs a local metadata route.
+The native metadata handlers and snapshot export below use the same prepared
+content, without a second metadata preparation during assembly.
 
 ## Export a snapshot
 
@@ -74,6 +109,16 @@ whole well-known namespace or inspect other handlers.
 canonical URL and bytes and only changes dispatch coordinates. A reverse proxy
 must actually perform the configured rewrite; the mapping does not rewrite
 forwarded requests.
+
+## Complete Pingora consumer
+
+The [multi-resource example](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/multi_resource_proxy.rs)
+consumes metadata contributions in its own server router and optionally serves
+an operator-supplied `security.txt` alongside them. Its router checks resource
+relationships, reserves exact publication paths for all methods, and rejects
+ambiguous paths before selecting a branch. The
+[metadata guide](crate::_docs::how_to::resource_metadata) includes configuration,
+rewrite examples, and the integration-test command.
 
 ## Axum integration
 
