@@ -98,6 +98,12 @@ impl huskarl_login::Session for MockSession {
     }
 }
 
+#[derive(Default)]
+struct SaveGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 // ── Mock session store ───────────────────────────────────────────
 
 #[derive(Builder, Default)]
@@ -112,6 +118,9 @@ struct MockSessionDriver {
     fail_save: bool,
     #[builder(default)]
     save_cookies: Vec<HeaderValue>,
+    save_gate: Option<Arc<SaveGate>>,
+    #[builder(default)]
+    save_completions: Mutex<usize>,
     #[builder(default)]
     fail_revoke: bool,
 }
@@ -194,12 +203,17 @@ impl SessionDriver for MockSessionDriver {
         _: &http::HeaderMap,
     ) -> Result<Vec<HeaderValue>, SessionError> {
         *self.save_calls.lock().unwrap() += 1;
+        if let Some(gate) = &self.save_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         if self.fail_save {
             return Err(SessionError::new(
                 SessionErrorKind::Unavailable,
                 "save failed",
             ));
         }
+        *self.save_completions.lock().unwrap() += 1;
         Ok(self.save_cookies.clone())
     }
     async fn revoke(&self, _: &MockSession) -> Result<(), SessionError> {

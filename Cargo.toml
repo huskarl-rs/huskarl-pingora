@@ -69,6 +69,7 @@ huskarl = { version = "0.11", path = "../huskarl/huskarl", default-features = fa
 huskarl-login = { version = "0.3", path = "../huskarl-login", optional = true }
 
 [dev-dependencies]
+h2 = "0.4"
 huskarl-login = { version = "0.3", path = "../huskarl-login", features = ["test-support"] }
 huskarl-resource-server = { version = "0.11", path = "../huskarl/huskarl-resource-server" }
 huskarl-reqwest = { version = "0.9", path = "../huskarl/huskarl-reqwest", features = ["rustls-tls"] }

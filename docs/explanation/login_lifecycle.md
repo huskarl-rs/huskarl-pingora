@@ -69,12 +69,32 @@ that behavior and should be included in integration tests.
 ## Testing the contract
 
 `src/login/proxy/tests/lifecycle.rs` drives Pingora's actual `HttpProxy` request
-runner over an in-memory downstream connection, with loopback upstreams and
-Pingora's in-memory cache. The scenario table covers upstream, early hints,
-cache hits, revalidation, queued local responses, and direct writes. Assertions
-check the bytes delivered to the client, cached headers, persistence counts,
-and identity visibility during logging. Extend the inner proxy implementations
-and scenarios when adding middleware or upgrading Pingora.
+runner over in-memory HTTP/1 and HTTP/2 downstream connections, with loopback
+HTTP/1 and HTTP/2 upstreams and Pingora's in-memory cache. The scenario table
+covers upstream responses, early hints, cache hits, revalidation, queued local
+responses, and direct writes. Assertions check client-observed headers and bodies,
+cached headers, persistence counts, and identity visibility during logging.
+HTTP/2 responses are decoded by the `h2` client. Pingora currently consumes
+HTTP/2 upstream informational headers without invoking the adapter's response
+hook; HTTP/1 upstream informational headers do reach it.
+
+Failure tests use notifications to pause at known boundaries, without sleeps:
+
+- Disconnect before response headers while persistence is pending: the save
+  completes once, the write fails, and logging does not repeat persistence.
+- Disconnect during a large buffered body: the client has received the cookie
+  header, and the body-write failure does not repeat persistence.
+- Reset an HTTP/2 stream during persistence: the request task completes its save
+  and error cleanup even though the client cannot receive the response.
+- Abort the request task before finalization or during a save: no response is
+  delivered and async logging cleanup does not run. The mock save does not
+  complete; a real backend may already have committed, so cancellation does not
+  establish rollback or safe retry.
+
+These tests distinguish request-task cancellation from a client disconnect.
+Cookie receipt here means transport delivery, not browser acceptance. Extend
+the inner proxy implementations and scenarios when adding middleware or
+upgrading Pingora.
 
 Run `cargo test --lib login::proxy::tests::lifecycle` (loopback access is required).
 Unit tests additionally cover termination, interim headers, upgrades, and

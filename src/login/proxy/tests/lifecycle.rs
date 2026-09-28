@@ -1,13 +1,15 @@
 //! Contract tests through Pingora's real request runner, not a simulated hook order.
-use super::*;
-use pingora_cache::{CacheKey, CacheMeta, MemCache, RespCacheable, storage::Storage};
-use pingora_core::{
-    apps::HttpServerApp, protocols::http::ServerSession, server::configuration::ServerConf,
-};
 use std::sync::{
     LazyLock,
     atomic::{AtomicUsize, Ordering},
 };
+
+use pingora_cache::{CacheKey, CacheMeta, MemCache, RespCacheable, storage::Storage};
+use pingora_core::{
+    apps::HttpServerApp, protocols::http::ServerSession, server::configuration::ServerConf,
+};
+
+use super::*;
 
 static CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
 static NEXT_KEY: AtomicUsize = AtomicUsize::new(0);
@@ -20,6 +22,7 @@ enum ResponsePath {
     CacheHit,
     Revalidated,
     Local,
+    LocalLarge,
     LocalHead,
     LocalNoContent,
     LocalNotModified,
@@ -30,8 +33,10 @@ enum ResponsePath {
 struct LifecycleInner {
     path: ResponsePath,
     upstream: Option<std::net::SocketAddr>,
+    upstream_h2: bool,
     key: String,
     observed: Arc<Mutex<Vec<&'static str>>>,
+    request_gate: Option<Arc<SaveGate>>,
 }
 
 #[async_trait]
@@ -42,8 +47,13 @@ impl ProxyHttp for LifecycleInner {
     }
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         ctx.login_state_mut().pending = Some(owed_persist());
+        if let Some(gate) = &self.request_gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         match self.path {
             ResponsePath::Local
+            | ResponsePath::LocalLarge
             | ResponsePath::LocalHead
             | ResponsePath::LocalNoContent
             | ResponsePath::LocalNotModified => {
@@ -54,7 +64,11 @@ impl ProxyHttp for LifecycleInner {
                         _ => http::StatusCode::OK,
                     },
                     headers: vec![],
-                    body: Bytes::from_static(b"local"),
+                    body: if matches!(self.path, ResponsePath::LocalLarge) {
+                        Bytes::from(vec![b'x'; 65536])
+                    } else {
+                        Bytes::from_static(b"local")
+                    },
                 })?;
                 Ok(false)
             }
@@ -73,11 +87,15 @@ impl ProxyHttp for LifecycleInner {
             )
             .into_up());
         }
-        Ok(Box::new(HttpPeer::new(
+        let mut peer = HttpPeer::new(
             self.upstream.expect("cache hit must not contact upstream"),
             false,
             String::new(),
-        )))
+        );
+        if self.upstream_h2 {
+            peer.options.set_http_version(2, 2);
+        }
+        Ok(Box::new(peer))
     }
     fn request_cache_filter(&self, session: &mut Session, _: &mut Self::CTX) -> Result<()> {
         if matches!(
@@ -124,11 +142,14 @@ impl ProxyHttp for LifecycleInner {
         }
         Ok(())
     }
-    async fn logging(&self, _: &mut Session, _: Option<&Error>, ctx: &mut Self::CTX) {
+    async fn logging(&self, _: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX) {
         assert!(
             ctx.login_state().session.is_some(),
             "identity must survive finalization"
         );
+        if error.is_some() {
+            self.observed.lock().unwrap().push("error");
+        }
         self.observed.lock().unwrap().push("logging");
     }
 }
@@ -157,6 +178,7 @@ async fn seed_cache(key: &str, stale: bool) {
 
 async fn start_upstream(
     path: ResponsePath,
+    http2: bool,
 ) -> (
     Option<std::net::SocketAddr>,
     Option<tokio::task::JoinHandle<()>>,
@@ -169,6 +191,43 @@ async fn start_upstream(
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            if http2 {
+                let mut connection = h2::server::handshake(stream).await.unwrap();
+                let (request, mut response) = connection.accept().await.unwrap().unwrap();
+                assert_eq!(request.version(), http::Version::HTTP_2);
+                if matches!(path, ResponsePath::EarlyHints) {
+                    response
+                        .send_informational(http::Response::builder().status(103).body(()).unwrap())
+                        .unwrap();
+                }
+                if matches!(path, ResponsePath::Revalidated) {
+                    assert!(request.headers().contains_key("if-none-match"));
+                    response
+                        .send_response(
+                            http::Response::builder().status(304).body(()).unwrap(),
+                            true,
+                        )
+                        .unwrap();
+                } else {
+                    let mut body = response
+                        .send_response(
+                            http::Response::builder()
+                                .status(200)
+                                .header("content-length", "8")
+                                .body(())
+                                .unwrap(),
+                            false,
+                        )
+                        .unwrap();
+                    body.send_data(Bytes::from_static(b"upstream"), true)
+                        .unwrap();
+                }
+                connection.graceful_shutdown();
+                while let Some(request) = connection.accept().await {
+                    request.unwrap();
+                }
+                return;
+            }
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
                 request.push(stream.read_u8().await.unwrap());
@@ -201,44 +260,10 @@ async fn start_upstream(
     }
 }
 
-async fn run_case(path: ResponsePath, fail_save: bool) -> (String, Vec<&'static str>) {
-    let key = format!("finalization-{}", NEXT_KEY.fetch_add(1, Ordering::Relaxed));
-    if matches!(path, ResponsePath::CacheHit | ResponsePath::Revalidated) {
-        seed_cache(&key, matches!(path, ResponsePath::Revalidated)).await;
-    }
-    let (upstream, task) = start_upstream(path).await;
-    let engine = build_engine(
-        MockSessionDriver::builder()
-            .load_session(MockSession::default())
-            .fail_save(fail_save)
-            .save_cookies(vec![HeaderValue::from_static(COOKIE)])
-            .build(),
-    )
-    .await;
-    let observed = Arc::new(Mutex::new(Vec::new()));
-    let proxy = LoginProxy::builder()
-        .inner(LifecycleInner {
-            path,
-            upstream,
-            key: key.clone(),
-            observed: observed.clone(),
-        })
-        .engine(engine.clone())
-        .path_guard(GuardConfig::new(
-            crate::login::CaseSensitivity::Sensitive,
-            DecodeDepth::UpToOne,
-        ))
-        .build()
-        .unwrap();
-    let mut app = pingora_proxy::HttpProxy::new(proxy, Arc::new(ServerConf::default()));
-    app.handle_init_modules();
-    let app = Arc::new(app);
+type LifecycleApp = pingora_proxy::HttpProxy<LoginProxy<LifecycleInner, MockSessionDriver>>;
+
+async fn exchange_h1(app: Arc<LifecycleApp>, method: &str) -> String {
     let (mut client, server) = tokio::io::duplex(16384);
-    let method = if matches!(path, ResponsePath::LocalHead) {
-        "HEAD"
-    } else {
-        "GET"
-    };
     client.write_all(format!("{method} /api HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
     let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let serve = async {
@@ -252,12 +277,142 @@ async fn run_case(path: ResponsePath, fail_save: bool) -> (String, Vec<&'static 
         client.read_to_end(&mut bytes).await.unwrap();
         String::from_utf8(bytes).unwrap()
     };
-    let ((), wire) =
-        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(serve, read) })
-            .await
-            .unwrap();
+    let ((), wire) = tokio::join!(serve, read);
+    wire
+}
+
+async fn exchange_h2(app: Arc<LifecycleApp>, method: &str) -> String {
+    use pingora_core::protocols::{
+        Digest,
+        http::v2::server::{H2Accept, HttpSession, handshake},
+    };
+    let (client, server) = tokio::io::duplex(16384);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let server_driver = tokio::spawn(async move {
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let Some(H2Accept::Session(session)) =
+            HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
+                .await
+                .unwrap()
+        else {
+            panic!("expected h2 request");
+        };
+        assert!(tx.send(session).is_ok());
+        while let Some(request) = connection.accept().await {
+            request.unwrap();
+        }
+    });
+    let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
+    let client_driver = tokio::spawn(connection);
+    let request = http::Request::builder()
+        .method(method)
+        .uri("https://localhost/api")
+        .header("accept", "application/json")
+        .body(())
+        .unwrap();
+    let (response, _stream) = sender.send_request(request, true).unwrap();
+    let session = rx.await.unwrap();
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let serve = async {
+        drop(
+            app.process_new_http(ServerSession::new_http2(session), &shutdown)
+                .await,
+        );
+    };
+    let read = async {
+        let response = response.await.unwrap();
+        let mut wire = format!("HTTP/2 {}\r\n", response.status());
+        for (name, value) in response.headers() {
+            use std::fmt::Write;
+            write!(wire, "{name}: {}\r\n", value.to_str().unwrap()).unwrap();
+        }
+        wire.push_str("\r\n");
+        let mut body = response.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            wire.push_str(std::str::from_utf8(&chunk).unwrap());
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+        }
+        wire
+    };
+    let ((), wire) = tokio::join!(serve, read);
+    client_driver.abort();
+    server_driver.abort();
+    let _ = client_driver.await;
+    let _ = server_driver.await;
+    wire
+}
+
+async fn run_case(path: ResponsePath, fail_save: bool) -> (String, Vec<&'static str>) {
+    run_case_with_protocol(path, fail_save, false).await
+}
+
+async fn run_case_with_protocol(
+    path: ResponsePath,
+    fail_save: bool,
+    http2: bool,
+) -> (String, Vec<&'static str>) {
+    run_case_with_protocols(path, fail_save, http2, false).await
+}
+
+async fn run_case_with_protocols(
+    path: ResponsePath,
+    fail_save: bool,
+    http2: bool,
+    upstream_h2: bool,
+) -> (String, Vec<&'static str>) {
+    let key = format!("finalization-{}", NEXT_KEY.fetch_add(1, Ordering::Relaxed));
+    if matches!(path, ResponsePath::CacheHit | ResponsePath::Revalidated) {
+        seed_cache(&key, matches!(path, ResponsePath::Revalidated)).await;
+    }
+    let (upstream, task) = start_upstream(path, upstream_h2).await;
+    let engine = build_engine(
+        MockSessionDriver::builder()
+            .load_session(MockSession::default())
+            .fail_save(fail_save)
+            .save_cookies(vec![HeaderValue::from_static(COOKIE)])
+            .build(),
+    )
+    .await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let proxy = LoginProxy::builder()
+        .inner(LifecycleInner {
+            path,
+            upstream,
+            upstream_h2,
+            key: key.clone(),
+            observed: observed.clone(),
+            request_gate: None,
+        })
+        .engine(engine.clone())
+        .path_guard(GuardConfig::new(
+            crate::login::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
+        .build()
+        .unwrap();
+    let mut app = pingora_proxy::HttpProxy::new(proxy, Arc::new(ServerConf::default()));
+    app.handle_init_modules();
+    let app = Arc::new(app);
+    let method = if matches!(path, ResponsePath::LocalHead) {
+        "HEAD"
+    } else {
+        "GET"
+    };
+    let wire = tokio::time::timeout(Duration::from_secs(5), async {
+        if http2 {
+            exchange_h2(app, method).await
+        } else {
+            exchange_h1(app, method).await
+        }
+    })
+    .await
+    .expect("request lifecycle timed out");
     if let Some(task) = task {
-        task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
     assert_eq!(
         engine.session_store().save_count(),
@@ -368,5 +523,360 @@ async fn upstream_failure_uses_cleanup_without_claiming_cookie_delivery() {
     let (wire, events) = run_case(ResponsePath::UpstreamFailure, false).await;
     assert!(wire.starts_with("HTTP/1.1 502"), "{wire}");
     assert!(!wire.contains(COOKIE));
-    assert_eq!(events, ["logging"]);
+    assert_eq!(events, ["error", "logging"]);
+}
+
+#[tokio::test]
+async fn http2_response_paths_finalize_and_keep_cookies_out_of_cache() {
+    for path in [
+        ResponsePath::Upstream,
+        ResponsePath::EarlyHints,
+        ResponsePath::CacheHit,
+        ResponsePath::Revalidated,
+        ResponsePath::Local,
+        ResponsePath::LocalHead,
+        ResponsePath::LocalNoContent,
+        ResponsePath::LocalNotModified,
+    ] {
+        let (wire, events) = run_case_with_protocol(path, false, true).await;
+        let status = match path {
+            ResponsePath::LocalNoContent => 204,
+            ResponsePath::LocalNotModified => 304,
+            _ => 200,
+        };
+        assert!(
+            wire.starts_with(&format!("HTTP/2 {status}")),
+            "{path:?}: {wire}"
+        );
+        assert_eq!(wire.matches(COOKIE).count(), 1, "{path:?}: {wire}");
+        assert!(wire.contains("cache-control: no-store"));
+        assert_eq!(events.last(), Some(&"logging"));
+        assert_eq!(events.iter().filter(|event| **event == "final").count(), 1);
+        if matches!(path, ResponsePath::EarlyHints) {
+            assert!(events.contains(&"interim"));
+        }
+        if matches!(
+            path,
+            ResponsePath::LocalHead | ResponsePath::LocalNoContent | ResponsePath::LocalNotModified
+        ) {
+            assert!(wire.ends_with("\r\n\r\n"), "{path:?}: unexpected body");
+        }
+    }
+}
+
+#[tokio::test]
+async fn http2_persist_failures_never_deliver_success_or_cookies() {
+    for path in [
+        ResponsePath::Upstream,
+        ResponsePath::CacheHit,
+        ResponsePath::Revalidated,
+        ResponsePath::Local,
+    ] {
+        let (wire, events) = run_case_with_protocol(path, true, true).await;
+        let status = if matches!(path, ResponsePath::CacheHit) {
+            500
+        } else {
+            503
+        };
+        assert!(
+            wire.starts_with(&format!("HTTP/2 {status}")),
+            "{path:?}: {wire}"
+        );
+        assert!(!wire.contains(COOKIE));
+        assert!(!wire.contains("cached") && !wire.contains("upstream") && !wire.ends_with("local"));
+        assert_eq!(events.last(), Some(&"logging"));
+    }
+}
+
+struct LocalFixture {
+    app: Arc<LifecycleApp>,
+    engine: Arc<LoginEngine<MockSessionDriver>>,
+    observed: Arc<Mutex<Vec<&'static str>>>,
+}
+
+async fn local_fixture(
+    path: ResponsePath,
+    save_gate: Option<Arc<SaveGate>>,
+    request_gate: Option<Arc<SaveGate>>,
+) -> LocalFixture {
+    let engine = build_engine(
+        MockSessionDriver::builder()
+            .load_session(MockSession::default())
+            .save_cookies(vec![HeaderValue::from_static(COOKIE)])
+            .maybe_save_gate(save_gate)
+            .build(),
+    )
+    .await;
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let proxy = LoginProxy::builder()
+        .inner(LifecycleInner {
+            path,
+            upstream: None,
+            upstream_h2: false,
+            key: String::new(),
+            observed: observed.clone(),
+            request_gate,
+        })
+        .engine(engine.clone())
+        .path_guard(GuardConfig::new(
+            crate::login::CaseSensitivity::Sensitive,
+            DecodeDepth::UpToOne,
+        ))
+        .build()
+        .unwrap();
+    let mut app = pingora_proxy::HttpProxy::new(proxy, Arc::new(ServerConf::default()));
+    app.handle_init_modules();
+    LocalFixture {
+        app: Arc::new(app),
+        engine,
+        observed,
+    }
+}
+
+async fn start_local_request(
+    app: Arc<LifecycleApp>,
+) -> (DuplexStream, tokio::task::JoinHandle<()>) {
+    let (mut client, server) = tokio::io::duplex(1024);
+    client.write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n").await.unwrap();
+    let task = tokio::spawn(async move {
+        let (_tx, shutdown) = tokio::sync::watch::channel(false);
+        drop(
+            app.process_new_http(ServerSession::new_http1(Box::new(server)), &shutdown)
+                .await,
+        );
+    });
+    (client, task)
+}
+
+#[tokio::test]
+async fn disconnect_before_headers_does_not_repeat_completed_persistence() {
+    let gate = Arc::new(SaveGate::default());
+    let fixture = local_fixture(ResponsePath::Local, Some(gate.clone()), None).await;
+    let (client, task) = start_local_request(fixture.app).await;
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        *fixture
+            .engine
+            .session_store()
+            .save_completions
+            .lock()
+            .unwrap(),
+        0
+    );
+    // Persistence is in flight. Closing the reader guarantees the subsequent
+    // downstream header write fails, without relying on socket timing.
+    drop(client);
+    gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.engine.session_store().save_count(), 1);
+    assert_eq!(
+        *fixture
+            .engine
+            .session_store()
+            .save_completions
+            .lock()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        *fixture.observed.lock().unwrap(),
+        ["final", "error", "logging"]
+    );
+}
+
+#[tokio::test]
+async fn disconnect_during_body_preserves_the_already_delivered_cookie() {
+    let fixture = local_fixture(ResponsePath::LocalLarge, None, None).await;
+    let (mut client, task) = start_local_request(fixture.app).await;
+    let header = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(client.read_u8().await.unwrap());
+        }
+        String::from_utf8(header).unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(header.matches(COOKIE).count(), 1);
+    assert!(header.to_lowercase().contains("content-length: 65536"));
+    // The body exceeds the duplex buffer, so the writer cannot have completed.
+    assert!(!task.is_finished());
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.engine.session_store().save_count(), 1);
+    assert_eq!(
+        *fixture
+            .engine
+            .session_store()
+            .save_completions
+            .lock()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        *fixture.observed.lock().unwrap(),
+        ["final", "error", "logging"]
+    );
+}
+
+#[tokio::test]
+async fn aborting_the_request_task_does_not_run_async_cleanup() {
+    for during_save in [false, true] {
+        let gate = Arc::new(SaveGate::default());
+        let fixture = local_fixture(
+            ResponsePath::Local,
+            during_save.then(|| gate.clone()),
+            (!during_save).then(|| gate.clone()),
+        )
+        .await;
+        let (mut client, task) = start_local_request(fixture.app).await;
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let mut wire = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut wire))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            wire.is_empty(),
+            "cancellation before headers cannot deliver cookies"
+        );
+        assert_eq!(
+            fixture.engine.session_store().save_count(),
+            usize::from(during_save)
+        );
+        assert_eq!(
+            *fixture
+                .engine
+                .session_store()
+                .save_completions
+                .lock()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            *fixture.observed.lock().unwrap(),
+            if during_save { vec!["final"] } else { vec![] }
+        );
+    }
+}
+
+#[tokio::test]
+async fn http2_upstreams_finalize_for_both_downstream_protocols() {
+    for downstream_h2 in [false, true] {
+        for path in [
+            ResponsePath::Upstream,
+            ResponsePath::EarlyHints,
+            ResponsePath::Revalidated,
+        ] {
+            for fail_save in [false, true] {
+                let (wire, events) =
+                    run_case_with_protocols(path, fail_save, downstream_h2, true).await;
+                let status = if fail_save { 503 } else { 200 };
+                let protocol = if downstream_h2 { "HTTP/2" } else { "HTTP/1.1" };
+                assert!(
+                    wire.contains(&format!("{protocol} {status}")),
+                    "{path:?}: {wire}"
+                );
+                assert_eq!(wire.matches(COOKIE).count(), usize::from(!fail_save));
+                if fail_save {
+                    assert!(!wire.ends_with("upstream") && !wire.ends_with("cached"));
+                }
+                assert_eq!(events.last(), Some(&"logging"));
+                if matches!(path, ResponsePath::EarlyHints) {
+                    // Pingora's h2 upstream reader polls only the final
+                    // ResponseFuture; it does not forward informational headers.
+                    assert!(!events.contains(&"interim"));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn http2_stream_reset_during_save_completes_once_and_runs_cleanup() {
+    use pingora_core::protocols::{
+        Digest,
+        http::v2::server::{H2Accept, HttpSession, handshake},
+    };
+    let gate = Arc::new(SaveGate::default());
+    let fixture = local_fixture(ResponsePath::Local, Some(gate.clone()), None).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (client, server) = tokio::io::duplex(16384);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let server_driver = tokio::spawn(async move {
+            let mut connection = handshake(Box::new(server), None).await.unwrap();
+            let Some(H2Accept::Session(session)) =
+                HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected h2 request");
+            };
+            assert!(tx.send(session).is_ok());
+            while let Some(request) = connection.accept().await {
+                request.unwrap();
+            }
+        });
+        let (mut sender, mut connection) = h2::client::handshake(client).await.unwrap();
+        let mut ping = connection.ping_pong().unwrap();
+        let client_driver = tokio::spawn(connection);
+        let request = http::Request::builder()
+            .uri("https://localhost/api")
+            .header("accept", "application/json")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = sender.send_request(request, true).unwrap();
+        let session = rx.await.unwrap();
+        let task = tokio::spawn(async move {
+            let (_tx, shutdown) = tokio::sync::watch::channel(false);
+            drop(
+                fixture
+                    .app
+                    .process_new_http(ServerSession::new_http2(session), &shutdown)
+                    .await,
+            );
+        });
+        gate.entered.notified().await;
+        stream.send_reset(h2::Reason::CANCEL);
+        // The round trip orders reset processing before persistence resumes.
+        ping.ping(h2::Ping::opaque()).await.unwrap();
+        assert_eq!(
+            response.await.unwrap_err().reason(),
+            Some(h2::Reason::CANCEL)
+        );
+        gate.release.notify_one();
+        task.await.unwrap();
+        client_driver.abort();
+        server_driver.abort();
+        let _ = client_driver.await;
+        let _ = server_driver.await;
+    })
+    .await
+    .expect("reset lifecycle timed out");
+    assert_eq!(fixture.engine.session_store().save_count(), 1);
+    assert_eq!(
+        *fixture
+            .engine
+            .session_store()
+            .save_completions
+            .lock()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        *fixture.observed.lock().unwrap(),
+        ["final", "error", "logging"]
+    );
 }
