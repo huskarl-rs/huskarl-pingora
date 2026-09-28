@@ -339,7 +339,9 @@ where
             return Err(crate::resource::ConfigError::ProtectedResourceAlreadyConfigured);
         }
         self.guard.bind_resource_mapping(definition.mapping())?;
-        let config = self.guard.build_resource_metadata(definition.resource())?;
+        let config = self
+            .guard
+            .build_resource_metadata_from_definition(definition)?;
         let (binding, endpoint) = split_resource_metadata(config, definition.audiences().to_vec());
         self.protected_resource = Some(binding);
         Ok((self, endpoint))
@@ -863,17 +865,44 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // End-to-end publication and authentication contract.
     async fn publication_export_and_mapped_handler_share_bound_metadata() {
         use huskarl_resource_server::core::url_mapping::PublicUrlMapping;
         use tokio::io::AsyncReadExt;
 
-        let (auth, metadata) = build_auth_proxy(MockValidator(MockOutcome::Missing), vec![])
-            .with_protected_resource("/app?tenant=one", AudienceBinding::ResourceIdentifier)
+        let definition =
+            crate::resource_server::resource::ResourceDefinition::builder_from_mapping(
+                &PublicUrlMapping::new("https://api.example.com", "/").unwrap(),
+            )
+            .subpath("/app?tenant=one")
+            .audience(AudienceBinding::ResourceIdentifier)
+            .resource_name("Published API")
+            .resource_documentation("https://api.example.com/docs".parse().unwrap())
+            .scopes_supported(vec!["owner.read".into()])
+            .build()
             .unwrap();
+        let guard = Guard::builder()
+            .validator(MockValidator(MockOutcome::Missing))
+            .path_guard(crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            ))
+            .subtree("/app", Rule::required().scopes(["guard.read"]))
+            .build()
+            .unwrap();
+        let bound =
+            crate::resource::BoundResource::new(definition, guard, InnerProxy::new()).unwrap();
+        let (_, auth, metadata) = bound.into_parts();
         let canonical = metadata.publication().uri.clone();
         let exported = metadata.publication().body.to_vec();
         let json: serde_json::Value = serde_json::from_slice(&exported).unwrap();
         assert_eq!(json["resource"], metadata.resource().to_string());
+        assert_eq!(json["resource_name"], "Published API");
+        assert_eq!(
+            json["resource_documentation"],
+            "https://api.example.com/docs"
+        );
+        assert_eq!(json["scopes_supported"], serde_json::json!(["owner.read"]));
         assert_eq!(
             auth.protected_resource
                 .as_ref()
@@ -882,6 +911,18 @@ mod tests {
                 .resource_metadata,
             Some(canonical.to_string())
         );
+        let (mut session, _client) = make_session("GET", "/app").await;
+        assert!(
+            auth.request_filter(&mut session, &mut auth.new_ctx())
+                .await
+                .unwrap()
+        );
+        let response = session.response_written().unwrap();
+        assert_eq!(response.status.as_u16(), 401);
+        let challenge = response.headers["www-authenticate"].to_str().unwrap();
+        assert!(challenge.contains("guard.read"));
+        assert!(!challenge.contains("owner.read"));
+
         let wrong = PublicUrlMapping::new("https://other.example", "/").unwrap();
         assert!(metadata.clone().with_mapping(&wrong).is_err());
         let mapping =

@@ -1,5 +1,9 @@
 //! Drive the example's consumer router through Pingora's HTTP request runner.
-use super::*;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use huskarl_pingora::resource_server::{
     core::platform::MaybeSendBoxFuture,
     validator::{
@@ -10,11 +14,9 @@ use huskarl_pingora::resource_server::{
 use pingora_core::{
     apps::HttpServerApp, protocols::http::ServerSession, server::configuration::ServerConf,
 };
-use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::*;
 
 #[derive(Default)]
 struct Observed {

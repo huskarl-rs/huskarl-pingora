@@ -1,4 +1,6 @@
 //! Shared example transport setup, not a library-level resource abstraction.
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use huskarl_pingora::{
     resource::{AuthCtx, HasAuthState},
@@ -12,7 +14,6 @@ use pingora_core::{server::Server, upstreams::peer::HttpPeer};
 use pingora_error::Result;
 use pingora_proxy::{ProxyHttp, Session, http_proxy_service};
 use pingora_proxy_router::RouteSlot;
-use std::sync::Arc;
 pub type Claims = huskarl_pingora::resource_server::validator::rfc9068::Rfc9068AccessTokenClaims;
 
 pub struct AppContext {

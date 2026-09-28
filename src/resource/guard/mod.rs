@@ -414,6 +414,21 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         &self,
         resource: &str,
     ) -> Result<ResourceMetadataConfig, ConfigError> {
+        self.build_resource_metadata_inner(resource, None)
+    }
+
+    pub(crate) fn build_resource_metadata_from_definition(
+        &self,
+        definition: &crate::resource_server::resource::ResourceDefinition,
+    ) -> Result<ResourceMetadataConfig, ConfigError> {
+        self.build_resource_metadata_inner(definition.resource(), Some(definition))
+    }
+
+    fn build_resource_metadata_inner(
+        &self,
+        resource: &str,
+        definition: Option<&crate::resource_server::resource::ResourceDefinition>,
+    ) -> Result<ResourceMetadataConfig, ConfigError> {
         validate_resource_identifier(resource)?;
         let resource_uri =
             resource
@@ -428,12 +443,17 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
                 source,
             })?;
 
-        let (metadata, body) = crate::resource_server::resource::prepare_metadata(
-            resource,
-            &self.validator,
-            self.scopes_supported.clone(),
-        )
-        .map_err(|error| match error {
+        let prepared = match definition {
+            Some(definition) => definition
+                .prepare(&self.validator, self.scopes_supported.clone())
+                .map(|prepared| (prepared.validator_metadata, prepared.body)),
+            None => crate::resource_server::resource::prepare_metadata(
+                resource,
+                &self.validator,
+                self.scopes_supported.clone(),
+            ),
+        };
+        let (metadata, body) = prepared.map_err(|error| match error {
             crate::resource_server::resource::ResourceError::MetadataUrlMismatch {
                 configured,
                 derived,

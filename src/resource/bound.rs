@@ -1,12 +1,13 @@
 //! A resource binding carried intact to a server's routing boundary.
 
+use pingora_proxy::ProxyHttp;
+use pingora_proxy_router::{Route, route};
+
 use super::{AuthProxy, ConfigError, Guard, HasAuthState, HasScopes, ResourceMetadataEndpoint};
 use crate::resource_server::{
     resource::ResourceDefinition,
     validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata},
 };
-use pingora_proxy::ProxyHttp;
-use pingora_proxy_router::{Route, route};
 
 /// An authenticated proxy and its metadata, prepared from one resource definition.
 ///

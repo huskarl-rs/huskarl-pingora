@@ -113,3 +113,22 @@ If the front proxy instead forwards `/edge/dashboard`, set `INCOMING_PREFIX=/edg
 callback, logout and application policies then use `/edge/...`. Forwarded paths
 remain unchanged, so the upstream must also accept those paths. Merely configuring
 a mapping does not perform a rewrite. Keep `COOKIE_KEY` stable across restarts.
+
+## Metadata fields and local development
+
+The first example uses `ResourceDefinition::builder_from_mapping(&mapping)`:
+only resource-specific inputs remain to be set. Use `builder()` when supplying
+the mapping alongside the other inputs. Optional name, documentation, policy,
+terms and advertised-scope setters belong to the definition; binding supplies
+validator capabilities. Explicit scopes override adapter defaults, including
+an empty list to omit them. They do not change authorization requirements.
+
+See the shared [metadata and browser discovery guide](https://github.com/huskarl-rs/huskarl/blob/main/huskarl-resource-server/docs/guide/resource_metadata.md)
+for a standalone document example and server-owned CORS configuration.
+
+During API iteration, this repository's Cargo patches use sibling
+`../huskarl/huskarl-core` and `../huskarl/huskarl-resource-server` sources.
+Keep the sibling checkout alongside this repository. Cargo patches apply only
+at the workspace root; an external application needs equivalent root patches.
+Remove these overrides after releasing the shared API and update version
+requirements before publishing the adapter.

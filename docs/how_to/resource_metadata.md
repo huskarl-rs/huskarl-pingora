@@ -58,8 +58,8 @@ let proxy = ResourceMetadataProxy::new(inventory).publish(metadata)?;
 
 `Rule::required().scopes(...)` enforces scopes. Metadata describes supported
 capabilities; publishing it is not a substitute for a route policy. The guard
-collects rule scopes for advertisement when the validator does not already
-supply `scopes_supported`.
+collects rule scopes for advertisement. A bound `ResourceDefinition` can override
+that list with its builder's `scopes_supported` field.
 
 A resource-bound proxy only applies its guard inside that resource's path.
 Requests outside it are refused with 403; requests whose public URI cannot be
@@ -194,3 +194,14 @@ If discovery fails, check that no authentication layer or branch wraps the
 metadata endpoint. If the challenge points to the wrong document, check the
 selected resource and trusted public base URL. If a token crosses resource
 boundaries, check for overlapping audiences and missing route protection.
+
+## Owner fields and browser discovery
+
+Use `ResourceDefinition::builder_from_mapping(&mapping)` to add a resource name,
+documentation, privacy-policy and terms URLs, and advertised scopes before
+binding. The [registration guide](crate::_docs::how_to::resource_registration)
+shows this API. Existing constructors retain their defaults.
+
+The shared [metadata guide](https://github.com/huskarl-rs/huskarl/blob/main/huskarl-resource-server/docs/guide/resource_metadata.md)
+describes standalone publication and CORS for browser discovery, including
+exposing `WWW-Authenticate` on locally generated authentication failures.

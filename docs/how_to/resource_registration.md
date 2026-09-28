@@ -16,9 +16,12 @@ use huskarl_pingora::resource_server::{
 };
 
 let mapping = PublicUrlMapping::new("https://api.example.com/gateway", "/edge")?;
-let inventory = ResourceDefinition::new(
-    mapping, "/mcp/inventory", AudienceBinding::ResourceIdentifier,
-)?;
+let inventory = ResourceDefinition::builder_from_mapping(&mapping)
+    .subpath("/mcp/inventory")
+    .audience(AudienceBinding::ResourceIdentifier)
+    .resource_name("Inventory API")
+    .resource_documentation("https://api.example.com/docs/inventory".parse()?)
+    .build()?;
 assert_eq!(inventory.resource(), "https://api.example.com/gateway/mcp/inventory");
 assert_eq!(inventory.incoming_mount(), "/edge/mcp/inventory");
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -73,9 +76,10 @@ Query parameters in a resource identifier do not restrict the authentication
 subtree to requests with those parameters: the entire mounted subtree belongs
 to that resource.
 
-Supply the complete advertised scope list to Axum; an empty list omits scopes
-from metadata. Lists are sorted and deduplicated. Pingora collects scopes from
-its guard rules. Scope advertisement does not grant access; configure scope
+The definition builder also accepts `resource_policy_uri`, `resource_tos_uri`,
+and `scopes_supported`. Explicit scopes override adapter defaults; an explicit
+empty list omits the field. When unset, Axum uses its supplied list and Pingora
+collects scopes from guard rules. Lists are sorted and deduplicated. Scope advertisement does not grant access; configure scope
 requirements in the guard or the Axum subtree's authorization layers.
 
 ## Login URL mapping

@@ -27,8 +27,12 @@ fn main() {
             .map_or(AudienceBinding::ResourceIdentifier, |value| {
                 AudienceBinding::mapped([value])
             });
-        let definition =
-            ResourceDefinition::new(mapping.clone(), "/api", audiences).expect("invalid resource");
+        let definition = ResourceDefinition::builder_from_mapping(&mapping)
+            .subpath("/api")
+            .audience(audiences)
+            .resource_name("Example API")
+            .build()
+            .expect("invalid resource");
 
         // 2. Choose who validates tokens. Use the definition's audience so both
         // token validation and resource binding agree. This example accepts one.
