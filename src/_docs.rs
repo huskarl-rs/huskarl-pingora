@@ -82,9 +82,12 @@ pub mod explanation {
 )]
 #[cfg_attr(
     feature = "login",
-    doc = "Look up [login finalization exceptions and mitigations](reference::login_finalization)."
+    doc = "Look up [login finalization exceptions and mitigations](reference::login_finalization) and [finalization invariants](reference::login_invariants)."
 )]
 pub mod reference {
+    #[cfg(feature = "login")]
+    #[doc = include_str!("../docs/reference/login_invariants.md")]
+    pub mod login_invariants {}
     #[cfg(feature = "login")]
     #[doc = include_str!("../docs/reference/login_finalization.md")]
     pub mod login_finalization {}

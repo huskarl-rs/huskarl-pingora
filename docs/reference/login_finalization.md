@@ -3,7 +3,9 @@
 This is the response contract for [`LoginProxy`](crate::login::LoginProxy),
 including exceptions observed by the Pingora 0.9 lifecycle tests. See
 [Login state through the Pingora lifecycle](crate::_docs::explanation::login_lifecycle)
-for the sequence of operations and a local-response example.
+for the sequence of operations and a local-response example. The
+[named finalization invariants](crate::_docs::reference::login_invariants) state
+the review obligations and map them to regression tests and coverage gaps.
 
 ## Supported behavior
 

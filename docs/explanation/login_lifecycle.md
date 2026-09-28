@@ -78,6 +78,11 @@ that behavior and should be included in integration tests.
 
 ## Testing the contract
 
+Use the [named invariants](crate::_docs::reference::login_invariants) as the
+review and test checklist for finalization, cookie handling, and failure behavior.
+They distinguish safety obligations from progress assumptions and list current
+coverage gaps.
+
 `src/login/proxy/tests/lifecycle.rs` drives Pingora's actual `HttpProxy` request
 runner over in-memory HTTP/1 and HTTP/2 downstream connections, with loopback
 HTTP/1 and HTTP/2 upstreams and Pingora's in-memory cache. The scenario table
