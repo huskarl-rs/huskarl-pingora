@@ -3,8 +3,8 @@
 //! [`LoginProxy`] wraps an inner proxy and runs each request through the
 //! shared [`LoginEngine`]: `/callback` and `/logout` are handled internally,
 //! the session is loaded (and refreshed if needed) for paths that need it,
-//! and persistence happens in `upstream_response_filter`, with a `logging`
-//! fallback for requests that never produce an upstream response.
+//! and persistence happens in `response_filter`, with a `logging`
+//! fallback for requests that never reach downstream finalization.
 //!
 //! Per-path policy is configured via a routing DSL that mirrors the resource
 //! side's [`Guard`](crate::resource::Guard). Register a [`LoginRule`] with
@@ -57,11 +57,16 @@ mod tests;
 ///   or forwards it to the inner proxy with the loaded session in the
 ///   context (rules `required` or `optional`). Paths matched by a `public`
 ///   rule skip session loading entirely.
-/// - `upstream_response_filter` persists or terminates the session via the
-///   engine, appending the resulting `Set-Cookie` headers to the response.
+/// - `response_filter` persists or terminates the session once, on the final
+///   downstream response (including cache hits). It appends `Set-Cookie` after
+///   cache processing, preserving the session for subsequent hooks. Interim
+///   responses are skipped; a `101` upgrade finalizes the session.
+/// - Inner handlers can queue a local response with
+///   [`LoginState::respond`](super::LoginState::respond), then return `Ok(false)`.
+///   The proxy finalizes and writes it without contacting an upstream.
 ///   A failure here is handled by the configured [`PersistFailurePolicy`].
 /// - `logging` is the persistence fallback for requests that never reach
-///   `upstream_response_filter` — the inner proxy answered the request
+///   `response_filter` — the inner proxy answered the request
 ///   itself in `request_filter`, or proxying failed. The response is
 ///   already sent at that point, so any `Set-Cookie` values the store
 ///   returns are dropped with a warning: external stores persist fine,
@@ -185,9 +190,10 @@ where
         /// persist) fails — letting the response through would strand the
         /// rotated token.
         ///
-        /// When the policy returns a replacement response, only its status
-        /// code is honored — pingora has already committed to the upstream
-        /// body, so the request is failed with that status instead.
+        /// A replacement response becomes a filter error carrying its status;
+        /// its headers and body are not used. Pingora 0.9 maps errors on fresh
+        /// cache hits to 500; other paths normally use the supplied status.
+        /// An inner `fail_to_proxy` override can also change error rendering.
         #[builder(default = Box::new(DefaultPersistFailurePolicy) as Box<dyn PersistFailurePolicy>)]
         persist_failure_policy: Box<dyn PersistFailurePolicy>,
         /// Whether to pass CORS preflight requests — `OPTIONS` carrying an
@@ -302,6 +308,119 @@ where
     /// policy.
     pub fn engine(&self) -> &Arc<LoginEngine<SD>> {
         &self.engine
+    }
+
+    /// Completes session work once, on the final downstream header block.
+    async fn finalize_response(
+        &self,
+        response: &mut ResponseHeader,
+        ctx: &mut P::CTX,
+    ) -> Result<()> {
+        let state = ctx.login_state_mut();
+        if response.status.is_informational()
+            && response.status != http::StatusCode::SWITCHING_PROTOCOLS
+        {
+            return Ok(());
+        }
+        if state.finalized {
+            return Ok(());
+        }
+        state.finalized = true;
+        let maybe_sess = state.session.as_ref();
+        let request_headers = std::mem::take(&mut state.request_headers);
+        let set_cookies = std::mem::take(&mut state.set_cookies);
+        let pending = state.pending.take();
+        let terminate_requested = std::mem::replace(&mut state.terminate_requested, false);
+
+        append_set_cookies(response, set_cookies)?;
+
+        let Some(sess) = maybe_sess else {
+            return Ok(());
+        };
+
+        if terminate_requested {
+            // The owed persist (if any) is moot for a session being terminated.
+            if let Some(pending) = pending {
+                pending.abandon();
+            }
+            // The browser clears are built before server-side revocation and
+            // are delivered whichever way revocation went: a backend failure
+            // can leave a copied store pointer usable, but must not keep the
+            // current browser logged in. Failing the request here would
+            // replace this response — clears and all — and leave the client
+            // holding a live session cookie, so report the revocation failure
+            // instead and let operators monitor it.
+            let (clears, revocation) = self
+                .engine
+                .terminate_session(sess, &request_headers)
+                .await
+                .into_parts();
+            append_set_cookies(response, clears)?;
+            if let Err(e) = revocation {
+                log::error!("failed to revoke session: {}", error_chain(&e));
+            }
+            return Ok(());
+        }
+
+        // Fully persisted at load time — nothing owed.
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        match pending.commit(&self.engine, &request_headers).await {
+            Ok(cookies) => append_set_cookies(response, cookies),
+            Err(e) => {
+                log::error!("failed to persist session: {}", error_chain(&e));
+                match self.persist_failure_policy.handle(&e) {
+                    // The filter cannot replace the body stream. Return a
+                    // status-bearing error; Pingora's fresh-hit path maps it
+                    // to 500, while its usual error handler honors the status.
+                    Some(resp) => Err(Error::explain(
+                        HTTPStatus(resp.status().as_u16()),
+                        format!("failed to persist session: {}", error_chain(&e)),
+                    )),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    async fn forward_request(&self, session: &mut Session, ctx: &mut P::CTX) -> Result<bool>
+    where
+        SD::SessionType: Clone,
+    {
+        let handled = self.inner.request_filter(session, ctx).await?;
+        let Some(response) = ctx.login_state_mut().response.take() else {
+            return Ok(handled);
+        };
+        if handled || session.response_written().is_some() {
+            return Err(Error::explain(
+                InternalError,
+                "queued login response requires an unwritten response and Ok(false)",
+            ));
+        }
+        let (status, headers, body) = response.into_parts();
+        let mut header = ResponseHeader::build(status, Some(headers.len() + 1))?;
+        for (name, value) in headers {
+            header.append_header(name, value)?;
+        }
+        header.remove_header(&http::header::TRANSFER_ENCODING);
+        let body_allowed =
+            status != http::StatusCode::NO_CONTENT && status != http::StatusCode::NOT_MODIFIED;
+        if body_allowed {
+            header.insert_header(http::header::CONTENT_LENGTH, body.len().to_string())?;
+        } else {
+            header.remove_header(&http::header::CONTENT_LENGTH);
+        }
+        self.response_filter(session, &mut header, ctx).await?;
+        let send_body =
+            body_allowed && session.req_header().method != http::Method::HEAD && !body.is_empty();
+        session
+            .write_response_header(Box::new(header), !send_body)
+            .await?;
+        if send_body {
+            session.write_response_body(Some(body), true).await?;
+        }
+        Ok(true)
     }
 
     /// Serves a retryable `503` for a [`LoadedSession::RefreshUnavailable`]: the
@@ -480,12 +599,12 @@ fn report_stranded_cookies(cookies: SetCookies) {
     cookies.discard();
 }
 
-/// Appends session `Set-Cookie` headers (eager-refresh re-seal, touch re-save,
-/// or teardown clears) to the upstream response.
+/// Appends session `Set-Cookie` headers to the downstream response, after
+/// Pingora cache processing.
 ///
 /// When any cookie is appended, the response is forced to
 /// `Cache-Control: no-store`: the upstream may have marked the response
-/// cacheable, and a shared cache storing a refreshed session cookie could
+/// cacheable, and a downstream shared cache storing a session cookie could
 /// replay it to another user (RFC 6749 §5.1). Engine-authored responses
 /// already carry `no-store`. An empty `cookies` (the steady-state authenticated
 /// request) leaves the upstream's own cache headers untouched.
@@ -531,7 +650,7 @@ where
                     .serve_path_confusion(session, uri.path(), &reason)
                     .await;
             }
-            return self.inner.request_filter(session, ctx).await;
+            return self.forward_request(session, ctx).await;
         }
 
         // The engine handles its configured callback / logout paths fully —
@@ -562,7 +681,7 @@ where
         // only in whether a missing session is fatal, plus an optional check.
         let (required, check) = match rule {
             LoginRule::Public { .. } => {
-                return self.inner.request_filter(session, ctx).await;
+                return self.forward_request(session, ctx).await;
             }
             LoginRule::Optional { check, .. } => (false, check),
             LoginRule::Required { check, .. } => (true, check),
@@ -619,7 +738,7 @@ where
             }
             ctx.login_state_mut()
                 .prepare_forward(None, None, headers.clone(), set_cookies);
-            return self.inner.request_filter(session, ctx).await;
+            return self.forward_request(session, ctx).await;
         };
 
         if let Some(check) = check
@@ -649,7 +768,7 @@ where
         ctx.login_state_mut()
             .prepare_forward(Some(sess), pending, headers.clone(), set_cookies);
 
-        self.inner.request_filter(session, ctx).await
+        self.forward_request(session, ctx).await
     }
 
     async fn upstream_request_filter(
@@ -672,87 +791,33 @@ where
             .await
     }
 
-    async fn upstream_response_filter(
+    async fn response_filter(
         &self,
         session: &mut Session,
-        upstream_response: &mut ResponseHeader,
+        response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        self.inner
-            .upstream_response_filter(session, upstream_response, ctx)
-            .await?;
-
-        let state = ctx.login_state_mut();
-        let maybe_sess = state.session.take();
-        let request_headers = std::mem::take(&mut state.request_headers);
-        let set_cookies = std::mem::take(&mut state.set_cookies);
-        let pending = state.pending.take();
-        let terminate_requested = std::mem::replace(&mut state.terminate_requested, false);
-
-        append_set_cookies(upstream_response, set_cookies)?;
-
-        let Some(sess) = maybe_sess else {
-            return Ok(());
-        };
-
-        if terminate_requested {
-            // The owed persist (if any) is moot for a session being terminated.
-            if let Some(pending) = pending {
-                pending.abandon();
-            }
-            // The browser clears are built before server-side revocation and
-            // are delivered whichever way revocation went: a backend failure
-            // can leave a copied store pointer usable, but must not keep the
-            // current browser logged in. Failing the request here would
-            // replace this response — clears and all — and leave the client
-            // holding a live session cookie, so report the revocation failure
-            // instead and let operators monitor it.
-            let (clears, revocation) = self
-                .engine
-                .terminate_session(&sess, &request_headers)
-                .await
-                .into_parts();
-            append_set_cookies(upstream_response, clears)?;
-            if let Err(e) = revocation {
-                log::error!("failed to revoke session: {}", error_chain(&e));
-            }
-            return Ok(());
-        }
-
-        // Fully persisted at load time — nothing owed.
-        let Some(pending) = pending else {
-            return Ok(());
-        };
-        match pending.commit(&self.engine, &request_headers).await {
-            Ok(cookies) => append_set_cookies(upstream_response, cookies),
-            Err(e) => {
-                log::error!("failed to persist session: {}", error_chain(&e));
-                match self.persist_failure_policy.handle(&e) {
-                    // Pingora has already committed to the upstream body, so
-                    // the replacement response can't be written as-is — fail
-                    // the request with the policy's status code instead.
-                    Some(resp) => Err(Error::explain(
-                        HTTPStatus(resp.status().as_u16()),
-                        format!("failed to persist session: {}", error_chain(&e)),
-                    )),
-                    None => Ok(()),
-                }
-            }
-        }
+        self.inner.response_filter(session, response, ctx).await?;
+        self.finalize_response(response, ctx).await
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
         // Persistence fallback for requests that never reached
-        // `upstream_response_filter`: the inner proxy answered in
-        // `request_filter`, or proxying failed. On the normal proxied path
-        // `upstream_response_filter` has already consumed the state and this
+        // `response_filter`: the inner proxy wrote directly in
+        // `request_filter`, or proxying failed. On a finalized response path
+        // `response_filter` has already consumed the state and this
         // is a no-op. The response is gone, so `Set-Cookie` values can no
         // longer be delivered — external stores still persist correctly,
         // cookie-backed stores cannot.
         let state = ctx.login_state_mut();
+        if state.finalized {
+            self.inner.logging(session, e, ctx).await;
+            return;
+        }
+        state.finalized = true;
         let set_cookies = std::mem::take(&mut state.set_cookies);
         report_stranded_cookies(set_cookies);
-        if let Some(sess) = state.session.take() {
+        if let Some(sess) = state.session.as_ref() {
             let request_headers = std::mem::take(&mut state.request_headers);
             let pending = state.pending.take();
             let terminate_requested = std::mem::replace(&mut state.terminate_requested, false);
@@ -765,7 +830,7 @@ where
                 // independent: the clears exist even when revocation fails.
                 let (clears, revocation) = self
                     .engine
-                    .terminate_session(&sess, &request_headers)
+                    .terminate_session(sess, &request_headers)
                     .await
                     .into_parts();
                 report_stranded_cookies(clears);

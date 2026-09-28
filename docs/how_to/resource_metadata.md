@@ -57,9 +57,10 @@ collects rule scopes for advertisement when the validator does not already
 supply `scopes_supported`.
 
 A resource-bound proxy only applies its guard inside that resource's path.
-Requests outside it delegate to the inner proxy. Route unrelated paths to an
-explicit fallback rather than treating this wrapper as protection for the
-whole listener. Keep discovery outside token validation.
+Requests outside it are refused with 403; requests whose public URI cannot be
+reconstructed are refused with 400. Neither reaches the inner proxy. Route
+unrelated paths to an explicit fallback rather than treating this wrapper as
+protection for the whole listener. Keep discovery outside token validation.
 
 ## Add a second resource
 

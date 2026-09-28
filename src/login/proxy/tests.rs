@@ -111,6 +111,8 @@ struct MockSessionDriver {
     #[builder(default)]
     fail_save: bool,
     #[builder(default)]
+    save_cookies: Vec<HeaderValue>,
+    #[builder(default)]
     fail_revoke: bool,
 }
 
@@ -198,7 +200,7 @@ impl SessionDriver for MockSessionDriver {
                 "save failed",
             ));
         }
-        Ok(vec![])
+        Ok(self.save_cookies.clone())
     }
     async fn revoke(&self, _: &MockSession) -> Result<(), SessionError> {
         *self.revoke_called.lock().unwrap() = true;
@@ -712,7 +714,7 @@ async fn callback_with_missing_state_returns_400() {
     assert_eq!(read_status(&mut c).await, 400);
 }
 
-// ── upstream_response_filter persistence paths ───────────────────
+// ── response_filter persistence paths ───────────────────
 
 #[tokio::test]
 async fn response_filter_save_on_dirty_persistence() {
@@ -730,7 +732,7 @@ async fn response_filter_save_on_dirty_persistence() {
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .response_filter(&mut s, &mut resp, &mut ctx)
         .await
         .unwrap();
 
@@ -754,7 +756,7 @@ async fn response_filter_owes_nothing_on_plain_request() {
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .response_filter(&mut s, &mut resp, &mut ctx)
         .await
         .unwrap();
 
@@ -776,7 +778,7 @@ async fn response_filter_termination_path() {
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .response_filter(&mut s, &mut resp, &mut ctx)
         .await
         .unwrap();
 
@@ -804,7 +806,7 @@ async fn response_filter_termination_delivers_clears_when_revocation_fails() {
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .response_filter(&mut s, &mut resp, &mut ctx)
         .await
         .unwrap();
 
@@ -837,7 +839,7 @@ async fn response_filter_forces_no_store_when_session_cookie_appended() {
     resp.insert_header(http::header::CACHE_CONTROL, "max-age=600")
         .unwrap();
     proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .response_filter(&mut s, &mut resp, &mut ctx)
         .await
         .unwrap();
 
@@ -870,7 +872,7 @@ async fn response_filter_preserves_cache_control_without_session_cookie() {
     resp.insert_header(http::header::CACHE_CONTROL, "max-age=600")
         .unwrap();
     proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .response_filter(&mut s, &mut resp, &mut ctx)
         .await
         .unwrap();
 
@@ -904,9 +906,7 @@ async fn persist_save_failure_fails_closed_with_policy_status() {
     ctx.login_state_mut().pending = Some(owed_persist());
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
-    let result = proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
-        .await;
+    let result = proxy.response_filter(&mut s, &mut resp, &mut ctx).await;
 
     let err = result.unwrap_err();
     assert!(matches!(
@@ -945,7 +945,7 @@ async fn denied_check_returns_403() {
 #[tokio::test]
 async fn logging_fallback_persists_when_response_not_proxied() {
     // The inner proxy self-handled the request (or proxying failed), so
-    // `upstream_response_filter` never ran — `logging` picks up the owed save.
+    // `response_filter` never ran — `logging` picks up the owed save.
     let store = MockSessionDriver::builder()
         .load_session(MockSession::default())
         .build();
@@ -974,7 +974,7 @@ async fn logging_after_response_filter_does_not_double_persist() {
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .response_filter(&mut s, &mut resp, &mut ctx)
         .await
         .unwrap();
     proxy.logging(&mut s, None, &mut ctx).await;
@@ -1012,7 +1012,7 @@ async fn response_filter_no_session_does_nothing() {
 
     let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
     proxy
-        .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+        .response_filter(&mut s, &mut resp, &mut ctx)
         .await
         .unwrap();
 
@@ -1387,7 +1387,7 @@ mod store_backed {
 
         let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
         proxy
-            .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+            .response_filter(&mut s, &mut resp, &mut ctx)
             .await
             .unwrap();
 
@@ -1418,7 +1418,7 @@ mod store_backed {
 
         let mut resp = pingora_http::ResponseHeader::build(200, Some(1)).unwrap();
         proxy
-            .upstream_response_filter(&mut s, &mut resp, &mut ctx)
+            .response_filter(&mut s, &mut resp, &mut ctx)
             .await
             .unwrap();
 
@@ -1497,5 +1497,49 @@ async fn shared_path_guard_config_preserves_downstream_assumptions() {
         if !allowed {
             assert_eq!(read_status(&mut client).await, 400, "{path}");
         }
+    }
+}
+
+mod lifecycle;
+
+#[tokio::test]
+async fn interim_headers_preserve_work_until_final_or_upgrade_response() {
+    for final_status in [101, 200, 204, 304] {
+        let proxy = build_proxy(
+            MockSessionDriver::builder()
+                .load_session(MockSession::default())
+                .save_cookies(vec![HeaderValue::from_static("mock-session=updated")])
+                .build(),
+        )
+        .await;
+        let (mut session, _client) =
+            make_session("GET", "/api", "Accept: application/json\r\n").await;
+        let mut ctx = proxy.new_ctx();
+        proxy.request_filter(&mut session, &mut ctx).await.unwrap();
+        ctx.login_state_mut().pending = Some(owed_persist());
+        for status in [100, 103] {
+            let mut header = ResponseHeader::build(status, None).unwrap();
+            proxy
+                .response_filter(&mut session, &mut header, &mut ctx)
+                .await
+                .unwrap();
+            assert!(set_cookies(&header).is_empty());
+            assert_eq!(proxy.engine().session_store().save_count(), 0);
+            assert!(ctx.login_state().pending.is_some());
+        }
+        let mut header = ResponseHeader::build(final_status, None).unwrap();
+        proxy
+            .response_filter(&mut session, &mut header, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(set_cookies(&header), ["mock-session=updated"]);
+        proxy
+            .response_filter(&mut session, &mut header, &mut ctx)
+            .await
+            .unwrap();
+        proxy.logging(&mut session, None, &mut ctx).await;
+        assert_eq!(set_cookies(&header), ["mock-session=updated"]);
+        assert_eq!(proxy.engine().session_store().save_count(), 1);
+        assert!(ctx.login_state().session.is_some());
     }
 }

@@ -29,10 +29,11 @@ to compensate for an unexplained mismatch. See
 
 ## Trace session-cookie delivery
 
-For login integrations, inspect callback and upstream response headers. The
+For login integrations, inspect callback and downstream response headers. The
 browser must receive all session-cookie updates and clears. An inner proxy that
-responds early can bypass `upstream_response_filter`; logging cannot send cookies
-after the response is gone. Cookie-session refreshes depend on delivery even
+writes directly can bypass `response_filter`; use `LoginState::respond` and return
+`Ok(false)` for buffered local responses. Logging cannot send cookies after the
+response is gone. Cookie-session refreshes depend on delivery even
 when the engine already prepared a successful save.
 
 For provider refresh failures, cookie rejection, and lifetime checks, use the

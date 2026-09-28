@@ -2,7 +2,7 @@
 //!
 //! Defines [`HasLoginSession`], the trait that your proxy context must implement
 //! for [`LoginProxy`](super::LoginProxy) to thread session and persistence state
-//! through `request_filter` → inner proxy → `upstream_response_filter`, and
+//! through `request_filter` → inner proxy → `response_filter`, and
 //! [`LoginCtx`], a convenience wrapper that implements it automatically.
 
 use http::HeaderMap;
@@ -11,7 +11,7 @@ use huskarl_login::engine::{PendingPersist, SetCookies};
 /// State held on the proxy context across the request lifecycle.
 ///
 /// [`LoginProxy`](super::LoginProxy) populates this in `request_filter` and
-/// reads it in `upstream_response_filter` to persist or terminate the session
+/// reads it in `response_filter` to persist or terminate the session
 /// after the inner proxy responds.
 ///
 /// User code reads `session` and sets `terminate_requested` directly; the
@@ -36,6 +36,8 @@ pub struct LoginState<S> {
     /// expired or refresh-failed session, or the re-sealed session cookies
     /// when a token refresh was persisted eagerly.
     pub(crate) set_cookies: SetCookies,
+    pub(crate) finalized: bool,
+    pub(crate) response: Option<huskarl_login::engine::LoginResponse>,
 }
 
 impl<S> Default for LoginState<S> {
@@ -46,11 +48,37 @@ impl<S> Default for LoginState<S> {
             request_headers: HeaderMap::new(),
             set_cookies: SetCookies::default(),
             terminate_requested: false,
+            finalized: false,
+            response: None,
         }
     }
 }
 
 impl<S> LoginState<S> {
+    /// Queues a buffered local response for the enclosing `LoginProxy` to send.
+    ///
+    /// Call from the inner proxy's `request_filter`, then return `Ok(false)`
+    /// without writing to the session. The login proxy runs the downstream
+    /// response filter, completes session persistence or termination, and adds
+    /// cookies before sending this response. Later hooks can still read `session`.
+    /// Direct writes bypass this contract and cannot receive queued cookies.
+    ///
+    /// # Errors
+    /// Rejects informational responses: this API sends a complete final response.
+    pub fn respond(
+        &mut self,
+        response: huskarl_login::engine::LoginResponse,
+    ) -> pingora_error::Result<()> {
+        if response.status().is_informational() {
+            return Err(pingora_error::Error::explain(
+                pingora_error::ErrorType::InternalError,
+                "local login response must have a final status",
+            ));
+        }
+        self.response = Some(response);
+        Ok(())
+    }
+
     /// Replaces proxy-managed request state immediately before forwarding.
     pub(crate) fn prepare_forward(
         &mut self,
@@ -64,6 +92,7 @@ impl<S> LoginState<S> {
         self.request_headers = request_headers;
         self.set_cookies = set_cookies;
         self.terminate_requested = false;
+        self.finalized = false;
     }
 }
 

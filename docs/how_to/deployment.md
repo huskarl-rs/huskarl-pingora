@@ -47,12 +47,13 @@ this adapter's integration.
 ## Account for Pingora's response lifecycle
 
 `LoginProxy` queues session-cookie changes during request handling and delivers
-them through the upstream response phase.
+them through the final downstream response phase, after Pingora caching.
 
 | Request outcome | Cookie-delivery consequence |
 |---|---|
-| Upstream response reaches `upstream_response_filter` | Queued cookies can be attached before headers go to the browser |
-| Inner proxy answers early or no upstream response arrives | That delivery phase can be bypassed |
+| Upstream or cached response reaches `response_filter` | Cookies are attached after cache processing, before headers go to the browser |
+| Inner proxy queues a response with `LoginState::respond` and returns `Ok(false)` | The proxy finalizes and writes the local response |
+| Inner proxy writes directly, or a proxy error bypasses response filters | Cookie delivery can be bypassed |
 | Only the logging fallback runs | Server-side persistence can be retried, but cookies cannot be sent after the response is gone |
 
 Callback and logout responses are handled directly by the login engine; the
