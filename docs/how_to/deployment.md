@@ -51,7 +51,10 @@ this adapter's integration.
 5. **Preserve response headers.** Keep every `Set-Cookie` header through response
    filters and load balancers. Exclude personalized responses from shared caches
    even when cookies do not change. The example upstream uses
-   `Cache-Control: no-store`; see the shared
+   `Cache-Control: no-store`. If you need personalized caching inside Pingora,
+   follow [Cache responses per authenticated user](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/how_to/user_caching/)
+   for identity keys, authorization before lookup, and downstream cache policy.
+   See also the shared
    [caching guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/caching/).
 
 ## Account for Pingora's response lifecycle

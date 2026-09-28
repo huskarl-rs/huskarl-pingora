@@ -71,6 +71,10 @@ this request; its presence is not a fresh check that the session remains valid.
 Set `terminate_requested` before finalization, not in logging after a response
 has already been finalized.
 
+For an application that deliberately caches personalized content, follow
+[Cache responses per authenticated user](crate::_docs::how_to::user_caching).
+Cookie isolation and user-specific response-body isolation are separate contracts.
+
 ## Session-storage limits still apply
 
 Correct response finalization does not order different requests' responses.

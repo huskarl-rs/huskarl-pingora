@@ -18,7 +18,7 @@ pub mod tutorial {
 /// Start with [Deploy a proxy](how_to::deployment) before exposing it beyond localhost.
 #[cfg_attr(
     any(feature = "login", feature = "resource"),
-    doc = "Choose [route policies](how_to::routes), [configure the path guard](how_to::path_guard), [customize error responses](how_to::error_responses), or [troubleshoot a proxy](how_to::troubleshooting)."
+    doc = "Choose [route policies](how_to::routes), [configure the path guard](how_to::path_guard), [customize error responses](how_to::error_responses), [cache per user](how_to::user_caching), or [troubleshoot a proxy](how_to::troubleshooting)."
 )]
 #[cfg_attr(
     feature = "login",
@@ -29,6 +29,9 @@ pub mod tutorial {
     doc = "[Build a bearer-token proxy](how_to::resource_proxy) or [publish protected-resource metadata](how_to::resource_metadata)."
 )]
 pub mod how_to {
+    #[cfg(any(feature = "login", feature = "resource"))]
+    #[doc = include_str!("../docs/how_to/user_caching.md")]
+    pub mod user_caching {}
     #[cfg(feature = "resource")]
     #[doc = include_str!("../docs/how_to/resource_metadata.md")]
     pub mod resource_metadata {}

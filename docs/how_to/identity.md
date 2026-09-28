@@ -54,4 +54,6 @@ required rule to the corresponding protected proxy path as well.
 Check that a forged identity header is removed on an anonymous request and
 replaced on an authenticated request. Check that direct upstream access is
 restricted in your deployment and that personalized responses cannot enter a
-shared cache. Cookie-free responses can still contain private user data.
+cache shared across users. Cookie-free responses can still contain private user
+data. To enable caching within an authenticated user's partition, follow
+[Cache responses per authenticated user](crate::_docs::how_to::user_caching).
