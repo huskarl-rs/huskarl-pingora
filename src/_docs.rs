@@ -77,7 +77,14 @@ pub mod explanation {
     any(feature = "login", feature = "resource"),
     doc = "Look up [path-guard configuration](reference::path_guard)."
 )]
+#[cfg_attr(
+    feature = "login",
+    doc = "Look up [login finalization exceptions and mitigations](reference::login_finalization)."
+)]
 pub mod reference {
+    #[cfg(feature = "login")]
+    #[doc = include_str!("../docs/reference/login_finalization.md")]
+    pub mod login_finalization {}
     #[cfg(any(feature = "login", feature = "resource"))]
     #[doc = include_str!("../docs/reference/path_guard.md")]
     pub mod path_guard {}

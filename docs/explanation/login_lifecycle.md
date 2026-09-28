@@ -3,6 +3,8 @@
 [`LoginProxy`](crate::login::LoginProxy) adapts the shared login engine to
 Pingora's request and response phases. The distinction between persisting
 server state and delivering browser cookies matters when a proxy returns early.
+For the supported contract, exceptions, coding mitigations, and service-user
+impact, see [Login response finalization](crate::_docs::reference::login_finalization).
 
 | Phase | Responsibility |
 |---|---|
@@ -17,6 +19,14 @@ external store this can commit durable state before the upstream responds.
 For cookie sessions, it only prepares `Set-Cookie` headers: the write finishes
 when the browser receives them. Even a successful eager refresh can therefore
 lose its browser update if the response bypasses the cookie-delivery phase.
+
+The built-in store-backed driver does not replace the pointer cookie during
+refresh: after a durable commit, an existing valid pointer can load the updated
+record even if the response is lost. Cookie sessions need replacement-cookie
+delivery for that update. Neither mode can guarantee delivery across a disconnect,
+and both require a cookie to reach the browser when establishing a new session.
+See [the storage comparison](crate::_docs::reference::login_finalization#how-session-storage-changes-the-impact)
+for logout, delayed responses, cancellation, and backend-failure tradeoffs.
 
 A failed eager save produces `ActivePending`; its later commit is a retry.
 If the response is already sent, the logging fallback can retry a server-side

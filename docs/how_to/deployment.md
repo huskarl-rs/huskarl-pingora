@@ -7,8 +7,18 @@ localhost. The upstream trust and routing steps also apply to bearer-token proxi
 
 | Session storage | Use when | Limit |
 |---|---|---|
-| Cookie sessions (the example) | You can accept sessions without individual server-side revocation | Delayed responses can restore older cookies, including after logout |
-| Store-backed sessions with a shared backend | Logout must revoke the session on the server | Revocation depends on successful deletion; stored-state protection does not prevent simultaneous refresh exchanges |
+| Cookie sessions (the example) | You want no external session backend and can accept browser-dependent refresh and logout | Missed refresh cookies can force re-login; delayed responses can restore older cookies, including after logout |
+| Store-backed sessions with a shared backend | You need server-side revocation or want committed refreshes to survive lost responses without replacing the browser cookie | Requires an available backend and an existing valid pointer; revocation depends on successful deletion, and stored-state protection does not prevent simultaneous refresh exchanges |
+
+A disconnect can prevent cookie delivery in either mode. With store-backed
+sessions, a durably committed refresh can still be used through the browser's
+existing pointer, and successful deletion invalidates that pointer even when
+logout clears are lost. A new login still requires delivery of the initial
+cookie in both modes. Storage choice does not fix direct writes bypassing
+finalization or guarantee cleanup after task abortion.
+
+See [how session storage changes the impact](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/login_finalization/#how-session-storage-changes-the-impact)
+for a per-failure comparison and the remaining conditions on recovery.
 
 Neither choice prevents two requests from exchanging the same refresh token,
 even on one replica. Local logout also leaves provider SSO active. Resolve
@@ -61,6 +71,12 @@ boundary above concerns application requests continuing through the inner proxy.
 A successful refresh exchange alone does not prove delivery to the browser.
 See the [login lifecycle](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/explanation/login_lifecycle/)
 and the shared guide's [delivery and response-ordering limits](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/deployment/#limits-configuration-cannot-remove).
+
+For each exception, its coding mitigation, and its effect on service users,
+consult the [login finalization reference](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/login_finalization/).
+Plan graceful request draining; aborting a request task does not run async
+logging cleanup. Test the error and cancellation policies used in your deployment,
+not just successful upstream responses.
 
 ## Verify the integration
 

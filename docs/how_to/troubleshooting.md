@@ -17,6 +17,12 @@ without sharing cookie values, authorization codes, or tokens.
 | A method returns 403 despite a public default | A method-specific route denies unlisted methods without an explicit all-method fallback |
 | API client gets 401 instead of a login page | Browser login distinguishes navigations from API requests; bearer-token protection challenges unauthenticated requests |
 
+For refresh-related sign-outs, uncleared browser state, truncated responses,
+or 500 responses on cache hits, use the
+[login finalization reference](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/login_finalization/).
+It maps each exception to coding mitigations and service-user impact, including
+why retrying an interrupted application request may duplicate an operation.
+
 ## Trace routing and rewrites
 
 Compare the original request path with the path your inner proxy forwards.
@@ -35,6 +41,16 @@ writes directly can bypass `response_filter`; use `LoginState::respond` and retu
 `Ok(false)` for buffered local responses. Logging cannot send cookies after the
 response is gone. Cookie-session refreshes depend on delivery even
 when the engine already prepared a successful save.
+
+For cookie sessions, missing a refreshed cookie can leave the browser with an
+old refresh token and lead to re-login. For store-backed sessions, first check
+whether the refresh committed to the backend and whether the existing pointer
+is still valid; a successful refresh does not require a replacement pointer
+cookie. After logout, successful record deletion invalidates that pointer even
+if cookie clears were lost. Neither mode can recover an initial login cookie
+that never reached the browser. Use the
+[storage comparison](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/login_finalization/#how-session-storage-changes-the-impact)
+to distinguish delivery failures from persistence failures.
 
 For provider refresh failures, cookie rejection, and lifetime checks, use the
 shared [browser login troubleshooting guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/troubleshooting/).
