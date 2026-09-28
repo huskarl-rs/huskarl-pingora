@@ -97,3 +97,8 @@ async fn main() {
     // pass `proxy` to pingora — it implements ProxyHttp
 }
 ```
+
+## Publish discovery metadata
+
+Follow [Publish protected-resource metadata](crate::_docs::how_to::resource_metadata)
+to add a public discovery endpoint or host multiple resources on one listener.

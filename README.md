@@ -59,3 +59,7 @@ Start with the [how-to guides](https://docs.rs/huskarl-pingora/latest/huskarl_pi
 the [explanations](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/explanation/) to understand their security boundaries.
 
 <!-- cargo-reedme: end -->
+
+For discovery setup and multiple resources, follow
+[Publish protected-resource metadata](docs/how_to/resource_metadata.md) and the
+[runnable two-resource example](examples/multi_resource_proxy.rs).

@@ -26,9 +26,12 @@ pub mod tutorial {
 )]
 #[cfg_attr(
     feature = "resource",
-    doc = "[Build a bearer-token proxy](how_to::resource_proxy)."
+    doc = "[Build a bearer-token proxy](how_to::resource_proxy) or [publish protected-resource metadata](how_to::resource_metadata)."
 )]
 pub mod how_to {
+    #[cfg(feature = "resource")]
+    #[doc = include_str!("../docs/how_to/resource_metadata.md")]
+    pub mod resource_metadata {}
     #[cfg(any(feature = "login", feature = "resource"))]
     #[doc = include_str!("../docs/how_to/error_responses.md")]
     pub mod error_responses {}

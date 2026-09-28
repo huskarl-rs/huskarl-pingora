@@ -31,6 +31,9 @@
 //!   [`ResourceMetadataProxy`] publishes the documents collected from all such
 //!   integrations under `/.well-known/oauth-protected-resource[/path]`.
 //!
+//! Follow [Publish protected-resource metadata](crate::_docs::how_to::resource_metadata)
+//! for single-resource setup, multiple resources, and verification.
+//!
 //! # Multiple resource servers
 //!
 //! Build one resource-bound [`AuthProxy`] per protected subtree, then place
