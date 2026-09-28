@@ -288,9 +288,10 @@ where
     /// URLs are endpoints of the same logical resource and share its audience
     /// and challenge metadata.
     ///
-    /// If a request is outside this protected resource's path, this decorator
-    /// delegates without invoking its guard and leaves credentials untouched.
-    /// A server hosting several resources should normally prevent this case by
+    /// Requests outside this protected resource's path are denied with 403.
+    /// If the public request URI cannot be reconstructed (including a
+    /// `strip_prefix` mismatch), the request is denied with 400. Neither case
+    /// invokes the inner proxy. A server hosting several resources must route by
     /// selecting the matching [`AuthProxy`] in `early_request_filter`.
     ///
     /// # Errors
@@ -459,11 +460,26 @@ where
             effective_path.is_some_and(|path| resource_path_matches(&binding.resource_path, path))
         });
 
-        // A resource-bound decorator owns exactly one subtree. A router should
-        // normally select it only for that subtree; outside it, remain inert.
+        // Fail closed if routing selected the wrong resource or the public URI
+        // cannot be reconstructed. Neither case may reach the inner proxy.
         if self.protected_resource.is_some() && binding.is_none() {
-            ctx.set_strip_credentials(false);
-            return self.inner.request_filter(session, ctx).await;
+            let (status, description) = if effective_uri.is_none() {
+                (http::StatusCode::BAD_REQUEST, "Invalid request URI")
+            } else {
+                (
+                    http::StatusCode::FORBIDDEN,
+                    "Request outside protected resource",
+                )
+            };
+            let body = self.error_body.error_body(&ErrorDetails {
+                status,
+                error_code: None,
+                error_description: Some(description),
+                required_scopes: None,
+                challenges: &[],
+            });
+            write_challenge_response(session, status, &[], None, None, &body).await?;
+            return Ok(true);
         }
 
         let outcome = if let Some(binding) = binding {
@@ -1136,6 +1152,72 @@ mod tests {
             metadata_session.response_written().unwrap().status.as_u16(),
             200
         );
+    }
+
+    #[tokio::test]
+    async fn resource_binding_denies_out_of_scope_requests() {
+        for path in ["/health", "/mcp/payments", "/mcp/inventory-other"] {
+            let (proxy, _metadata) = build_auth_proxy(
+                MockValidator(MockOutcome::ValidFor(
+                    MockClaims { scopes: None },
+                    vec!["https://api.example.com/mcp/inventory".to_owned()],
+                )),
+                vec![("/health", Rule::public())],
+            )
+            .with_protected_resource("/mcp/inventory", AudienceBinding::ResourceIdentifier)
+            .unwrap();
+            let (mut session, _client) = make_session("GET", path).await;
+            session
+                .req_header_mut()
+                .insert_header("Authorization", "Bearer secret")
+                .unwrap();
+            session
+                .req_header_mut()
+                .insert_header("DPoP", "proof")
+                .unwrap();
+            let mut ctx = proxy.inner.new_ctx();
+
+            assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+            let response = session.response_written().unwrap();
+            assert_eq!(response.status.as_u16(), 403, "{path}");
+            assert!(
+                !response
+                    .headers
+                    .contains_key(http::header::WWW_AUTHENTICATE)
+            );
+            assert!(ctx.validated_token().is_none());
+            assert!(!*proxy.inner.request_filter_called.lock().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_binding_denies_uri_reconstruction_failure_even_on_public_routes() {
+        for path in ["/mcp/inventory", "/internalX/mcp/inventory"] {
+            let guard = Guard::builder()
+                .validator(MockValidator(MockOutcome::Missing))
+                .base_uri("https://api.example.com".parse().unwrap())
+                .strip_prefix("/internal")
+                .default(Rule::public())
+                .path_guard(crate::resource::GuardConfig::new(
+                    crate::resource::CaseSensitivity::Sensitive,
+                    crate::resource::DecodeDepth::UpToOne,
+                ))
+                .build()
+                .unwrap();
+            let (proxy, _metadata) = AuthProxy::new(InnerProxy::new(), guard)
+                .with_protected_resource("/mcp/inventory", AudienceBinding::ResourceIdentifier)
+                .unwrap();
+            let (mut session, _client) = make_session("GET", path).await;
+            let mut ctx = proxy.inner.new_ctx();
+
+            assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+            assert_eq!(
+                session.response_written().unwrap().status.as_u16(),
+                400,
+                "{path}"
+            );
+            assert!(!*proxy.inner.request_filter_called.lock().unwrap());
+        }
     }
 
     #[tokio::test]
