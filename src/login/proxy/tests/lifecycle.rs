@@ -262,7 +262,7 @@ async fn start_upstream(
 
 type LifecycleApp = pingora_proxy::HttpProxy<LoginProxy<LifecycleInner, MockSessionDriver>>;
 
-async fn exchange_h1(app: Arc<LifecycleApp>, method: &str) -> String {
+async fn exchange_h1(app: Arc<impl HttpServerApp>, method: &str) -> String {
     let (mut client, server) = tokio::io::duplex(16384);
     client.write_all(format!("{method} /api HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
     let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
@@ -281,7 +281,7 @@ async fn exchange_h1(app: Arc<LifecycleApp>, method: &str) -> String {
     wire
 }
 
-async fn exchange_h2(app: Arc<LifecycleApp>, method: &str) -> String {
+async fn exchange_h2(app: Arc<impl HttpServerApp>, method: &str) -> String {
     use pingora_core::protocols::{
         Digest,
         http::v2::server::{H2Accept, HttpSession, handshake},
@@ -341,6 +341,37 @@ async fn exchange_h2(app: Arc<LifecycleApp>, method: &str) -> String {
     let _ = client_driver.await;
     let _ = server_driver.await;
     wire
+}
+
+#[tokio::test]
+async fn login_denial_omits_head_body_for_both_downstream_protocols() {
+    let proxy = build_proxy(MockSessionDriver::default()).await;
+    let mut app = pingora_proxy::HttpProxy::new(proxy, Arc::new(ServerConf::default()));
+    app.handle_init_modules();
+    let app = Arc::new(app);
+
+    for http2 in [false, true] {
+        for method in ["GET", "HEAD"] {
+            let wire = tokio::time::timeout(Duration::from_secs(5), async {
+                if http2 {
+                    exchange_h2(Arc::clone(&app), method).await
+                } else {
+                    exchange_h1(Arc::clone(&app), method).await
+                }
+            })
+            .await
+            .expect("login denial timed out");
+            let (headers, body) = wire.split_once("\r\n\r\n").unwrap();
+            assert!(headers.lines().next().unwrap().contains("401"), "{wire}");
+            assert!(headers.to_lowercase().contains("cache-control: no-store"));
+            assert!(headers.to_lowercase().contains("content-type:"));
+            if method == "HEAD" {
+                assert!(body.is_empty(), "HEAD must not send a body: {wire}");
+            } else {
+                assert!(!body.is_empty(), "GET must retain its error body: {wire}");
+            }
+        }
+    }
 }
 
 async fn run_case(path: ResponsePath, fail_save: bool) -> (String, Vec<&'static str>) {

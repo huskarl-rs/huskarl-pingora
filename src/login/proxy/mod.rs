@@ -576,11 +576,13 @@ async fn write_login_response(
             .append_header(http::header::SET_COOKIE, cookie)
             .map_err(|e| Error::explain(InternalError, format!("set-cookie: {e}")))?;
     }
-    let has_body = !body.is_empty();
+    // HEAD retains the response headers but must end without a body, including
+    // on HTTP/2 where sending DATA would cause a protocol error.
+    let send_body = session.req_header().method != http::Method::HEAD && !body.is_empty();
     session
-        .write_response_header(Box::new(header), !has_body)
+        .write_response_header(Box::new(header), !send_body)
         .await?;
-    if has_body {
+    if send_body {
         session.write_response_body(Some(body), true).await?;
     }
     Ok(())
