@@ -16,11 +16,12 @@ use huskarl_pingora::resource_server::{
 };
 
 let mapping = PublicUrlMapping::new("https://api.example.com/gateway", "/edge")?;
-let inventory = ResourceDefinition::builder_from_mapping(&mapping)
+let inventory = ResourceDefinition::builder()
+    .mapping(mapping.clone())
     .subpath("/mcp/inventory")
     .audience(AudienceBinding::ResourceIdentifier)
     .resource_name("Inventory API")
-    .resource_documentation("https://api.example.com/docs/inventory".parse()?)
+    .resource_documentation("https://api.example.com/docs/inventory")
     .build()?;
 assert_eq!(inventory.resource(), "https://api.example.com/gateway/mcp/inventory");
 assert_eq!(inventory.incoming_mount(), "/edge/mcp/inventory");

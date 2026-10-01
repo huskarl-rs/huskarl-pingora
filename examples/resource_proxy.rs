@@ -27,7 +27,8 @@ fn main() {
             .map_or(AudienceBinding::ResourceIdentifier, |value| {
                 AudienceBinding::mapped([value])
             });
-        let definition = ResourceDefinition::builder_from_mapping(&mapping)
+        let definition = ResourceDefinition::builder()
+            .mapping(mapping.clone())
             .subpath("/api")
             .audience(audiences)
             .resource_name("Example API")

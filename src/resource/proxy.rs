@@ -870,14 +870,12 @@ mod tests {
         use huskarl_resource_server::core::url_mapping::PublicUrlMapping;
         use tokio::io::AsyncReadExt;
 
-        let definition =
-            crate::resource_server::resource::ResourceDefinition::builder_from_mapping(
-                &PublicUrlMapping::new("https://api.example.com", "/").unwrap(),
-            )
+        let definition = crate::resource_server::resource::ResourceDefinition::builder()
+            .mapping(PublicUrlMapping::new("https://api.example.com", "/").unwrap())
             .subpath("/app?tenant=one")
             .audience(AudienceBinding::ResourceIdentifier)
             .resource_name("Published API")
-            .resource_documentation("https://api.example.com/docs".parse().unwrap())
+            .resource_documentation("https://api.example.com/docs")
             .scopes_supported(vec!["owner.read".into()])
             .build()
             .unwrap();

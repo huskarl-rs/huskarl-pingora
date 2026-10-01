@@ -116,9 +116,8 @@ a mapping does not perform a rewrite. Keep `COOKIE_KEY` stable across restarts.
 
 ## Metadata fields and local development
 
-The first example uses `ResourceDefinition::builder_from_mapping(&mapping)`:
-only resource-specific inputs remain to be set. Use `builder()` when supplying
-the mapping alongside the other inputs. Optional name, documentation, policy,
+The first example uses `ResourceDefinition::builder().mapping(mapping.clone())`:
+only resource-specific inputs remain to be set. Optional name, documentation, policy,
 terms and advertised-scope setters belong to the definition; binding supplies
 validator capabilities. Explicit scopes override adapter defaults, including
 an empty list to omit them. They do not change authorization requirements.

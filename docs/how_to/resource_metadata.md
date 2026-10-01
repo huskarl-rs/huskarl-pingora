@@ -197,7 +197,7 @@ boundaries, check for overlapping audiences and missing route protection.
 
 ## Owner fields and browser discovery
 
-Use `ResourceDefinition::builder_from_mapping(&mapping)` to add a resource name,
+Use `ResourceDefinition::builder().mapping(mapping.clone())` to add a resource name,
 documentation, privacy-policy and terms URLs, and advertised scopes before
 binding. The [registration guide](crate::_docs::how_to::resource_registration)
 shows this API. Existing constructors retain their defaults.
