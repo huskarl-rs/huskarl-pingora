@@ -1863,6 +1863,88 @@ mod tests {
         assert_eq!(session.response_written().unwrap().status.as_u16(), 200);
     }
     #[tokio::test]
+    async fn bound_custom_body_survives_resource_assembly() {
+        use tokio::io::AsyncReadExt as _;
+
+        use crate::{
+            resource::{BoundResource, assembly::ResourceAssembly},
+            resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition},
+        };
+
+        let mapping = PublicUrlMapping::new("https://api.example.com", "/").unwrap();
+        let definition =
+            ResourceDefinition::new(mapping.clone(), "/api", AudienceBinding::ResourceIdentifier)
+                .unwrap();
+        let policy = crate::resource::GuardConfig::new(
+            crate::resource::CaseSensitivity::Sensitive,
+            crate::resource::DecodeDepth::UpToOne,
+        );
+        let guard = Guard::builder()
+            .validator(MockValidator(MockOutcome::Missing))
+            .path_guard(policy.clone())
+            .build()
+            .unwrap();
+        let bound = BoundResource::new(definition, guard, InnerProxy::new()).unwrap();
+        let metadata_uri = bound.metadata().uri().clone();
+        let metadata_body = bound.metadata().publication().body.to_vec();
+        // Replace a non-default renderer too, retaining the validated bundle.
+        let bound = bound
+            .error_body(NeverRender)
+            .error_body(JsonErrors)
+            .into_route();
+        assert_eq!(bound.definition().metadata_uri(), &metadata_uri);
+        assert_eq!(bound.metadata().publication().body, metadata_body);
+        let proxy = ResourceAssembly::new(mapping)
+            .register_bound(bound)
+            .unwrap()
+            .build(
+                route(InnerProxy::new()),
+                context_lens!(TestContext, ctx => ctx.route),
+                policy,
+            )
+            .unwrap();
+
+        for (method, path, status) in [
+            ("GET", "/api", 401),
+            ("HEAD", "/api", 401),
+            ("GET", metadata_uri.path(), 200),
+        ] {
+            let (mut session, mut client) = make_session(method, path).await;
+            let mut ctx = proxy.new_ctx();
+            proxy
+                .early_request_filter(&mut session, &mut ctx)
+                .await
+                .unwrap();
+            assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+            let response = session.response_written().unwrap();
+            assert_eq!(response.status.as_u16(), status);
+            assert_eq!(response.headers["content-type"], "application/json");
+            if status == 401 {
+                assert_eq!(response.headers["cache-control"], "no-store");
+                assert!(
+                    response.headers["www-authenticate"]
+                        .to_str()
+                        .unwrap()
+                        .contains(&metadata_uri.to_string())
+                );
+            }
+            drop(session);
+            let mut wire = String::new();
+            client.read_to_string(&mut wire).await.unwrap();
+            let (_, body) = wire.split_once("\r\n\r\n").unwrap();
+            if method == "HEAD" {
+                assert!(body.is_empty());
+            } else if status == 200 {
+                assert_eq!(body.as_bytes(), metadata_body);
+            } else {
+                let json: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(json["status"], 401);
+                assert!(json["error"].is_null());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn resource_assembly_maps_routes_and_publishes_metadata_separately() {
         use crate::{
             resource::assembly::ResourceAssembly,

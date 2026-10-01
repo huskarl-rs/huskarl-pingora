@@ -3,7 +3,9 @@
 use pingora_proxy::ProxyHttp;
 use pingora_proxy_router::{Route, route};
 
-use super::{AuthProxy, ConfigError, Guard, HasAuthState, HasScopes, ResourceMetadataEndpoint};
+use super::{
+    AuthProxy, ConfigError, ErrorBody, Guard, HasAuthState, HasScopes, ResourceMetadataEndpoint,
+};
 use crate::resource_server::{
     resource::ResourceDefinition,
     validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata},
@@ -50,6 +52,25 @@ where
             metadata,
         })
     }
+}
+
+impl<P, V, E> BoundResource<AuthProxy<P, V, E>>
+where
+    V: AccessTokenValidator + ProvideValidatorMetadata,
+{
+    /// Configures rejection bodies while retaining the resource definition and
+    /// prepared metadata. See [`AuthProxy::error_body`] for renderer semantics.
+    #[must_use]
+    pub fn error_body<NewE: ErrorBody>(
+        self,
+        error_body: NewE,
+    ) -> BoundResource<AuthProxy<P, V, NewE>> {
+        BoundResource {
+            definition: self.definition,
+            proxy: self.proxy.error_body(error_body),
+            metadata: self.metadata,
+        }
+    }
 
     /// Converts the bound proxy to a router branch while retaining its definition
     /// and publication contribution. This allows heterogeneous resource proxies
@@ -60,6 +81,7 @@ where
         P::CTX: HasAuthState<V::Claims> + Send + Sync + 'static,
         V: Send + Sync + 'static,
         V::Claims: HasScopes + Send + Sync,
+        E: ErrorBody,
     {
         BoundResource {
             definition: self.definition,

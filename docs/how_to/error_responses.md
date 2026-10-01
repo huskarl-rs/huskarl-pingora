@@ -48,6 +48,11 @@ and path-policy denials. It does not run for forwarded requests or metadata.
 sets status, `WWW-Authenticate`, `DPoP-Nonce`, `Retry-After`, `Cache-Control`, and
 content length. HEAD returns the representation headers without body bytes.
 
+For resource assembly, configure the bound resource before converting it to a
+route: `bound.error_body(ApiErrors).into_route()`. Pass that bundle to
+`ResourceAssembly::register_bound`; its resource definition and prepared metadata
+are retained. Calling `error_body` again replaces the renderer.
+
 ## Browser-login error pages
 
 Both adapters use `huskarl_login::ErrorPage`. The renderer controls the media
