@@ -178,7 +178,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         /// explicitly keeps `htu` bound to your real origin. Without `base_uri` or
         /// `url_mapping`, the guard passes the raw request URI to the validator.
         /// Behind a reverse proxy this is normally origin-form (path and optional
-        /// query, without scheme or authority), so DPoP validation fails closed
+        /// query, without scheme or authority), so `DPoP` validation fails closed
         /// with a server-side integration error. Configure `base_uri` or
         /// `url_mapping` whenever you accept DPoP-bound tokens.
         base_uri: Option<http::Uri>,

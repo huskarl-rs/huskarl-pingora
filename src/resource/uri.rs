@@ -9,7 +9,7 @@
 //! configure, not one taken from the inbound `Host` header. When it is
 //! **absent** and no `url_mapping` is configured, the guard passes the raw request
 //! URI to the validator. Behind a reverse proxy this is normally origin-form
-//! (path and optional query, without scheme or authority), so DPoP validation
+//! (path and optional query, without scheme or authority), so `DPoP` validation
 //! fails closed with a server-side integration error. Configure the guard's
 //! `base_uri` or `url_mapping` whenever DPoP-bound tokens are accepted.
 
