@@ -582,6 +582,13 @@ where
             .response_filter(session, upstream_response, ctx)
             .await?;
 
+        // Preserve the nonce through interim headers; a 101 upgrade is terminal.
+        if upstream_response.status.is_informational()
+            && upstream_response.status != http::StatusCode::SWITCHING_PROTOCOLS
+        {
+            return Ok(());
+        }
+
         // Insert DPoP-Nonce header if the guard produced one during request_filter.
         if let Some(nonce) = ctx.dpop_nonce_mut().take() {
             upstream_response
@@ -1673,6 +1680,37 @@ mod tests {
         assert_eq!(resp.headers.get("dpop-nonce").unwrap(), "test-nonce");
         // Nonce should be consumed
         assert!(ctx.dpop_nonce_mut().is_none());
+    }
+
+    #[tokio::test]
+    async fn response_filter_preserves_dpop_nonce_until_final_or_upgrade_response() {
+        for final_status in [200, 101] {
+            let claims = MockClaims { scopes: None };
+            let proxy = build_auth_proxy(MockValidator(MockOutcome::Valid(claims)), vec![]);
+            let (mut session, _client) = make_session("GET", "/api").await;
+            let mut ctx = proxy.inner.new_ctx();
+            *ctx.dpop_nonce_mut() = Some("test-nonce".into());
+
+            for status in [100, 103] {
+                let mut resp = pingora_http::ResponseHeader::build(status, Some(1)).unwrap();
+                proxy
+                    .response_filter(&mut session, &mut resp, &mut ctx)
+                    .await
+                    .unwrap();
+
+                assert!(resp.headers.get("dpop-nonce").is_none());
+                assert_eq!(ctx.dpop_nonce_mut().as_deref(), Some("test-nonce"));
+            }
+
+            let mut resp = pingora_http::ResponseHeader::build(final_status, Some(1)).unwrap();
+            proxy
+                .response_filter(&mut session, &mut resp, &mut ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.headers.get("dpop-nonce").unwrap(), "test-nonce");
+            assert!(ctx.dpop_nonce_mut().is_none());
+        }
     }
 
     #[tokio::test]
