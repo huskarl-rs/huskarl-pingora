@@ -120,8 +120,8 @@ pub struct Guard<V: AccessTokenValidator + ProvideValidatorMetadata> {
     request_mapping: Option<crate::resource_server::core::url_mapping::PublicUrlMapping>,
     legacy_mapping: bool,
     /// Optional value for the `name` label on emitted metrics, distinguishing guard
-    /// instances when one process runs several. `None` omits the label.
-    metrics_name: Option<String>,
+    /// instances when one process runs several. `None` emits an empty name.
+    pub(crate) metrics_name: Option<String>,
 }
 
 /// One locally served RFC 9728 document and the metadata used for challenges
@@ -202,7 +202,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         path_guard: GuardConfig,
         /// Optional value for the `name` label on emitted metrics (the
         /// `huskarl.resource.check` counter). Set it to tell guard instances apart when
-        /// one process runs several; leave unset to omit the label.
+        /// one process runs several; leave unset for `name=""`. Requires the optional
+        /// `metrics` feature; naming never wraps the supplied validator.
         #[builder(into)]
         metrics_name: Option<String>,
     ) -> Result<Self, ConfigError> {
@@ -583,28 +584,29 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         .await
     }
 
-    /// Checks a Pingora session while using resource-specific challenge
-    /// metadata selected by [`AuthProxy`](super::AuthProxy).
-    pub(crate) async fn check_with_metadata(
+    /// Runs the guard once and retains its classification for the adapter boundary.
+    pub(crate) async fn check_for_proxy(
         &self,
         session: &Session,
-        metadata: &ValidatorMetadata,
-        audiences: &[String],
-    ) -> Outcome<V::Claims>
+        binding: Option<(&ValidatorMetadata, &[String])>,
+    ) -> (Outcome<V::Claims>, CheckOutcome)
     where
         V::Claims: HasScopes,
     {
         let req = session.req_header();
-        let client_cert_der = client_cert_der(session);
-        self.check_request_with_metadata(
-            &req.headers,
-            &req.method,
-            &req.uri,
-            client_cert_der,
-            metadata,
-            Some(audiences),
-        )
-        .await
+        let (metadata, audiences) = binding.map_or((&self.metadata, None), |(m, a)| (m, Some(a)));
+        let (outcome, category) = self
+            .check_request_categorized(
+                &req.headers,
+                &req.method,
+                &req.uri,
+                client_cert_der(session),
+                metadata,
+                audiences,
+            )
+            .await;
+        category.emit(self.metrics_name.as_deref());
+        (outcome, category)
     }
 
     /// Low-level token check using plain HTTP types.
@@ -612,7 +614,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// Returns an [`Outcome`] describing whether the request should be
     /// forwarded or denied.
     ///
-    /// Emits the `huskarl.resource.check` counter once, with an `outcome` label naming
+    /// With `metrics` enabled, emits `huskarl.resource.check` once, with an `outcome` label naming
     /// what this call resolved to — `forward` for a success, or the specific deny reason
     /// (`path_confusion`, `policy_denied`, `unauthenticated`, `invalid_token`,
     /// `expired`, `unrecognized_issuer`, `binding_error`, `nonce_required`,
@@ -684,12 +686,10 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
 
         // 0. Resolve in one call: the path-confusion verdict, then the rule match — a
         // denied (ambiguous) path gets a rule-independent 400 before any rule applies.
-        // The attributed reason (which check and byte class fired) goes to the log so
-        // the denial is actionable; the client sees only the coarse static message.
+        // Metrics retain the bounded category; raw paths are never logged or labelled.
         let rule = match self.routes.resolve(path, method) {
             Ok(matched) => matched.rule(),
             Err(reason) => {
-                log::warn!("route guard denied {path:?}: {reason}");
                 return Self::route_denial(metadata, &reason);
             }
         };

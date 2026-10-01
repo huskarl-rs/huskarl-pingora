@@ -489,6 +489,15 @@ where
         // Fail closed if routing selected the wrong resource or the public URI
         // cannot be reconstructed. Neither case may reach the inner proxy.
         if self.protected_resource.is_some() && binding.is_none() {
+            crate::metrics::emit_counter(
+                "huskarl.pingora.resource.authorization",
+                if effective_uri.is_none() {
+                    "invalid_request"
+                } else {
+                    "outside_resource"
+                },
+                self.guard.metrics_name.as_deref(),
+            );
             let (status, description) = if effective_uri.is_none() {
                 (http::StatusCode::BAD_REQUEST, "Invalid request URI")
             } else {
@@ -508,13 +517,18 @@ where
             return Ok(true);
         }
 
-        let outcome = if let Some(binding) = binding {
-            self.guard
-                .check_with_metadata(session, &binding.validator_metadata, &binding.audiences)
-                .await
-        } else {
-            self.guard.check(session).await
-        };
+        let (outcome, category) = self
+            .guard
+            .check_for_proxy(
+                session,
+                binding.map(|b| (&b.validator_metadata, b.audiences.as_slice())),
+            )
+            .await;
+        crate::metrics::emit_counter(
+            "huskarl.pingora.resource.authorization",
+            category.as_str(),
+            self.guard.metrics_name.as_deref(),
+        );
 
         match outcome {
             Outcome::Forward {
@@ -2213,5 +2227,179 @@ mod tests {
                 .is_err()
         );
         assert!(!ctx.route.is_selected());
+    }
+    #[test]
+    fn authorization_metrics_cover_binding_denials_without_guard_double_counts() {
+        use crate::metrics_test_support::{assert_counter, with_metrics};
+        for (path, outcome, guard_count) in [
+            ("/edge/api/items", "unauthenticated", 1),
+            ("/edge/outside", "outside_resource", 0),
+            ("/wrong-prefix/api", "invalid_request", 0),
+        ] {
+            let ((), counters) = with_metrics(async {
+                let guard = Guard::builder()
+                    .validator(MockValidator(MockOutcome::Missing))
+                    .base_uri("https://api.example.com".parse().unwrap())
+                    .strip_prefix("/edge")
+                    .metrics_name("inventory")
+                    .path_guard(crate::resource::GuardConfig::new(
+                        crate::resource::CaseSensitivity::Sensitive,
+                        crate::resource::DecodeDepth::UpToOne,
+                    ))
+                    .build()
+                    .unwrap();
+                let (proxy, _) = AuthProxy::new(InnerProxy::new(), guard)
+                    .with_protected_resource("/api", AudienceBinding::mapped(["api"]))
+                    .unwrap();
+                let (mut session, _client) = make_session("GET", path).await;
+                let mut ctx = proxy.new_ctx();
+                assert!(proxy.request_filter(&mut session, &mut ctx).await.unwrap());
+                assert!(!*proxy.inner.request_filter_called.lock().unwrap());
+            });
+            assert_counter(
+                &counters,
+                "huskarl.pingora.resource.authorization",
+                &[("name", "inventory"), ("outcome", outcome)],
+                1,
+            );
+            assert_counter(
+                &counters,
+                "huskarl.resource.check",
+                &[("name", "inventory"), ("outcome", "unauthenticated")],
+                guard_count,
+            );
+            assert_eq!(
+                counters.len(),
+                if cfg!(feature = "metrics") {
+                    1 + usize::try_from(guard_count).unwrap()
+                } else {
+                    0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn assembly_metrics_have_an_independent_name_and_boundary() {
+        use crate::{
+            metrics_test_support::{assert_counter, with_metrics},
+            resource::assembly::ResourceAssembly,
+            resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition},
+        };
+        let ((), counters) = with_metrics(async {
+            let mapping = PublicUrlMapping::new("https://api.example.com", "/").unwrap();
+            let definition = ResourceDefinition::new(
+                mapping.clone(),
+                "/api",
+                AudienceBinding::ResourceIdentifier,
+            )
+            .unwrap();
+            let policy = crate::resource::GuardConfig::new(
+                crate::resource::CaseSensitivity::Sensitive,
+                crate::resource::DecodeDepth::UpToOne,
+            );
+            let guard = Guard::builder()
+                .validator(MockValidator(MockOutcome::Missing))
+                .metrics_name("api")
+                .path_guard(policy.clone())
+                .build()
+                .unwrap();
+            let proxy = ResourceAssembly::new(mapping)
+                .metrics_name("router")
+                .register(&definition, guard, InnerProxy::new())
+                .unwrap()
+                .build(
+                    route(InnerProxy::new()),
+                    context_lens!(TestContext, ctx => ctx.route),
+                    policy,
+                )
+                .unwrap();
+            for path in [
+                "/api",
+                definition.metadata_uri().path(),
+                "/fallback",
+                "/outside/../api",
+            ] {
+                let (mut session, _client) = make_session("GET", path).await;
+                let mut ctx = proxy.new_ctx();
+                if path.contains("..") {
+                    assert!(
+                        proxy
+                            .early_request_filter(&mut session, &mut ctx)
+                            .await
+                            .is_err()
+                    );
+                    assert!(!ctx.route.is_selected());
+                } else {
+                    proxy
+                        .early_request_filter(&mut session, &mut ctx)
+                        .await
+                        .unwrap();
+                    proxy.request_filter(&mut session, &mut ctx).await.unwrap();
+                }
+            }
+        });
+        assert_counter(
+            &counters,
+            "huskarl.pingora.resource.route",
+            &[("name", "router"), ("outcome", "selected")],
+            3,
+        );
+        assert_counter(
+            &counters,
+            "huskarl.pingora.resource.route",
+            &[("name", "router"), ("outcome", "path_confusion")],
+            1,
+        );
+        assert_counter(
+            &counters,
+            "huskarl.pingora.resource.authorization",
+            &[("name", "api"), ("outcome", "unauthenticated")],
+            1,
+        );
+        assert_counter(
+            &counters,
+            "huskarl.resource.check",
+            &[("name", "api"), ("outcome", "unauthenticated")],
+            1,
+        );
+        assert_eq!(
+            counters.len(),
+            if cfg!(feature = "metrics") { 4 } else { 0 }
+        );
+    }
+
+    #[test]
+    fn unnamed_authorization_metrics_remain_bounded_and_count_before_write_failure() {
+        use crate::metrics_test_support::{assert_counter, with_metrics};
+        let ((), counters) = with_metrics(async {
+            let proxy = build_auth_proxy(MockValidator(MockOutcome::Missing), vec![]);
+            for index in 0..16 {
+                let (mut session, client) =
+                    make_session("GET", &format!("/attacker-{index}?kid=untrusted-{index}")).await;
+                drop(client);
+                assert!(
+                    proxy
+                        .request_filter(&mut session, &mut proxy.new_ctx())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        for metric in [
+            "huskarl.resource.check",
+            "huskarl.pingora.resource.authorization",
+        ] {
+            assert_counter(
+                &counters,
+                metric,
+                &[("name", ""), ("outcome", "unauthenticated")],
+                16,
+            );
+        }
+        assert_eq!(
+            counters.len(),
+            if cfg!(feature = "metrics") { 2 } else { 0 }
+        );
     }
 }

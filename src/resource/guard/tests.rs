@@ -1512,53 +1512,7 @@ async fn cve_forwarded_uri_header_is_not_trusted() {
 
 // --- metrics: the `huskarl.resource.check` outcome counter ---
 
-type RecordedCounter = (String, Vec<(String, String)>, u64);
-
-/// Runs `fut` on a current-thread runtime with a thread-local debugging recorder
-/// installed, returning the captured counters as `(name, sorted (label, value) pairs,
-/// count)`. Mirrors the harness in `huskarl-login`.
-fn with_metrics<T>(fut: impl Future<Output = T>) -> (T, Vec<RecordedCounter>) {
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    let out = metrics::with_local_recorder(&recorder, || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(fut)
-    });
-    let counters = snapshotter
-        .snapshot()
-        .into_vec()
-        .into_iter()
-        .filter_map(|(key, _unit, _desc, value)| {
-            let DebugValue::Counter(count) = value else {
-                return None;
-            };
-            let key = key.key();
-            let mut labels: Vec<(String, String)> = key
-                .labels()
-                .map(|l| (l.key().to_owned(), l.value().to_owned()))
-                .collect();
-            labels.sort();
-            Some((key.name().to_owned(), labels, count))
-        })
-        .collect();
-    (out, counters)
-}
-
-/// The value of `huskarl.resource.check` with exactly the `outcome` label, or 0.
-fn check_outcome_count(counters: &[RecordedCounter], outcome: &str) -> u64 {
-    counters
-        .iter()
-        .find(|(name, labels, _)| {
-            name == "huskarl.resource.check"
-                && labels.as_slice() == [("outcome".to_owned(), outcome.to_owned())]
-        })
-        .map_or(0, |(_, _, count)| *count)
-}
+use crate::metrics_test_support::{assert_counter, with_metrics};
 
 #[test]
 fn metrics_forward_on_public_route() {
@@ -1566,8 +1520,18 @@ fn metrics_forward_on_public_route() {
         let guard = build_guard(MockValidator::no_token(), vec![("/health", Rule::public())]);
         check(&guard, &http::Method::GET, "/health").await
     });
-    assert_eq!(check_outcome_count(&counters, "forward"), 1);
-    assert_eq!(check_outcome_count(&counters, "unauthenticated"), 0);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "forward")],
+        1,
+    );
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "unauthenticated")],
+        0,
+    );
 }
 
 #[test]
@@ -1576,8 +1540,18 @@ fn metrics_unauthenticated_on_required_no_token() {
         let guard = build_guard(MockValidator::no_token(), vec![]);
         check(&guard, &http::Method::GET, "/api").await
     });
-    assert_eq!(check_outcome_count(&counters, "unauthenticated"), 1);
-    assert_eq!(check_outcome_count(&counters, "forward"), 0);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "unauthenticated")],
+        1,
+    );
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "forward")],
+        0,
+    );
 }
 
 #[test]
@@ -1590,7 +1564,12 @@ fn metrics_path_confusion_on_ambiguous_path() {
         // `/x/../admin` climbs onto the protected rule under a normalizing backend.
         check(&guard, &http::Method::GET, "/x/../admin").await
     });
-    assert_eq!(check_outcome_count(&counters, "path_confusion"), 1);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "path_confusion")],
+        1,
+    );
 }
 
 #[test]
@@ -1599,7 +1578,12 @@ fn metrics_invalid_token_on_bad_token() {
         let guard = build_guard(MockValidator::invalid(), vec![("/api", Rule::required())]);
         check(&guard, &http::Method::GET, "/api").await
     });
-    assert_eq!(check_outcome_count(&counters, "invalid_token"), 1);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "invalid_token")],
+        1,
+    );
 }
 
 /// A validator that could not reach a backing service produces a 5xx, and must be
@@ -1615,8 +1599,18 @@ fn metrics_server_error_not_counted_as_invalid_token() {
         check(&guard, &http::Method::GET, "/api").await
     });
     assert_deny(&outcome, http::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(check_outcome_count(&counters, "server_error"), 1);
-    assert_eq!(check_outcome_count(&counters, "invalid_token"), 0);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "server_error")],
+        1,
+    );
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "invalid_token")],
+        0,
+    );
 }
 
 /// A server-side failure's `Retry-After` interval must survive the guard. Dropping it
@@ -1677,9 +1671,24 @@ fn metrics_binding_error_and_nonce_required_are_distinct() {
         );
         check(&guard, &http::Method::GET, "/api").await
     });
-    assert_eq!(check_outcome_count(&counters, "binding_error"), 1);
-    assert_eq!(check_outcome_count(&counters, "invalid_token"), 0);
-    assert_eq!(check_outcome_count(&counters, "nonce_required"), 0);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "binding_error")],
+        1,
+    );
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "invalid_token")],
+        0,
+    );
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "nonce_required")],
+        0,
+    );
 
     let (_, counters) = with_metrics(async {
         let guard = build_guard(
@@ -1688,8 +1697,18 @@ fn metrics_binding_error_and_nonce_required_are_distinct() {
         );
         check(&guard, &http::Method::GET, "/api").await
     });
-    assert_eq!(check_outcome_count(&counters, "nonce_required"), 1);
-    assert_eq!(check_outcome_count(&counters, "binding_error"), 0);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "nonce_required")],
+        1,
+    );
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "binding_error")],
+        0,
+    );
 }
 
 /// Credentials that cannot be parsed out of the request are a malformed request, not a
@@ -1704,8 +1723,18 @@ fn metrics_extract_error_counts_as_invalid_request() {
         check(&guard, &http::Method::GET, "/api").await
     });
     assert_deny(&outcome, http::StatusCode::BAD_REQUEST);
-    assert_eq!(check_outcome_count(&counters, "invalid_request"), 1);
-    assert_eq!(check_outcome_count(&counters, "invalid_token"), 0);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "invalid_request")],
+        1,
+    );
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "invalid_token")],
+        0,
+    );
 }
 
 /// The rejection path must build exactly one `Challenge`. Status, retry interval,
@@ -1856,10 +1885,16 @@ fn metrics_insufficient_scope_on_missing_scope() {
         );
         check(&guard, &http::Method::GET, "/admin").await
     });
-    assert_eq!(check_outcome_count(&counters, "insufficient_scope"), 1);
+    assert_counter(
+        &counters,
+        "huskarl.resource.check",
+        &[("name", ""), ("outcome", "insufficient_scope")],
+        1,
+    );
 }
 
 #[test]
+#[cfg(feature = "metrics")]
 fn metrics_name_label_present_when_configured() {
     let (_, counters) = with_metrics(async {
         let guard = Guard::builder()

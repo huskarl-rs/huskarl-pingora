@@ -54,3 +54,8 @@ to distinguish delivery failures from persistence failures.
 
 For provider refresh failures, cookie rejection, and lifetime checks, use the
 shared [browser login troubleshooting guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/troubleshooting/).
+
+For adapter counters and handled login errors, enable the optional `metrics`
+feature and configure `LoginProxy::diagnostics` as needed. See the
+[telemetry reference](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/telemetry/)
+for counting boundaries, instance names, and dependency limitations.

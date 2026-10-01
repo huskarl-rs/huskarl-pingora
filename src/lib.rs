@@ -15,6 +15,10 @@
 //! by default. `default-jws-verifier-platform` supplies native token verification;
 //! without it, provide a verifier platform explicitly.
 //!
+//! Enable the optional `metrics` feature for named adapter counters. See the
+//! [telemetry reference](_docs::reference::telemetry) for counting boundaries,
+//! application diagnostics, and dependency limitations.
+//!
 //! # Deployment limits
 //!
 //! Before deploying browser login beyond localhost:
@@ -64,7 +68,7 @@ pub mod _docs;
 
 #[cfg(feature = "login")]
 pub mod login;
-#[cfg(feature = "resource")]
+#[cfg(any(feature = "resource", feature = "login"))]
 pub(crate) mod metrics;
 #[cfg(feature = "resource")]
 pub mod resource;
@@ -80,3 +84,6 @@ mod method;
 
 #[cfg(any(feature = "resource", feature = "login"))]
 mod routing;
+
+#[cfg(all(test, any(feature = "resource", feature = "login")))]
+mod metrics_test_support;

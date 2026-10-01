@@ -88,13 +88,15 @@ pub mod explanation {
 /// Configuration details complementing the public API reference.
 #[cfg_attr(
     any(feature = "login", feature = "resource"),
-    doc = "Look up [path-guard configuration](reference::path_guard)."
+    doc = "Look up [path-guard configuration](reference::path_guard) and [telemetry contracts](reference::telemetry)."
 )]
 #[cfg_attr(
     feature = "login",
     doc = "Look up [login finalization exceptions and mitigations](reference::login_finalization) and [finalization invariants](reference::login_invariants)."
 )]
 pub mod reference {
+    #[doc = include_str!("../docs/reference/telemetry.md")]
+    pub mod telemetry {}
     #[cfg(feature = "login")]
     #[doc = include_str!("../docs/reference/login_invariants.md")]
     pub mod login_invariants {}

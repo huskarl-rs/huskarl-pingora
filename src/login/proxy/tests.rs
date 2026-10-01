@@ -8,7 +8,6 @@
 #![allow(clippy::unused_async_trait_impl)]
 
 use std::{
-    convert::Infallible,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -123,6 +122,8 @@ struct MockSessionDriver {
     save_completions: Mutex<usize>,
     #[builder(default)]
     fail_revoke: bool,
+    #[builder(default)]
+    fail_load: bool,
 }
 
 /// The `Set-Cookie` clear this driver emits for the browser's session cookie.
@@ -144,7 +145,7 @@ impl huskarl_login::session::sealed::Sealed for MockSessionDriver {}
 
 impl SessionDriver for MockSessionDriver {
     type SessionType = MockSession;
-    type LoadError = Infallible;
+    type LoadError = SessionError;
 
     fn apply_session_policy(&mut self, _policy: &SessionPolicy) -> Result<(), ConfigError> {
         Ok(())
@@ -189,7 +190,13 @@ impl SessionDriver for MockSessionDriver {
     ) -> Result<(MockSession, Vec<HeaderValue>), SessionError> {
         unimplemented!()
     }
-    async fn load(&self, _: &http::HeaderMap) -> Result<DriverLoad<MockSession>, Infallible> {
+    async fn load(&self, _: &http::HeaderMap) -> Result<DriverLoad<MockSession>, SessionError> {
+        if self.fail_load {
+            return Err(SessionError::new(
+                SessionErrorKind::Unavailable,
+                "load failed",
+            ));
+        }
         Ok(self
             .load_session
             .lock()
@@ -1555,5 +1562,333 @@ async fn interim_headers_preserve_work_until_final_or_upgrade_response() {
         assert_eq!(set_cookies(&header), ["mock-session=updated"]);
         assert_eq!(proxy.engine().session_store().save_count(), 1);
         assert!(ctx.login_state().session.is_some());
+    }
+}
+
+#[test]
+fn telemetry_classifies_login_decisions_with_bounded_labels() {
+    use crate::metrics_test_support::{assert_counter, with_metrics};
+
+    for (rule, has_session, expected) in [
+        (LoginRule::public(), false, "public"),
+        (LoginRule::optional(), false, "anonymous"),
+        (LoginRule::required(), false, "unauthenticated"),
+        (LoginRule::required(), true, "authenticated"),
+        (LoginRule::required().check(admin_only), true, "forbidden"),
+    ] {
+        let ((), counters) = with_metrics(async {
+            let mut store = MockSessionDriver::default();
+            if has_session {
+                store.load_session = Mutex::new(Some(MockSession::default()));
+            }
+            let proxy = LoginProxy::builder()
+                .inner(InnerProxy::new())
+                .engine(build_engine(store).await)
+                .metrics_name("browser")
+                .path_guard(crate::login::GuardConfig::new(
+                    crate::login::CaseSensitivity::Sensitive,
+                    crate::login::DecodeDepth::UpToOne,
+                ))
+                .default(rule)
+                .build()
+                .unwrap();
+            let (mut session, _client) = make_session(
+                "GET",
+                "/untrusted?subject=secret",
+                "Accept: application/json\r\n",
+            )
+            .await;
+            proxy
+                .request_filter(&mut session, &mut proxy.new_ctx())
+                .await
+                .unwrap();
+        });
+        assert_counter(
+            &counters,
+            "huskarl.pingora.login.check",
+            &[("name", "browser"), ("outcome", expected)],
+            1,
+        );
+        assert_counter(
+            &counters,
+            "huskarl.pingora.login.session_operation",
+            &[
+                ("name", "browser"),
+                ("operation", "load"),
+                ("phase", "request"),
+                ("outcome", "success"),
+            ],
+            u64::from(expected != "public"),
+        );
+        let own: Vec<_> = counters
+            .iter()
+            .filter(|(name, _, _)| name.starts_with("huskarl.pingora."))
+            .collect();
+        assert_eq!(
+            own.len(),
+            if cfg!(feature = "metrics") {
+                if expected == "public" { 1 } else { 2 }
+            } else {
+                0
+            }
+        );
+    }
+}
+
+#[test]
+fn telemetry_finalizes_once_and_preserves_handled_failure_diagnostics() {
+    use crate::metrics_test_support::{assert_counter, with_metrics};
+
+    for (phase, revoke, fail) in [
+        (LoginPhase::Response, false, false),
+        (LoginPhase::Response, false, true),
+        (LoginPhase::Response, true, true),
+        (LoginPhase::Logging, false, false),
+        (LoginPhase::Logging, false, true),
+        (LoginPhase::Logging, true, true),
+    ] {
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&diagnostics);
+        let ((), counters) = with_metrics(async {
+            let store = MockSessionDriver::builder()
+                .load_session(MockSession::default())
+                .fail_save(fail)
+                .fail_revoke(fail)
+                .save_cookies(vec![HeaderValue::from_static("mock-session=updated")])
+                .build();
+            let proxy = build_proxy(store).await.diagnostics(move |event| {
+                let detail = match event {
+                    LoginDiagnostic::SessionFailure {
+                        operation,
+                        phase,
+                        error,
+                    } => {
+                        assert_eq!(error.kind(), SessionErrorKind::Unavailable);
+                        format!("{operation:?}/{phase:?}: {}", error_chain(error))
+                    }
+                    LoginDiagnostic::StrandedCookies { count } => format!("stranded={count}"),
+                };
+                captured.lock().unwrap().push(detail);
+            });
+            let (mut session, _client) = make_session("GET", "/api", "").await;
+            let mut ctx = proxy.new_ctx();
+            proxy.request_filter(&mut session, &mut ctx).await.unwrap();
+            ctx.login_state_mut().pending = Some(owed_persist());
+            ctx.login_state_mut().terminate_requested = revoke;
+            if phase == LoginPhase::Response {
+                let mut interim = ResponseHeader::build(103, None).unwrap();
+                proxy
+                    .response_filter(&mut session, &mut interim, &mut ctx)
+                    .await
+                    .unwrap();
+                assert!(!ctx.login_state().finalized);
+                let mut response = ResponseHeader::build(200, None).unwrap();
+                let result = proxy
+                    .response_filter(&mut session, &mut response, &mut ctx)
+                    .await;
+                assert_eq!(result.is_err(), fail && !revoke);
+                proxy
+                    .response_filter(&mut session, &mut response, &mut ctx)
+                    .await
+                    .unwrap();
+            }
+            proxy.logging(&mut session, None, &mut ctx).await;
+            proxy.logging(&mut session, None, &mut ctx).await;
+        });
+        let operation = if revoke { "revoke" } else { "persist" };
+        assert_counter(
+            &counters,
+            "huskarl.pingora.login.session_operation",
+            &[
+                ("name", ""),
+                ("operation", operation),
+                ("phase", phase.as_str()),
+                ("outcome", if fail { "error" } else { "success" }),
+            ],
+            1,
+        );
+        assert_counter(
+            &counters,
+            "huskarl.pingora.login.finalization",
+            &[("name", ""), ("outcome", phase.as_str())],
+            1,
+        );
+        let stranded = u64::from(phase == LoginPhase::Logging && (!fail || revoke));
+        assert_counter(
+            &counters,
+            "huskarl.pingora.login.stranded_cookies",
+            &[("name", "")],
+            stranded,
+        );
+        let details = diagnostics.lock().unwrap();
+        assert_eq!(
+            details.len(),
+            usize::from(fail) + usize::try_from(stranded).unwrap()
+        );
+        if fail {
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("failed")
+                        && detail.contains(&format!("{phase:?}")))
+            );
+        }
+    }
+}
+
+#[test]
+fn telemetry_counts_preflights_engine_routes_and_route_denials() {
+    use crate::metrics_test_support::{assert_counter, with_metrics};
+
+    for (method, path, headers, rule, expected) in [
+        (
+            "OPTIONS",
+            "/api",
+            "Access-Control-Request-Method: GET\r\n",
+            LoginRule::required(),
+            "preflight",
+        ),
+        (
+            "OPTIONS",
+            "/api",
+            "Access-Control-Request-Method: GET\r\n",
+            LoginRule::required().method(http::Method::GET),
+            "policy_denied",
+        ),
+        ("GET", "/callback", "", LoginRule::required(), "login_route"),
+        (
+            "GET",
+            "/public/../api",
+            "",
+            LoginRule::required(),
+            "path_confusion",
+        ),
+    ] {
+        let ((), counters) = with_metrics(async {
+            let proxy = build_proxy_with_routes(
+                MockSessionDriver::default(),
+                vec![("/api", rule), ("/public", LoginRule::public())],
+            )
+            .await;
+            let (mut session, _client) = make_session(method, path, headers).await;
+            proxy
+                .request_filter(&mut session, &mut proxy.new_ctx())
+                .await
+                .unwrap();
+        });
+        assert_counter(
+            &counters,
+            "huskarl.pingora.login.check",
+            &[("name", ""), ("outcome", expected)],
+            1,
+        );
+        assert!(
+            !counters
+                .iter()
+                .any(|(name, _, _)| name == "huskarl.pingora.login.session_operation")
+        );
+    }
+}
+
+#[test]
+fn telemetry_load_failure_preserves_the_original_error_without_metrics() {
+    use crate::metrics_test_support::{assert_counter, with_metrics};
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let ((), counters) = with_metrics(async {
+        let proxy = build_proxy(MockSessionDriver::builder().fail_load(true).build())
+            .await
+            .diagnostics(|_| panic!("replaced handler must not run"))
+            .diagnostics(move |event| {
+                let LoginDiagnostic::SessionFailure {
+                    operation,
+                    phase,
+                    error,
+                } = event
+                else {
+                    panic!("expected session-load diagnostic");
+                };
+                assert_eq!(operation, SessionOperation::Load);
+                assert_eq!(phase, LoginPhase::Request);
+                captured.lock().unwrap().push(error_chain(error));
+            });
+        let (mut session, _client) = make_session("GET", "/api", "").await;
+        assert!(
+            proxy
+                .request_filter(&mut session, &mut proxy.new_ctx())
+                .await
+                .unwrap()
+        );
+        assert_eq!(session.response_written().unwrap().status.as_u16(), 500);
+    });
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].contains("load failed"));
+    assert_counter(
+        &counters,
+        "huskarl.pingora.login.check",
+        &[("name", ""), ("outcome", "server_error")],
+        1,
+    );
+    assert_counter(
+        &counters,
+        "huskarl.pingora.login.session_operation",
+        &[
+            ("name", ""),
+            ("operation", "load"),
+            ("phase", "request"),
+            ("outcome", "error"),
+        ],
+        1,
+    );
+}
+
+#[test]
+fn telemetry_cancellation_does_not_claim_a_completed_persist() {
+    use crate::metrics_test_support::{assert_counter, with_metrics};
+
+    let ((), counters) = with_metrics(async {
+        let gate = Arc::new(SaveGate::default());
+        let store = MockSessionDriver::builder()
+            .load_session(MockSession::default())
+            .save_gate(Arc::clone(&gate))
+            .build();
+        let proxy = build_proxy(store).await;
+        let (mut session, _client) = make_session("GET", "/api", "").await;
+        let mut ctx = proxy.new_ctx();
+        proxy.request_filter(&mut session, &mut ctx).await.unwrap();
+        ctx.login_state_mut().pending = Some(owed_persist());
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        {
+            let work = proxy.response_filter(&mut session, &mut response, &mut ctx);
+            tokio::pin!(work);
+            tokio::select! {
+                result = &mut work => panic!("persist should remain pending: {result:?}"),
+                () = gate.entered.notified() => {}
+            }
+        }
+        assert!(ctx.login_state().finalized);
+        proxy.logging(&mut session, None, &mut ctx).await;
+        assert_eq!(proxy.engine().session_store().save_count(), 1);
+    });
+    assert_counter(
+        &counters,
+        "huskarl.pingora.login.finalization",
+        &[("name", ""), ("outcome", "response")],
+        1,
+    );
+    for outcome in ["success", "error"] {
+        assert_counter(
+            &counters,
+            "huskarl.pingora.login.session_operation",
+            &[
+                ("name", ""),
+                ("operation", "persist"),
+                ("phase", "response"),
+                ("outcome", outcome),
+            ],
+            0,
+        );
     }
 }

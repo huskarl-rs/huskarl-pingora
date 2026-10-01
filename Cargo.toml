@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.92"
 description = "Pingora integration for huskarl OAuth2 resource server."
 repository = "https://github.com/huskarl-rs/huskarl-pingora"
-homepage = "https://github.com/huskarl-rs/huskarl-pingora"
 documentation = "https://docs.rs/huskarl-pingora"
 license = "MIT OR Apache-2.0"
 keywords = ["oauth2", "pingora", "security", "authentication"]
@@ -18,6 +17,7 @@ upstream_modules = [
   "pingora-proxy-delegate/upstream_modules",
   "pingora-proxy-router/upstream_modules",
 ]
+metrics = ["dep:metrics", "huskarl?/metrics", "huskarl-core?/metrics"]
 resource = [
   "dep:bon",
   "dep:bytes",
@@ -26,7 +26,6 @@ resource = [
   "dep:huskarl-route-guard",
   "dep:pingora-core",
   "dep:serde_json",
-  "dep:metrics",
   "dep:strum",
 ]
 login = [
@@ -52,7 +51,6 @@ huskarl-core = { version = "0.10.4", default-features = false, optional = true }
 huskarl-route-guard = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 http = "1"
-log = "0.4"
 pingora-proxy-delegate = { version = "0.2", default-features = false }
 pingora-error = "0.9"
 pingora-http = "0.9"
@@ -73,6 +71,7 @@ huskarl = { version = "0.11", default-features = false, optional = true }
 huskarl-login = { version = "0.4", optional = true }
 
 [dev-dependencies]
+metrics = { version = "0.24", default-features = false }
 h2 = "0.4"
 huskarl-login = { version = "0.4", features = ["test-support"] }
 huskarl-resource-server = { version = "0.11.3" }

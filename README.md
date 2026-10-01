@@ -20,6 +20,10 @@ Choose `login` for browser sessions managed by an OIDC provider, or
 by default. `default-jws-verifier-platform` supplies native token verification;
 without it, provide a verifier platform explicitly.
 
+Enable the optional `metrics` feature for named adapter counters. See the
+[telemetry reference](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/telemetry/) for counting boundaries,
+application diagnostics, and dependency limitations.
+
 # Deployment limits
 
 Before deploying browser login beyond localhost:

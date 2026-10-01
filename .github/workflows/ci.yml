@@ -36,13 +36,20 @@ jobs:
           cargo check --no-default-features
           cargo check --no-default-features --features login
           cargo check --no-default-features --features resource
+          cargo check --no-default-features --features metrics
+          cargo check --no-default-features --features login,metrics
+          cargo check --no-default-features --features resource,metrics
           cargo check --all-features
 
       - name: Lint all targets
         run: cargo clippy --all-features --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --all-features --all-targets
+        run: |
+          cargo test --all-features --all-targets
+          cargo test --no-default-features --features resource --lib
+          cargo test --no-default-features --features login --lib
+          cargo test --no-default-features --features login,metrics --lib telemetry
 
       - name: Run documentation tests
         run: cargo test --doc --all-features

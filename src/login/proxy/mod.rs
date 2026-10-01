@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use http::HeaderValue;
 use huskarl_login::{
-    DefaultPersistFailurePolicy, PersistFailurePolicy, SessionDriver,
+    DefaultPersistFailurePolicy, PersistFailurePolicy, SessionDriver, SessionError,
     engine::{
         LoadedSession, LoginEngine, LoginResponse, SetCookies, error_chain, is_cors_preflight,
     },
@@ -33,6 +33,7 @@ use pingora_proxy_delegate::proxy_http_delegate;
 
 use super::{
     ctx::HasLoginSession,
+    diagnostics::{DiagnosticHandler, LoginDiagnostic, LoginPhase, SessionOperation},
     rule::{CheckError, LoginRule},
 };
 use crate::{
@@ -69,7 +70,8 @@ mod tests;
 ///   `response_filter` — the inner proxy answered the request
 ///   itself in `request_filter`, or proxying failed. The response is
 ///   already sent at that point, so any `Set-Cookie` values the store
-///   returns are dropped with a warning: external stores persist fine,
+///   returns are counted and reported to the optional diagnostic handler before
+///   being discarded: external stores persist fine,
 ///   cookie-backed stores cannot. Eager refresh persistence prepares cookie
 ///   updates but does not deliver them: even a successful cookie save depends
 ///   on the response reaching the browser. See the
@@ -146,6 +148,8 @@ where
     routes: RuleRouter<LoginRule<SD::SessionType>>,
     persist_failure_policy: Box<dyn PersistFailurePolicy>,
     cors_passthrough: bool,
+    metrics_name: Option<String>,
+    diagnostics: Option<DiagnosticHandler>,
 }
 
 #[bon::bon]
@@ -213,6 +217,10 @@ where
         /// inner proxy answer.
         #[builder(default = true)]
         cors_passthrough: bool,
+        /// Stable name for this adapter's metrics; unset emits `name=""`.
+        /// Requires `metrics`. The shared engine retains its separately configured name.
+        #[builder(into)]
+        metrics_name: Option<String>,
     ) -> Result<Self, RouteConfigError> {
         for (_kind, pattern, rule) in &routes {
             if rule.public_check_requested() {
@@ -234,6 +242,8 @@ where
             routes,
             persist_failure_policy,
             cors_passthrough,
+            metrics_name,
+            diagnostics: None,
         })
     }
 }
@@ -300,6 +310,66 @@ where
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
     SD: SessionDriver + Send + Sync,
 {
+    /// Installs an application handler for internally handled failures and stranded
+    /// cookies. Available independently of the `metrics` feature.
+    ///
+    /// The handler runs synchronously and may be called concurrently. It must not
+    /// block or panic; panics propagate, and reentrant calls receive no serialization.
+    /// For asynchronous export, copy only the needed fields into a bounded queue.
+    /// The application owns redaction, sampling, queue overflow, and delivery policy.
+    /// No handler is installed by default. Repeated calls replace the handler.
+    #[must_use]
+    pub fn diagnostics(
+        mut self,
+        handler: impl Fn(LoginDiagnostic<'_>) + Send + Sync + 'static,
+    ) -> Self {
+        self.diagnostics = Some(Arc::new(handler));
+        self
+    }
+
+    fn decision(&self, outcome: &'static str) {
+        crate::metrics::emit_counter(
+            "huskarl.pingora.login.check",
+            outcome,
+            self.metrics_name.as_deref(),
+        );
+    }
+
+    fn observe_operation<T>(
+        &self,
+        operation: SessionOperation,
+        phase: LoginPhase,
+        result: &std::result::Result<T, SessionError>,
+    ) {
+        crate::metrics::login_operation(
+            operation,
+            phase,
+            result.is_ok(),
+            self.metrics_name.as_deref(),
+        );
+        if let Err(error) = result
+            && let Some(handler) = &self.diagnostics
+        {
+            handler(LoginDiagnostic::SessionFailure {
+                operation,
+                phase,
+                error,
+            });
+        }
+    }
+
+    fn report_stranded_cookies(&self, cookies: SetCookies) {
+        if !cookies.is_empty() {
+            crate::metrics::stranded_cookies(cookies.len(), self.metrics_name.as_deref());
+            if let Some(handler) = &self.diagnostics {
+                handler(LoginDiagnostic::StrandedCookies {
+                    count: cookies.len(),
+                });
+            }
+        }
+        cookies.discard();
+    }
+
     /// Returns a handle to the underlying [`LoginEngine`].
     ///
     /// Exposed so an inner proxy can drive engine primitives directly — for
@@ -326,6 +396,11 @@ where
             return Ok(());
         }
         state.finalized = true;
+        crate::metrics::emit_counter(
+            "huskarl.pingora.login.finalization",
+            LoginPhase::Response.as_str(),
+            self.metrics_name.as_deref(),
+        );
         let maybe_sess = state.session.as_ref();
         let request_headers = std::mem::take(&mut state.request_headers);
         let set_cookies = std::mem::take(&mut state.set_cookies);
@@ -355,10 +430,8 @@ where
                 .terminate_session(sess, &request_headers)
                 .await
                 .into_parts();
+            self.observe_operation(SessionOperation::Revoke, LoginPhase::Response, &revocation);
             append_set_cookies(response, clears)?;
-            if let Err(e) = revocation {
-                log::error!("failed to revoke session: {}", error_chain(&e));
-            }
             return Ok(());
         }
 
@@ -366,10 +439,11 @@ where
         let Some(pending) = pending else {
             return Ok(());
         };
-        match pending.commit(&self.engine, &request_headers).await {
+        let persisted = pending.commit(&self.engine, &request_headers).await;
+        self.observe_operation(SessionOperation::Persist, LoginPhase::Response, &persisted);
+        match persisted {
             Ok(cookies) => append_set_cookies(response, cookies),
             Err(e) => {
-                log::error!("failed to persist session: {}", error_chain(&e));
                 match self.persist_failure_policy.handle(&e) {
                     // The filter cannot replace the body stream. Return a
                     // status-bearing error; Pingora's fresh-hit path maps it
@@ -436,14 +510,13 @@ where
         Ok(true)
     }
 
-    /// Logs and renders a route-resolution denial.
+    /// Counts and renders a route-resolution denial.
     async fn serve_path_confusion(
         &self,
         session: &mut Session,
-        path: &str,
         reason: &ResolveError,
     ) -> Result<bool> {
-        log::warn!("route guard denied {path:?}: {reason}");
+        self.decision(crate::metrics::route_denial(reason));
         let status = resolve_error_status(reason);
         let resp = self.engine.render_error(status, reason.message());
         write_login_response(session, resp, vec![]).await?;
@@ -588,19 +661,6 @@ async fn write_login_response(
     Ok(())
 }
 
-/// Consumes cookies owed to a response that has already been sent, reporting
-/// what was stranded. `discard` then consumes the guard without logging —
-/// non-delivery here is a fact, not a dropped-cookie bug.
-fn report_stranded_cookies(cookies: SetCookies) {
-    if !cookies.is_empty() {
-        log::warn!(
-            "session updated after the response was sent — {} Set-Cookie header(s) could not be delivered",
-            cookies.len()
-        );
-    }
-    cookies.discard();
-}
-
 /// Appends session `Set-Cookie` headers to the downstream response, after
 /// Pingora cache processing.
 ///
@@ -648,10 +708,9 @@ where
         // non-browser clients can manufacture preflight-shaped requests.
         if self.cors_passthrough && is_cors_preflight(&method, headers) {
             if let Err(reason) = self.routes.resolve(uri.path(), &method) {
-                return self
-                    .serve_path_confusion(session, uri.path(), &reason)
-                    .await;
+                return self.serve_path_confusion(session, &reason).await;
             }
+            self.decision("preflight");
             return self.forward_request(session, ctx).await;
         }
 
@@ -662,20 +721,18 @@ where
             .try_handle_login_route(&method, headers, &uri)
             .await
         {
+            self.decision("login_route");
             write_login_response(session, resp, vec![]).await?;
             return Ok(true);
         }
 
         // Resolve in one call: the path-confusion verdict, then the rule match — a
         // path a normalizing backend could route to a different rule is denied before
-        // any rule applies. The attributed reason goes to the log; the client sees
-        // only the coarse static message.
+        // any rule applies. Only the bounded category enters metrics.
         let rule = match self.routes.resolve(uri.path(), &method) {
             Ok(matched) => matched.rule(),
             Err(reason) => {
-                return self
-                    .serve_path_confusion(session, uri.path(), &reason)
-                    .await;
+                return self.serve_path_confusion(session, &reason).await;
             }
         };
 
@@ -683,23 +740,23 @@ where
         // only in whether a missing session is fatal, plus an optional check.
         let (required, check) = match rule {
             LoginRule::Public { .. } => {
+                self.decision("public");
                 return self.forward_request(session, ctx).await;
             }
             LoginRule::Optional { check, .. } => (false, check),
             LoginRule::Required { check, .. } => (true, check),
         };
 
-        let loaded = match self.engine.load_session(headers).await {
-            Ok(l) => l,
-            Err(e) => {
-                log::error!("failed to load session: {}", error_chain(&e));
-                let resp = self.engine.render_error(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to load session",
-                );
-                write_login_response(session, resp, vec![]).await?;
-                return Ok(true);
-            }
+        let loaded = self.engine.load_session(headers).await;
+        self.observe_operation(SessionOperation::Load, LoginPhase::Request, &loaded);
+        let Ok(loaded) = loaded else {
+            self.decision("server_error");
+            let resp = self.engine.render_error(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load session",
+            );
+            write_login_response(session, resp, vec![]).await?;
+            return Ok(true);
         };
 
         // Flatten the session state once, exhaustively: which session (if
@@ -726,6 +783,7 @@ where
             // into a login flow against the same unavailable authorization
             // server, or leaking anonymous state into a per-user cache.
             LoadedSession::RefreshUnavailable => {
+                self.decision("refresh_unavailable");
                 return self.serve_refresh_unavailable(session).await;
             }
         };
@@ -734,10 +792,12 @@ where
             // No usable session. set_cookies carries clears for stale
             // cookies the engine decided to drop (expired, refresh failed).
             if required {
+                self.decision("unauthenticated");
                 let resp = self.engine.redirect_to_login(headers, &uri).await;
                 write_login_response(session, resp, set_cookies.into_headers()).await?;
                 return Ok(true);
             }
+            self.decision("anonymous");
             ctx.login_state_mut()
                 .prepare_forward(None, None, headers.clone(), set_cookies);
             return self.forward_request(session, ctx).await;
@@ -746,6 +806,7 @@ where
         if let Some(check) = check
             && let Err(err) = check(&sess)
         {
+            self.decision("forbidden");
             let (status, msg) = match err {
                 CheckError::Forbidden(msg) => (http::StatusCode::FORBIDDEN, msg),
             };
@@ -754,12 +815,10 @@ where
             // the user is denied either way.
             let mut cookies = set_cookies.into_headers();
             if let Some(pending) = pending {
-                match pending.commit(&self.engine, headers).await {
-                    Ok(more) => cookies.extend(more),
-                    Err(e) => log::error!(
-                        "failed to persist session on denied request: {}",
-                        error_chain(&e)
-                    ),
+                let persisted = pending.commit(&self.engine, headers).await;
+                self.observe_operation(SessionOperation::Persist, LoginPhase::Denied, &persisted);
+                if let Ok(more) = persisted {
+                    cookies.extend(more);
                 }
             }
             let resp = self.engine.render_error(status, &msg);
@@ -767,6 +826,7 @@ where
             return Ok(true);
         }
 
+        self.decision("authenticated");
         ctx.login_state_mut()
             .prepare_forward(Some(sess), pending, headers.clone(), set_cookies);
 
@@ -817,8 +877,13 @@ where
             return;
         }
         state.finalized = true;
+        crate::metrics::emit_counter(
+            "huskarl.pingora.login.finalization",
+            LoginPhase::Logging.as_str(),
+            self.metrics_name.as_deref(),
+        );
         let set_cookies = std::mem::take(&mut state.set_cookies);
-        report_stranded_cookies(set_cookies);
+        self.report_stranded_cookies(set_cookies);
         if let Some(sess) = state.session.as_ref() {
             let request_headers = std::mem::take(&mut state.request_headers);
             let pending = state.pending.take();
@@ -835,20 +900,13 @@ where
                     .terminate_session(sess, &request_headers)
                     .await
                     .into_parts();
-                report_stranded_cookies(clears);
-                if let Err(err) = revocation {
-                    log::error!(
-                        "failed to revoke session in logging fallback: {}",
-                        error_chain(&err)
-                    );
-                }
+                self.observe_operation(SessionOperation::Revoke, LoginPhase::Logging, &revocation);
+                self.report_stranded_cookies(clears);
             } else if let Some(pending) = pending {
-                match pending.commit(&self.engine, &request_headers).await {
-                    Ok(cookies) => report_stranded_cookies(cookies),
-                    Err(err) => log::error!(
-                        "failed to persist session in logging fallback: {}",
-                        error_chain(&err)
-                    ),
+                let persisted = pending.commit(&self.engine, &request_headers).await;
+                self.observe_operation(SessionOperation::Persist, LoginPhase::Logging, &persisted);
+                if let Ok(cookies) = persisted {
+                    self.report_stranded_cookies(cookies);
                 }
             }
             // Otherwise fully persisted at load time — nothing owed.

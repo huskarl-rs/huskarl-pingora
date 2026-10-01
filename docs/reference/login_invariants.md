@@ -139,7 +139,7 @@ under its fixture assumptions, not every possible execution.
 | C1 | `real_pingora_response_paths_deliver_cookies_once`; `http2_response_paths_finalize_and_keep_cookies_out_of_cache`; `http2_upstreams_finalize_for_both_downstream_protocols` | Uses a mock cookie header, not browser chunk parsing or acceptance. |
 | C2 | Lifecycle cache-admission and stored-header assertions | Application-supplied cookies and user isolation require application tests. |
 | C3 | `response_filter_forces_no_store_when_session_cookie_appended`; `response_filter_preserves_cache_control_without_session_cookie` | Outer filters and downstream caches are deployment responsibilities. |
-| C4 | `direct_writes_demonstrate_the_documented_boundary`; `upstream_failure_uses_cleanup_without_claiming_cookie_delivery` | These verify no cookie delivery and store attempts, not the warning log's contents. |
+| C4 | `direct_writes_demonstrate_the_documented_boundary`; `upstream_failure_uses_cleanup_without_claiming_cookie_delivery` | These verify no cookie delivery and store attempts, not the optional diagnostic notification. |
 | E1 | `real_pingora_persist_failures_never_serve_success`; `http2_persist_failures_never_deliver_success_or_cookies`; HTTP/2 upstream failure matrix | Custom permissive policies and custom error handlers need their own scenarios. |
 | E2 | `response_filter_termination_delivers_clears_when_revocation_fails` | Hook-level test; no real external-store outage or browser involved. |
 | E3 | `disconnect_before_headers_does_not_repeat_completed_persistence`; `disconnect_during_body_preserves_the_already_delivered_cookie`; `http2_stream_reset_during_save_completes_once_and_runs_cleanup` | These do not establish that a browser accepted a cookie. |

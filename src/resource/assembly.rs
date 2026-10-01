@@ -54,6 +54,7 @@ pub struct ResourceAssembly<C> {
     metadata_mapping: PublicUrlMapping,
     branches: Vec<(String, Route<C>)>,
     endpoints: Vec<ResourceMetadataEndpoint>,
+    metrics_name: Option<String>,
 }
 impl<C: Send + Sync + 'static> ResourceAssembly<C> {
     /// Creates an assembly with explicit mapping for the metadata namespace.
@@ -64,8 +65,18 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
             metadata_mapping,
             branches: Vec::new(),
             endpoints: Vec::new(),
+            metrics_name: None,
         }
     }
+    /// Names this assembly's route-selection metrics when `metrics` is enabled.
+    /// Use a stable deployment-configured name; unset emits `name=""`.
+    /// Branch guards and shared dependencies retain their own names.
+    #[must_use]
+    pub fn metrics_name(mut self, name: impl Into<String>) -> Self {
+        self.metrics_name = Some(name.into());
+        self
+    }
+
     /// Binds authentication and records its incoming mount and metadata endpoint.
     /// # Errors
     /// Rejects inconsistent mappings, overlapping mounts, or metadata conflicts.
@@ -154,28 +165,35 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
         let routes =
             RuleRouter::from_registrations(Arc::clone(&fallback), path_guard, registrations)
                 .map_err(|e| AssemblyError::Configuration(e.into()))?;
-        Ok(Router::new(ResourceSelector { routes }, fallback, slot))
+        Ok(Router::new(
+            ResourceSelector {
+                routes,
+                metrics_name: self.metrics_name,
+            },
+            fallback,
+            slot,
+        ))
     }
 }
 
 /// Selector produced by [`ResourceAssembly`], retaining path-guard validation.
 pub struct ResourceSelector<C> {
     routes: RuleRouter<Route<C>>,
+    metrics_name: Option<String>,
 }
 impl<C: Send + Sync + 'static> RouteSelector<C> for ResourceSelector<C> {
     fn select(&self, session: &Session, _ctx: &C) -> pingora_error::Result<Option<Route<C>>> {
         let req = session.req_header();
-        let matched = self
-            .routes
-            .resolve(req.uri.path(), &req.method)
-            .map_err(|reason| {
-                pingora_error::Error::explain(
-                    pingora_error::ErrorType::HTTPStatus(
-                        crate::path_confusion::resolve_error_status(&reason).as_u16(),
-                    ),
-                    reason.to_string(),
-                )
-            })?;
+        let resolved = self.routes.resolve(req.uri.path(), &req.method);
+        crate::metrics::route_outcome(resolved.as_ref().err(), self.metrics_name.as_deref());
+        let matched = resolved.map_err(|reason| {
+            pingora_error::Error::explain(
+                pingora_error::ErrorType::HTTPStatus(
+                    crate::path_confusion::resolve_error_status(&reason).as_u16(),
+                ),
+                reason.to_string(),
+            )
+        })?;
         Ok(Some(Arc::clone(matched.rule())))
     }
 }

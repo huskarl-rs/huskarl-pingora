@@ -29,11 +29,13 @@
 //! driving the flow, following the grant's own configuration.
 
 mod ctx;
+mod diagnostics;
 mod proxy;
 mod rule;
 
 // ── Pingora-specific public API ─────────────────────────────────────────────
 pub use ctx::{HasLoginSession, LoginCtx, LoginState};
+pub use diagnostics::{LoginDiagnostic, LoginPhase, SessionOperation};
 // ── Advanced: implementing a custom session type or external store, or driving
 // engine primitives directly ─────────────────────────────────────────────────
 //
