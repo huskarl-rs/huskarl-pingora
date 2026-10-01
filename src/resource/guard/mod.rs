@@ -175,11 +175,12 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
         ///
         /// For `DPoP`, set this to a value *you* control. The guard never derives the
         /// authority from the inbound `Host` header, so configuring `base_uri`
-        /// explicitly is what keeps `htu` bound to your real origin. If it is left unset,
-        /// `htu` is matched against the raw request URI — which from a downstream proxy is
-        /// origin-form (path only) and therefore no longer pins scheme/host, so a captured
-        /// proof could be replayed across origins. Set `base_uri` whenever you accept
-        /// DPoP-bound tokens.
+        /// explicitly keeps `htu` bound to your real origin. Without `base_uri` or
+        /// `url_mapping`, the guard passes the raw request URI to the validator.
+        /// Behind a reverse proxy this is normally origin-form (path and optional
+        /// query, without scheme or authority), so DPoP validation fails closed
+        /// with a server-side integration error. Configure `base_uri` or
+        /// `url_mapping` whenever you accept DPoP-bound tokens.
         base_uri: Option<http::Uri>,
         /// Validated public/ingress mapping. Do not combine with `base_uri` or `strip_prefix`.
         url_mapping: Option<crate::resource_server::core::url_mapping::PublicUrlMapping>,

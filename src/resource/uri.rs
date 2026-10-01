@@ -7,10 +7,11 @@
 //!
 //! `base_uri` must be an origin the client cannot spoof — typically a value you
 //! configure, not one taken from the inbound `Host` header. When it is
-//! **absent**, reconstruction returns the raw request URI unchanged; behind a
-//! proxy that is origin-form (path only), so the validator fails closed with an
-//! integration error rather than checking `htu`. Configure `base_uri` (the
-//! guard's `base_uri`) whenever DPoP-bound tokens are accepted.
+//! **absent** and no `url_mapping` is configured, the guard passes the raw request
+//! URI to the validator. Behind a reverse proxy this is normally origin-form
+//! (path and optional query, without scheme or authority), so DPoP validation
+//! fails closed with a server-side integration error. Configure the guard's
+//! `base_uri` or `url_mapping` whenever DPoP-bound tokens are accepted.
 
 /// Reconstructs the client-facing URI for `DPoP` `htu` matching.
 ///
