@@ -16,28 +16,6 @@ jobs:
     steps:
       - name: Check out huskarl-pingora
         uses: actions/checkout@v4
-        with:
-          path: huskarl-pingora
-
-      # Cargo.toml intentionally uses sibling paths for coordinated local
-      # development while retaining published version requirements.
-      - name: Check out huskarl
-        uses: actions/checkout@v4
-        with:
-          repository: huskarl-rs/huskarl
-          path: huskarl
-
-      - name: Check out huskarl-login
-        uses: actions/checkout@v4
-        with:
-          repository: huskarl-rs/huskarl-login
-          path: huskarl-login
-
-      - name: Check out huskarl-route-guard
-        uses: actions/checkout@v4
-        with:
-          repository: huskarl-rs/huskarl-route-guard
-          path: huskarl-route-guard
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +30,6 @@ jobs:
 
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
-        working-directory: huskarl-pingora
 
       - name: Check feature combinations
         run: |
@@ -60,19 +37,15 @@ jobs:
           cargo check --no-default-features --features login
           cargo check --no-default-features --features resource
           cargo check --all-features
-        working-directory: huskarl-pingora
 
       - name: Lint all targets
         run: cargo clippy --all-features --all-targets -- -D warnings
-        working-directory: huskarl-pingora
 
       - name: Run tests
         run: cargo test --all-features --all-targets
-        working-directory: huskarl-pingora
 
       - name: Run documentation tests
         run: cargo test --doc --all-features
-        working-directory: huskarl-pingora
 
       - name: Build strict documentation for supported feature sets
         run: |
@@ -82,10 +55,8 @@ jobs:
           cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
-        working-directory: huskarl-pingora
 
       - name: Check generated README
         run: |
           cargo install cargo-reedme --version 0.6.1 --locked
           cargo reedme --check
-        working-directory: huskarl-pingora
