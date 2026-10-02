@@ -1,54 +1,40 @@
-//! OAuth 2.0 resource server (bearer token) protection for Pingora.
+//! Access-token authentication and protected-resource discovery for Pingora.
 //!
-//! Construct a [`BoundResource`] from a resource definition, token validator,
-//! validated [`ResourcePolicy`], and inner proxy. Its [`ProtectedResourceProxy`]
-//! authenticates requests, while its matching metadata is published separately.
-//! Use [`assembly::ResourceAssembly`] to mount resource bundles together.
+//! | Task | API | Guide |
+//! |---|---|---|
+//! | Protect resources and publish discovery on one listener | [`assembly::ResourceAssembly`] | [Assemble resources](crate::_docs::how_to::resource_registration) |
+//! | Use your own router or an external metadata publisher | [`BoundResource`] | [Contribute metadata](crate::_docs::how_to::publication_contributions) |
+//! | Authenticate tokens without resource discovery | [`Guard`] + [`AuthProxy`] | [Add token authentication](crate::_docs::how_to::resource_proxy) |
 //!
-//! For standalone authentication without a resource definition, combine
-//! [`Guard::builder`] and [`AuthProxy::new`]. Both proxies implement
-//! [`ProxyHttp`](pingora_proxy::ProxyHttp) with the inner proxy's context.
+//! Start with the [token-protection tutorial](crate::_docs::tutorial::resource_proxy)
+//! for a working upstream, proxy, and authenticated request.
 //!
-//! Access control is defined through path-based [`Rule`]s registered on a
-//! [`ResourcePolicy`]. Each rule specifies whether a route is public, optionally
-//! authenticated, or requires a valid token — and can additionally enforce
-//! audience, scope, and custom checks.
+//! # Request policy and context
 //!
-//! Register rules with [`ResourcePolicy::builder`]: prefer
-//! [`subtree`](ResourcePolicyBuilder::subtree) to protect a path and everything beneath
-//! it, and use [`route`](ResourcePolicyBuilder::route) for a single exact path. See the
-//! [crate-level routing notes](crate#routing) for why the choice matters.
+//! A [`ResourcePolicy`] selects a [`Rule`] for the incoming path and method.
+//! Unmatched paths require authentication by default. Use
+//! [`subtree`](ResourcePolicyBuilder::subtree) for a path and its descendants,
+//! or [`route`](ResourcePolicyBuilder::route) for one exact path. Rules can require
+//! audiences, scopes, and custom checks after token validation.
 //!
-//! # Features
+//! The inner proxy's context must implement [`HasAuthState`] for the validator's
+//! claims type. [`AuthCtx`] supplies this state around your own context.
+//! Read [`HasAuthState::validated_token`] in inner request or forwarding hooks.
+//! Public rules skip validation; optional rules validate supplied credentials
+//! but allow requests without a token. Invalid supplied tokens are rejected.
 //!
-//! - **Path-based routing** — protect a path and all descendants with
-//!   [`subtree`](crate::resource::ResourcePolicyBuilder::subtree), or match one exact
-//!   path with [`route`](crate::resource::ResourcePolicyBuilder::route). Patterns use
-//!   `matchit` syntax (e.g. `/users/{id}`, `/public/{*rest}`).
-//! - **Scope enforcement** — requires tokens to carry specific scopes via the
-//!   [`HasScopes`] trait.
-//! - **`DPoP` support** — proof-of-possession tokens are validated and
-//!   `DPoP-Nonce` headers are propagated automatically.
-//! - **Credential stripping** — `Authorization` and `DPoP` headers are removed
-//!   before forwarding to upstream by default.
-//! - **[RFC 9728] resource metadata** — each [`BoundResource`] binds one logical
-//!   protected resource to its token audience, while a server-level
-//!   [`ResourceMetadataProxy`] publishes the documents collected from all such
-//!   integrations under `/.well-known/oauth-protected-resource[/path]`.
+//! # Forwarding and discovery
 //!
-//! Follow [Publish protected-resource metadata](crate::_docs::how_to::resource_metadata)
-//! for single-resource setup, multiple resources, and verification.
+//! Authentication removes `Authorization` and `DPoP` before the inner upstream
+//! request filter by default. [`Rule::strip_credentials`] controls this behavior.
+//! `DPoP` nonces are propagated to responses. For mTLS-bound tokens, supply the
+//! handshake certificate through [`ClientCertDer`].
 //!
-//! # Multiple resource servers
-//!
-//! Build one [`BoundResource`] per protected subtree, then place
-//! those independent proxies behind a `ProxyHttp` router. Publish the returned
-//! metadata endpoints through a separate router branch so metadata requests do
-//! not enter any resource server's early-filter lifecycle. See the
-//! `multi_resource_proxy` example for built-in assembly, or `publication_proxy`
-//! for server-owned routing using `pingora-proxy-router`.
-//!
-//! [RFC 9728]: https://datatracker.ietf.org/doc/html/rfc9728
+//! Resource assembly binds each resource's identity and audiences and publishes
+//! its metadata outside token authentication. Advertising scopes does not enforce
+//! them: configure [`Rule::scopes`] for authorization. A custom router must select
+//! metadata independently before invoking an authenticated branch's early hooks.
+//! See [metadata publication](crate::_docs::how_to::resource_metadata).
 
 mod bound;
 mod ctx;

@@ -71,7 +71,9 @@ pub trait HasAuthState<C> {
 /// Use it to add auth to an existing context type without implementing
 /// [`HasAuthState`] yourself: [`AuthProxy`](super::AuthProxy) accepts any context
 /// implementing [`HasAuthState`], and this wrapper provides it over `inner`.
-/// Access the inner context fields via `ctx.inner`.
+/// Access the inner context fields via `ctx.inner`. `T` is your application context;
+/// `C` is the validator's claims type. New contexts have no token or response nonce
+/// and enable credential stripping. See [`HasAuthState`] for reading token claims.
 pub struct AuthCtx<T, C = ()> {
     token: Option<Arc<ValidatedRequest<C>>>,
     dpop_nonce: Option<String>,

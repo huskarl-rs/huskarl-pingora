@@ -9,11 +9,6 @@ validator, validated policy, and inner proxy; use `into_route()` when collecting
 `ResourceAssembly::register_bound` consumes that routed bundle. Existing
 `ResourceAssembly::register` constructs the same bundle internally.
 
-Axum exposes `resource_router::BoundResource`. Construct it with the definition,
-validator, scopes, and relative application router; authentication is applied
-before the bundle is returned. `ResourceRouter::register_bound` consumes it, and
-`ResourceRouter::register` delegates to that same path.
-
 For a custom server, call `definition()` and `metadata()` to inspect the bundle,
 and `into_parts()` at the routing boundary. That returns the matching definition,
 authenticated proxy/router, and publication contribution. Mount according to the
@@ -37,6 +32,7 @@ where V: AccessTokenValidator + ProvideValidatorMetadata
         .validator(validator)
         .policy(policy)
         .inner(inner)
+        .error_body(())
         .build()
 }
 ```
@@ -47,8 +43,7 @@ content, without a second metadata preparation during assembly.
 
 ## Export a snapshot
 
-`PreparedResource`, Pingora's `ResourceMetadataEndpoint`, and Axum's
-`ResourceMetadataService` expose the same borrowed `ResourcePublication` view.
+`ResourceMetadataEndpoint::publication()` exposes a borrowed `ResourcePublication` view.
 It contains the canonical absolute URL, the exact JSON bytes, and the media type.
 Copy these when handing them to a separate process or static publisher:
 
@@ -125,16 +120,5 @@ ambiguous paths before selecting a branch. The
 [metadata guide](crate::_docs::how_to::resource_metadata) includes configuration,
 rewrite examples, and the integration-test command.
 
-## Axum integration
-
-Axum's metadata service can already be mounted at an independently chosen path.
-Use `mapping.incoming_uri(metadata.uri())?` and mount it with
-`Router::route_service(incoming.path(), metadata)`. Put that route and unrelated
-public endpoints in the outer router, with the protected application as its
-fallback. `ResourceMetadataService` documents a complete composition example.
-
-Axum dispatches by path and its metadata service ignores query parameters.
-Consumers must reject query-only document collisions or provide their own
-query-aware dispatcher using exported snapshots. Mounting the service does not
-apply resource authentication; outer middleware, including login middleware,
-still applies. Unknown well-known paths have the consumer's configured fallback.
+For the shared design and framework differences, read
+[Why binding and publication are separate](crate::_docs::explanation::endpoint_publication).

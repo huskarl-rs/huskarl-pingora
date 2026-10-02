@@ -10,7 +10,21 @@
 /// A trait for checking OAuth 2.0 scopes on token claims.
 ///
 /// Implement this for your custom claims type so that [`Guard`](super::Guard)
-/// can enforce scope-based access rules.
+/// can enforce scope-based access rules. RFC 9068 claims already implement it.
+/// Match complete scope names; a token granting `read:profile` should not satisfy
+/// a request for `read`. See [`super::Rule::scopes`] for policy configuration.
+///
+/// ```
+/// use huskarl_pingora::resource::HasScopes;
+/// struct Claims {
+///     scopes: Vec<String>,
+/// }
+/// impl HasScopes for Claims {
+///     fn has_scope(&self, scope: &str) -> bool {
+///         self.scopes.iter().any(|granted| granted == scope)
+///     }
+/// }
+/// ```
 pub trait HasScopes {
     /// Returns `true` if the token grants the given scope.
     fn has_scope(&self, scope: &str) -> bool;

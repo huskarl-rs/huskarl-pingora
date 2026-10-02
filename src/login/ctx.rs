@@ -62,6 +62,9 @@ impl<S> LoginState<S> {
     /// response filter, completes session persistence or termination, and adds
     /// cookies before sending this response. Later hooks can still read `session`.
     /// Direct writes bypass this contract and cannot receive queued cookies.
+    /// A later call replaces an already queued response. The entire body is buffered;
+    /// HEAD, 204, and 304 responses send no body. See the
+    /// [local-response recipe](crate::_docs::how_to::local_responses) for an example.
     ///
     /// # Errors
     /// Rejects informational responses: this API sends a complete final response.
@@ -121,9 +124,12 @@ pub trait HasLoginSession<S> {
 /// Convenience context wrapper that bundles login state with an inner user
 /// context.
 ///
-/// Auto-implements [`HasLoginSession`] over the inner context — use it when your
+/// Implements [`HasLoginSession`] on the wrapper. Use it when your
 /// proxy needs no context of its own, or to add login to an existing type without
 /// implementing the trait yourself. Access the inner context via `ctx.inner`.
+/// `T` is your application context and `S` is the session driver's session type.
+/// New contexts have no loaded session or requested termination. See
+/// [identity forwarding](crate::_docs::how_to::identity) for reading a session.
 pub struct LoginCtx<T, S> {
     /// The inner user-defined context.
     pub inner: T,

@@ -369,6 +369,7 @@ fn main() {
                 address: std::env::var("INVENTORY_UPSTREAM")
                     .unwrap_or_else(|_| "127.0.0.1:3001".into()),
             })
+            .error_body(())
             .build()
             .expect("failed to bind inventory")
             .into_route();
@@ -380,6 +381,7 @@ fn main() {
                 address: std::env::var("PAYMENTS_UPSTREAM")
                     .unwrap_or_else(|_| "127.0.0.1:3002".into()),
             })
+            .error_body(())
             .build()
             .expect("failed to bind payments")
             .into_route();

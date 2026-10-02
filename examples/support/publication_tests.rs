@@ -141,6 +141,7 @@ fn branch(
         .validator(validator)
         .policy(policy)
         .inner(Application(Arc::clone(observed)))
+        .error_body(())
         .build()
         .unwrap()
         .into_route()

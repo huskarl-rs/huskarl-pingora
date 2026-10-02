@@ -14,6 +14,43 @@ use crate::resource_server::{
 
 /// An authenticated proxy and its metadata, prepared from one resource definition.
 ///
+/// Use this when your server owns routing or when customizing a resource before
+/// registering it with [`super::assembly::ResourceAssembly`]. For ordinary
+/// registration, [`super::assembly::ResourceAssembly::register`] constructs it for you.
+///
+/// # Example
+///
+/// Given a resource definition, matching validator, validated policy, and inner proxy:
+///
+/// ```
+/// use huskarl_pingora::resource::{BoundResource, ResourcePolicy};
+/// # use huskarl_pingora::resource_server::{resource::ResourceDefinition,
+/// #     validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata}};
+/// # fn bind<P, V>(definition: ResourceDefinition, validator: V,
+/// #     policy: ResourcePolicy<V::Claims>, inner: P) -> Result<(), Box<dyn std::error::Error>>
+/// # where V: AccessTokenValidator + ProvideValidatorMetadata {
+/// let bound = BoundResource::builder()
+///     .definition(definition)
+///     .validator(validator)
+///     .policy(policy)
+///     .inner(inner)
+///     .error_body(()) // Empty rejection bodies; protocol headers are still set.
+///     .build()?;
+/// let (definition, authenticated_proxy, metadata) = bound.into_parts();
+/// // Mount authenticated_proxy at definition.incoming_mount().
+/// // Publish metadata separately, before authentication hooks run.
+/// # let _ = (definition, authenticated_proxy, metadata);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// For built-in assembly, keep the bundle intact: call [`Self::into_route`] and
+/// pass it to [`super::assembly::ResourceAssembly::register_bound`]. For a custom
+/// router or external publisher, follow the
+/// [publication recipe](crate::_docs::how_to::publication_contributions).
+///
+/// # Binding guarantees
+///
 /// Fields are private so independently prepared parts cannot be combined. The
 /// consuming server owns routing and publication. Use [`Self::into_parts`] only
 /// at that boundary; mounting the resulting proxy at the correct path remains
@@ -35,6 +72,7 @@ use crate::resource_server::{
 ///         .validator(validator)
 ///         .policy(guard)
 ///         .inner(inner)
+///         .error_body(())
 ///         .build();
 /// }
 /// ```
@@ -68,13 +106,15 @@ pub struct BoundResource<P> {
 }
 
 #[bon::bon]
-impl<P, V> BoundResource<ProtectedResourceProxy<P, V>>
+impl<P, V, E: ErrorBody> BoundResource<ProtectedResourceProxy<P, V, E>>
 where
     V: AccessTokenValidator + ProvideValidatorMetadata,
 {
     /// Starts a builder for an authenticated proxy and its matching metadata.
     /// Call [`BoundResourceBuilder::build`] to bind authentication and prepare
     /// the publication contribution.
+    /// Set [`BoundResourceBuilder::error_body`] to a renderer, or `()` for an
+    /// empty rejection body.
     /// No HTTP route is installed. Policy paths use incoming request coordinates,
     /// including the ingress prefix and resource mount. The definition alone
     /// supplies resource identity, accepted audiences and URL reconstruction.
@@ -92,11 +132,14 @@ where
         policy: ResourcePolicy<V::Claims>,
         /// Inner proxy to invoke after authentication and authorization succeed.
         inner: P,
+        /// Renderer for resource-server rejection bodies. Use `()` for an empty body.
+        /// Protocol status and headers remain library-controlled.
+        error_body: E,
     ) -> Result<Self, ConfigError> {
         let (proxy, metadata) = ProtectedResourceProxy::new(&definition, validator, policy, inner)?;
         Ok(Self {
             definition,
-            proxy,
+            proxy: proxy.error_body(error_body),
             metadata,
         })
     }
@@ -108,6 +151,7 @@ where
 {
     /// Configures rejection bodies while retaining the resource definition and
     /// prepared metadata. See [`ProtectedResourceProxy::error_body`] for renderer semantics.
+    /// Use [`BoundResourceBuilder::error_body`] to choose the renderer during construction.
     #[must_use]
     pub fn error_body<NewE: ErrorBody>(
         self,

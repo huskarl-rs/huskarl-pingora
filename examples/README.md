@@ -11,6 +11,9 @@ or write a router to use the built-in resource assembly.
 | Add browser login | [login_proxy.rs](login_proxy.rs) | Issuer, client ID, registered redirect URI, cookie key, upstream |
 | Use bearer-token policies without discovery | [jwt_proxy.rs](jwt_proxy.rs) | Issuer, audience, public/protected route rules |
 
+For a guided first run with an upstream and request checks, follow
+[Protect an upstream with access tokens](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/tutorial/resource_proxy/).
+
 ## One resource
 
 ```sh
@@ -72,14 +75,14 @@ server composition. It shows `BoundResource`, route selection before branch
 hooks, independent metadata ingress, and an optional `SECURITY_TXT_FILE` handler.
 The file's contents are operator supplied and loaded once at startup.
 
-See [the publication and rewrite walkthrough](../docs/how_to/resource_metadata.md#publish-alongside-securitytxt).
+See [the publication and rewrite walkthrough](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/how_to/resource_metadata/#publish-alongside-securitytxt).
 Run its routing tests with `cargo test --example publication_proxy`. These use
 Pingora's HTTP runner and a test-only validator, without live issuer services.
 The library's contribution API does not manage the rest of `.well-known`.
 
 ## Browser login and rewrites
 
-First follow [the localhost login tutorial](../docs/tutorial/browser_login.md).
+First follow [the localhost login tutorial](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/tutorial/browser_login/).
 The default mapping is the redirect URI's origin with incoming prefix `/`.
 Cookie-key setup, grant configuration, session storage and application policies
 are explicit in `login_proxy.rs`; those are deployment choices, not resource
@@ -125,9 +128,5 @@ an empty list to omit them. They do not change authorization requirements.
 See the shared [metadata and browser discovery guide](https://github.com/huskarl-rs/huskarl/blob/main/huskarl-resource-server/docs/guide/resource_metadata.md)
 for a standalone document example and server-owned CORS configuration.
 
-During API iteration, this repository's Cargo patches use sibling
-`../huskarl/huskarl-core` and `../huskarl/huskarl-resource-server` sources.
-Keep the sibling checkout alongside this repository. Cargo patches apply only
-at the workspace root; an external application needs equivalent root patches.
-Remove these overrides after releasing the shared API and update version
-requirements before publishing the adapter.
+Build examples from this repository with registry dependencies; no sibling
+checkout is required.

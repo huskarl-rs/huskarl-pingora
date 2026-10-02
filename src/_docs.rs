@@ -1,20 +1,32 @@
 //! Guides for learning and operating a huskarl Pingora proxy.
 //!
 //! Choose [tutorial] for a guided first run, [how_to] for a task, or
-//! [explanation] for design reasoning. Public API modules are the reference.
+//! [explanation] for design reasoning. Use [reference](mod@reference) for cross-cutting contracts
+//! and the public API modules for individual types and methods.
 
 /// Guided first runs. Available pages depend on enabled features.
 #[cfg_attr(
     feature = "login",
     doc = "Start with [Browser login](tutorial::browser_login)."
 )]
+#[cfg_attr(
+    feature = "resource",
+    doc = "Start with [Protect an upstream with access tokens](tutorial::resource_proxy)."
+)]
 pub mod tutorial {
+    #[cfg(feature = "resource")]
+    #[doc = include_str!("../docs/tutorial/resource_proxy.md")]
+    pub mod resource_proxy {}
     #[cfg(feature = "login")]
     #[doc = include_str!("../docs/tutorial/browser_login.md")]
     pub mod browser_login {}
 }
 
 /// Complete an integration or deployment task.
+#[cfg_attr(
+    any(feature = "login", feature = "resource"),
+    doc = "For gateway rewrites, [map public URLs to incoming paths](how_to::url_mapping)."
+)]
 /// Start with [Deploy a proxy](how_to::deployment) before exposing it beyond localhost.
 #[cfg_attr(
     any(feature = "login", feature = "resource"),
@@ -22,13 +34,19 @@ pub mod tutorial {
 )]
 #[cfg_attr(
     feature = "login",
-    doc = "[Forward session identity](how_to::identity) to an upstream service."
+    doc = "[Forward session identity](how_to::identity) or [return a local response](how_to::local_responses) with session updates."
 )]
 #[cfg_attr(
     feature = "resource",
-    doc = "[Build a bearer-token proxy](how_to::resource_proxy) or [publish protected-resource metadata](how_to::resource_metadata), or [assemble shared resource registrations](how_to::resource_registration)."
+    doc = "[Assemble protected resources](how_to::resource_registration), [add token authentication without discovery](how_to::resource_proxy), [publish metadata](how_to::resource_metadata), or [contribute to an existing publisher](how_to::publication_contributions)."
 )]
 pub mod how_to {
+    #[cfg(feature = "login")]
+    #[doc = include_str!("../docs/how_to/local_responses.md")]
+    pub mod local_responses {}
+    #[cfg(any(feature = "login", feature = "resource"))]
+    #[doc = include_str!("../docs/how_to/url_mapping.md")]
+    pub mod url_mapping {}
     #[cfg(feature = "resource")]
     #[doc = include_str!("../docs/how_to/publication_contributions.md")]
     pub mod publication_contributions {}
@@ -71,6 +89,10 @@ pub mod how_to {
 #[cfg_attr(
     feature = "login",
     doc = "Read [Login proxy lifecycle](explanation::login_lifecycle)."
+)]
+#[cfg_attr(
+    feature = "resource",
+    doc = "Read [Why binding and publication are separate](explanation::endpoint_publication)."
 )]
 pub mod explanation {
     /// Contribution boundary for independently owned metadata publication.

@@ -5,6 +5,10 @@ A loaded session is available to your inner `ProxyHttp` implementation through
 [`LoginCtx`](crate::login::LoginCtx); it does not automatically appear in a
 separate upstream process.
 
+If you need profile fields or application roles beyond the default session,
+first follow [Build an application session](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/enrichment/).
+The resulting session is available through the same Pingora context interface.
+
 ## 1. Establish the trust boundary
 
 Choose a dedicated header, such as `X-Authenticated-Subject`, and configure

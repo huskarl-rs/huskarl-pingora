@@ -1,7 +1,9 @@
 # Troubleshoot a proxy
 
 Follow status codes and redirects in the browser or HTTP client, and correlate
-them with proxy and upstream logs. Record cookie attributes and header names
+them with application diagnostics and upstream logs. Configure the adapter's
+`LoginProxy::diagnostics` and the shared engine's diagnostic handler separately;
+neither emits library log statements by default. Record cookie attributes and header names
 without sharing cookie values, authorization codes, or tokens.
 
 | Symptom | First checks |
@@ -53,7 +55,7 @@ that never reached the browser. Use the
 to distinguish delivery failures from persistence failures.
 
 For provider refresh failures, cookie rejection, and lifetime checks, use the
-shared [browser login troubleshooting guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/troubleshooting/).
+shared [browser login troubleshooting guide](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/troubleshooting/).
 
 For adapter counters and handled login errors, enable the optional `metrics`
 feature and configure `LoginProxy::diagnostics` as needed. See the

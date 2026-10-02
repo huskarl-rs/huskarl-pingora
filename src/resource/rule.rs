@@ -85,7 +85,9 @@ impl<C> Rule<C> {
 
     /// Creates a rule that requires no authentication.
     ///
-    /// The validator is not called at all for matching paths.
+    /// The validator is not called and the inner proxy sees no validated token.
+    /// Audience, scope, or custom-check constraints on this rule cause policy
+    /// construction to fail. Credential stripping still follows this rule's setting.
     pub fn public() -> Self {
         Self::with_requirement(TokenRequirement::None)
     }
@@ -93,7 +95,8 @@ impl<C> Rule<C> {
     /// Creates a rule where a token is accepted but not required.
     ///
     /// If a token is present it is validated; if absent the request proceeds
-    /// with `token: None`.
+    /// with `token: None`. Invalid supplied tokens are rejected. Audience, scope,
+    /// and custom checks run only after a token is successfully validated.
     pub fn optional() -> Self {
         Self::with_requirement(TokenRequirement::Optional)
     }
@@ -103,17 +106,19 @@ impl<C> Rule<C> {
         Self::with_requirement(TokenRequirement::Required)
     }
 
-    /// Requires that the token's `audience` contains at least one of the given values.
+    /// Adds an acceptable token audience to this rule.
     ///
+    /// At least one configured audience must match; repeated calls extend the list.
     /// If none match, the request is denied with 401 `invalid_token`.
     pub fn audience(mut self, audience: impl Into<String>) -> Self {
         self.audiences.push(audience.into());
         self
     }
 
-    /// Adds multiple required audiences at once — like
+    /// Adds multiple acceptable audiences at once — like
     /// [`audience`](Self::audience), but accepts an iterator.
     ///
+    /// At least one configured audience must match; repeated calls extend the list.
     /// If none match, the request is denied with 401 `invalid_token`.
     pub fn audiences(mut self, audiences: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.audiences.extend(audiences.into_iter().map(Into::into));
@@ -124,6 +129,8 @@ impl<C> Rule<C> {
     /// all of the given values.
     ///
     /// If any are missing, the request is denied with 403 `insufficient_scope`.
+    /// This enforces access; metadata scope advertisement alone does not.
+    /// See the [route recipe](crate::_docs::how_to::routes) for a complete policy.
     pub fn scopes(mut self, scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.scopes.extend(scopes.into_iter().map(Into::into));
         self.scope_param = if self.scopes.is_empty() {
@@ -134,7 +141,8 @@ impl<C> Rule<C> {
         self
     }
 
-    /// Adds a custom check function that runs after audience and scope checks.
+    /// Sets a custom check function that runs after audience and scope checks.
+    /// Repeated calls replace the previous check.
     ///
     /// Return `Ok(())` to allow the request, or `Err(CheckError)` to deny it.
     ///
@@ -153,8 +161,8 @@ impl<C> Rule<C> {
         self
     }
 
-    /// Controls whether the `Authorization` header is stripped before
-    /// forwarding the request to upstream.
+    /// Controls whether `Authorization` and `DPoP` are removed before the inner
+    /// proxy's upstream request filter runs.
     ///
     /// Defaults to `true`. Set to `false` if the upstream service needs to
     /// see the original credentials.

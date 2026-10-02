@@ -339,12 +339,17 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
     /// Returns an [`Outcome`] describing whether the request should be
     /// forwarded or denied.
     ///
-    /// With `metrics` enabled, emits `huskarl.resource.check` once, with an `outcome` label naming
-    /// what this call resolved to — `forward` for a success, or the specific deny reason
-    /// (`path_confusion`, `policy_denied`, `unauthenticated`, `invalid_token`,
-    /// `expired`, `unrecognized_issuer`, `binding_error`, `nonce_required`,
-    /// `insufficient_scope`, `invalid_request`, `server_error`).
-    /// The label set is closed; the request path is never a label.
+    /// The caller supplies the original request headers and method and a URI in
+    /// incoming coordinates. A configured trusted URL mapping reconstructs the
+    /// public target for the validator. Supply the DER client certificate when
+    /// validating mTLS-bound tokens.
+    ///
+    /// This method neither forwards nor writes a response. On [`Outcome::Forward`],
+    /// retain the validated token for application hooks, honor credential stripping,
+    /// and propagate any response nonce. On [`Outcome::Deny`], send its status and
+    /// protocol headers. [`super::AuthProxy`] handles these responsibilities for you.
+    /// With `metrics` enabled, each completed check emits one guard counter; see
+    /// the [telemetry reference](crate::_docs::reference::telemetry).
     pub async fn check_request(
         &self,
         headers: &http::HeaderMap,

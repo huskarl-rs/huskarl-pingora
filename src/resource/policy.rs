@@ -12,6 +12,9 @@ use crate::routing::RouteKind;
 /// A policy owns no validator or URL mapping. Pass it to [`super::BoundResource::builder`]
 /// for a defined resource, or [`super::Guard::builder`] for standalone authentication.
 /// Unmatched paths require authentication unless an explicit default overrides it.
+/// `C` is the validator's claims type, usually inferred when the policy is bound.
+/// See [`ResourcePolicyBuilder::subtree`] for a policy example and
+/// [Choose route policies](crate::_docs::how_to::routes) for method-specific rules.
 pub struct ResourcePolicy<C> {
     pub(crate) routes: RuleRouter<Rule<C>>,
     pub(crate) scopes_supported: Vec<String>,

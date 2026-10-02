@@ -4,8 +4,17 @@ Both `LoginProxy::builder()` and `ResourcePolicy::builder()` require
 `.path_guard(GuardConfig::new(case_sensitivity, decode_depth))`. Configure the
 mode, additional structural classes, and analysis budget on that `GuardConfig`
 with `with_mode`, `with_structural_classes`, and `with_max_analysis_path_len`.
-These replace the separate `case_sensitivity`, `decode_depth`, `guard_mode`,
-`structural_classes`, and `max_analysis_path_len` builder setters.
+
+| Setting | Required/default | Meaning |
+|---|---|---|
+| Case sensitivity | Required: `Sensitive` or `Insensitive` | Whether downstream routing folds ASCII case |
+| Decode depth | Required: `UpToOne` or `UpToTwo` | Maximum whole-path percent-decoding passes downstream |
+| Mode | `RejectAmbiguous` | Reject supported interpretations that select different rules |
+| Backslash separators | Enabled | Model raw and percent-encoded backslashes as separators |
+| Additional encodings/probes | None | Opt in to overlong encodings, fullwidth structural forms, or custom probes |
+| Maximum analysis path length | 8,192 original path bytes | Analysis budget, separate from request-size limits |
+
+For a configuration sequence, follow [Configure the path guard](crate::_docs::how_to::path_guard).
 
 `GuardConfig` is re-exported by both `login` and `resource`, and is also
 available in `path_confusion`. Clone one configuration for guards with the same
@@ -16,27 +25,31 @@ rules: each layer still needs its own authorization boundaries; see
 Decode depth can differ by layer, so only reuse a configuration where its
 assumptions hold.
 
-## Opt-in classes and encodings
+## Structural classes and encodings
 
-The always-on alphabet is encoded slash, dot-segments, `;`-matrix-params, and
-`%00`/raw-NUL truncation — the forms whose legitimate-traffic cost is near nil. A
-backend that considers *more* paths equivalent needs the matching toggle on
-[`StructuralClasses`](crate::path_confusion::StructuralClasses), passed via
-`GuardConfig::with_structural_classes`:
+The default alphabet includes encoded slash, dot-segments, matrix parameters,
+NUL truncation, and backslash separators. Backslashes are included conservatively:
+URL parsers can treat them as separators even on Unix. `StructuralClasses::new()`
+uses this default set.
 
-- [`with_backslash()`](crate::path_confusion::StructuralClasses::with_backslash) — `\`/`%5C`
-  as a separator (Windows/IIS);
-- [`with_overlong([…])`](crate::path_confusion::StructuralClasses::with_overlong) —
-  recognise overlong-UTF-8 forms (`%C0%AF`) accepted by legacy decoders;
-- [`with_probe(p)`](crate::path_confusion::StructuralClasses::with_probe) — a custom
-  [`StructuralProbe`](crate::path_confusion::StructuralProbe) **break-glass** for a structural
-  form the built-in alphabet doesn't ship (e.g. a fresh CVE), denied on presence
-  anywhere in the path.
+Configure additional forms through
+[`StructuralClasses`](crate::path_confusion::StructuralClasses), then pass the
+result to `GuardConfig::with_structural_classes`:
 
-Each toggle is a per-deployment security decision: it is how you tell the guard
-which paths your backend considers equivalent. Example:
-`StructuralClasses::new().with_backslash()`. (Case and decode depth are **not**
-here — they are required arguments to `GuardConfig::new`; see below.)
+| Method | Effect |
+|---|---|
+| [`without_backslash()`](crate::path_confusion::StructuralClasses::without_backslash) | Treat backslashes as content; use only when every downstream component preserves them |
+| [`with_backslash()`](crate::path_confusion::StructuralClasses::with_backslash) | Restore default backslash handling |
+| [`with_overlong(...)`](crate::path_confusion::StructuralClasses::with_overlong) | Model overlong UTF-8 slash/dot encodings accepted by a legacy decoder |
+| [`with_fullwidth_structure()`](crate::path_confusion::StructuralClasses::with_fullwidth_structure) | Model fullwidth structural characters that NFKC normalization maps to delimiters |
+| [`with_probe(p)`](crate::path_confusion::StructuralClasses::with_probe) | Reject paths matched by an application-supplied structural detector |
+
+These settings declare actual downstream behavior. Unicode support covers the
+specified structural forms, not all Unicode route equivalences; consult the
+method's contract before enabling it. A custom probe sees the original path and
+must account for relevant escaped spellings. See
+[`StructuralProbe`](crate::path_confusion::StructuralProbe) for its execution contract.
+Case sensitivity and decode depth are separate required settings.
 
 ## Decode depth
 
@@ -52,8 +65,7 @@ Path matching here is **case-sensitive** (and so is the route matcher), but whet
 matches your upstream is a security fact the library cannot infer — so `GuardConfig::new`
 **requires** you to declare it with
 [`CaseSensitivity`](crate::path_confusion::CaseSensitivity); there is no default. A case-folding
-upstream — IIS, ASP.NET, servlet containers on Windows, or anything serving files
-from a Windows/macOS filesystem — routes `/ADMIN` and `/admin` to the same resource,
+upstream, such as a service using a case-insensitive filesystem, routes `/ADMIN` and `/admin` to the same resource,
 so a differently-cased request can reach a route *without that route's checks*
 (`/ADMIN` falling through to a weaker rule, then served as `/admin`).
 

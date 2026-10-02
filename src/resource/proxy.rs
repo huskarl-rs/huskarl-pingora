@@ -142,6 +142,11 @@ fn split_resource_metadata(
 /// [`super::BoundResource`] instead. That produces a [`ProtectedResourceProxy`]
 /// together with its matching publication contribution.
 ///
+/// The guard populates token state before the inner `request_filter` runs.
+/// Unless the selected rule disables stripping, `Authorization` and `DPoP` are
+/// removed before the inner `upstream_request_filter`. Rejections use an empty
+/// body by default; configure [`Self::error_body`] to provide one.
+///
 /// # Example
 ///
 /// ```
@@ -221,6 +226,16 @@ where
 /// Construct through [`super::BoundResource::builder`]. Its mandatory binding fixes
 /// the accepted audiences and public resource boundary. It cannot be rebound.
 /// The bundle carries the matching metadata to the server's publication boundary.
+///
+/// Requests inside the resource mount use its [`super::ResourcePolicy`]. Requests outside
+/// that mount return 403; requests whose public URI cannot be reconstructed return
+/// 400. Neither reaches the inner proxy. A mapping reconstructs the validation URL;
+/// it does not rewrite the forwarded path.
+///
+/// The inner context must implement [`HasAuthState<V::Claims>`]. Credentials are
+/// stripped and response nonces propagated as with [`AuthProxy`]. Publish metadata
+/// separately, or use [`super::assembly::ResourceAssembly`] to install both branches.
+/// See [`super::BoundResource`] for a construction example.
 pub struct ProtectedResourceProxy<P, V, E = ()>
 where
     V: AccessTokenValidator + ProvideValidatorMetadata,
@@ -785,8 +800,8 @@ mod tests {
                 .validator(validator)
                 .policy(policy)
                 .inner(self.inner)
-                .build()?
-                .error_body(self.error_body);
+                .error_body(self.error_body)
+                .build()?;
             let (_, proxy, endpoint) = bound.into_parts();
             Ok((proxy, endpoint))
         }
@@ -916,6 +931,7 @@ mod tests {
             .validator(validator)
             .policy(resource_policy)
             .inner(InnerProxy::new())
+            .error_body(())
             .build()
             .unwrap();
         let (_, auth, metadata) = bound.into_parts();
@@ -1331,6 +1347,7 @@ mod tests {
             )))
             .policy(policy)
             .inner(InnerProxy::new())
+            .error_body(())
             .build()
             .unwrap();
         let (_, proxy, _) = bound.into_parts();
@@ -1922,15 +1939,12 @@ mod tests {
             .validator(validator)
             .policy(resource_policy)
             .inner(InnerProxy::new())
+            .error_body(JsonErrors)
             .build()
             .unwrap();
         let metadata_uri = bound.metadata().uri().clone();
         let metadata_body = bound.metadata().publication().body.to_vec();
-        // Replace a non-default renderer too, retaining the validated bundle.
-        let bound = bound
-            .error_body(NeverRender)
-            .error_body(JsonErrors)
-            .into_route();
+        let bound = bound.into_route();
         assert_eq!(bound.definition().metadata_uri(), &metadata_uri);
         assert_eq!(bound.metadata().publication().body, metadata_body);
         let proxy = ResourceAssembly::new(mapping)
@@ -2164,6 +2178,7 @@ mod tests {
             .validator(validator)
             .policy(resource_policy)
             .inner(InnerProxy::new())
+            .error_body(())
             .build()
             .unwrap()
             .into_parts();

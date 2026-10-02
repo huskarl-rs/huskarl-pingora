@@ -7,8 +7,9 @@ manages encrypted cookie sessions; the upstream receives a subject header.
 ## 1. Prepare the provider and checkout
 
 You need Rust 1.92 or later, native build tools for Pingora (including CMake),
-Python 3, OpenSSL, and an OIDC provider. From a checkout of `huskarl-pingora`,
-Cargo expects sibling `huskarl` and `huskarl-login` repositories.
+Python 3, OpenSSL, and an OIDC provider. Run the commands from a checkout of
+`huskarl-pingora`. Dependencies come from Cargo's registry; no sibling checkout
+is required.
 
 Register a public client using Authorization Code with PKCE and no client
 secret. Register this exact sign-in redirect URI:
@@ -113,11 +114,9 @@ window. Rotation and concurrent refresh require their own deployment checks.
 - Understand the [login proxy lifecycle](crate::_docs::explanation::login_lifecycle).
 - [Troubleshoot a proxy](crate::_docs::how_to::troubleshooting).
 - For refresh deployment, use the shared
-  [rotation guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/rotation/).
+  [rotation guide](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/rotation/).
 
-## Rewritten deployments
-
-The example also accepts `PUBLIC_BASE` and `INCOMING_PREFIX`. It derives the
-callback using the shared mapping and mounts application and logout routes in
-ingress coordinates. See the [worked mapping example](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/README.md#browser-login-and-rewrites)
-before adapting the localhost setup to a front proxy.
+- For ingress rewrites, follow [Map public URLs to incoming paths](crate::_docs::how_to::url_mapping).
+- To construct the engine in your own application, follow the shared
+  [login-engine tutorial](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/tutorial/getting_started/).
+  Its environment variables and port differ from this Pingora exercise.

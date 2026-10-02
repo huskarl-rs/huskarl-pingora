@@ -3,7 +3,7 @@ name = "huskarl-pingora"
 version = "0.6.0"
 edition = "2024"
 rust-version = "1.92"
-description = "Pingora integration for huskarl OAuth2 resource server."
+description = "Browser login and OAuth2 resource protection for Pingora reverse proxies."
 repository = "https://github.com/huskarl-rs/huskarl-pingora"
 documentation = "https://docs.rs/huskarl-pingora"
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,7 @@ upstream_modules = [
   "pingora-proxy-delegate/upstream_modules",
   "pingora-proxy-router/upstream_modules",
 ]
-metrics = ["dep:metrics", "huskarl?/metrics", "huskarl-core?/metrics"]
+metrics = ["dep:metrics", "huskarl?/metrics", "huskarl-core?/metrics", "huskarl-login?/metrics"]
 resource = [
   "dep:bon",
   "dep:bytes",
@@ -68,12 +68,13 @@ strum = { version = "0.28", default-features = false, features = ["derive"], opt
 
 # login feature
 huskarl = { version = "0.11", default-features = false, optional = true }
-huskarl-login = { version = "0.4", optional = true }
+huskarl-login = { version = "0.5.0", optional = true }
 
 [dev-dependencies]
+uuid = "1"
 metrics = { version = "0.24", default-features = false }
 h2 = "0.4"
-huskarl-login = { version = "0.4", features = ["test-support"] }
+huskarl-login = { version = "0.5.0", features = ["test-support"] }
 huskarl-resource-server = { version = "0.11.3" }
 huskarl-reqwest = { version = "0.9", features = ["rustls-tls"] }
 huskarl-crypto-native = { version = "0.11" }

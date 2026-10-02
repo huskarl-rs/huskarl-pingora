@@ -1,6 +1,10 @@
-# Build a bearer-token proxy
+# Add token authentication without discovery
 
-Use this recipe when clients already hold RFC 9068 access tokens. You need the
+Use `Guard` and `AuthProxy` when you want token authentication without a resource
+definition or discovery endpoint. For discovery, start with
+[resource assembly](crate::_docs::how_to::resource_registration).
+
+This recipe assumes clients already hold RFC 9068 access tokens. You need the
 issuer URL, the expected audience, and an upstream service. For a runnable
 Pingora server, use `examples/jwt_proxy.rs` with `ISSUER`, `AUDIENCE`, and
 `UPSTREAM` set, then run `cargo run --example jwt_proxy --features resource`.
@@ -9,7 +13,7 @@ for the configured issuer and audience reaches the upstream. `/health` and the
 `/public` subtree bypass token validation in that runnable example.
 
 The integration below shows how to add an `api` scope requirement as well.
-A minimal JWT-protected reverse proxy using an [RFC 9068] validator. Note
+The proxy uses an [RFC 9068] validator. Note
 how `subtree` protects the whole API while `route` opens a single exact
 health endpoint:
 
@@ -53,21 +57,19 @@ impl ProxyHttp for MyProxy {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // 1. Create an HTTP client for fetching metadata and JWKS.
     let http_client = ReqwestClient::builder()
         .mtls(huskarl_reqwest::mtls::NoMtls)
         .build()
-        .await
-        .expect("HTTP client");
+        .await?;
 
     // 2. Discover the authorization server's metadata (issuer, jwks_uri, …).
     let metadata = AuthorizationServerMetadata::fetch()
         .http_client(&http_client)
         .issuer("https://auth.example.com")
         .call()
-        .await
-        .expect("AS metadata");
+        .await?;
 
     // 3. Build an RFC 9068 JWT validator.
     let jwks = Arc::new(JwksSource::builder().http_client(http_client).build());
@@ -75,8 +77,7 @@ async fn main() {
         .audience("my-api")
         .jws_verifier_factory(jwks)
         .build()
-        .await
-        .expect("validator");
+        .await?;
 
     // 4. Wrap your proxy with the auth guard.
     //    `subtree` protects a path and everything beneath it; `route`
@@ -89,12 +90,13 @@ async fn main() {
         ))
         .subtree("/api", Rule::required().scopes(["api"])) // /api and below
         .route("/health", Rule::public()) // exactly /health
-        .build()
-        .expect("policy");
+        .build()?;
 
     let guard = Guard::builder().validator(validator).policy(policy).build();
     let proxy = AuthProxy::new(MyProxy, guard);
-    // pass `proxy` to pingora — it implements ProxyHttp
+    // Pass `proxy` to Pingora's http_proxy_service; it implements ProxyHttp.
+    let _ = proxy;
+    Ok(())
 }
 ```
 

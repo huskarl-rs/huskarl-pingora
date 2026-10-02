@@ -1,13 +1,16 @@
-# Assemble resources from shared definitions
+# Assemble protected resources on one listener
 
-For integration with an independently owned server, see
-[publication contributions](crate::_docs::how_to::publication_contributions) and
-the [publication design](crate::_docs::explanation::endpoint_publication).
+Use `ResourceAssembly` when this server owns resource routing and discovery.
+It installs authentication and public metadata routes together. You supply a
+validator and inner proxy per resource, a shared context, and a fallback.
+For a guided first run, follow the [resource tutorial](crate::_docs::tutorial::resource_proxy).
+For an independently owned router, use [publication contributions](crate::_docs::how_to::publication_contributions).
 
-Use `huskarl-resource-server::resource::ResourceDefinition` as the source
-of truth for a resource's public identifier, accepted audiences, ingress mount,
-and canonical metadata endpoint. Construct it before the validator, so the
-validator can use the definition's audiences too.
+## 1. Name the resource and configure its validator
+
+Create the definition before the validator. Pass its accepted audiences to your
+validator so token validation and resource binding agree. In this example the
+public resource is `https://api.example.com/api`, also its accepted audience:
 
 ```rust
 use huskarl_pingora::resource_server::{
@@ -15,114 +18,146 @@ use huskarl_pingora::resource_server::{
     resource::{AudienceBinding, ResourceDefinition},
 };
 
-let mapping = PublicUrlMapping::new("https://api.example.com/gateway", "/edge")?;
-let inventory = ResourceDefinition::builder()
+let mapping = PublicUrlMapping::new("https://api.example.com", "/")?;
+let definition = ResourceDefinition::builder()
     .mapping(mapping.clone())
-    .subpath("/mcp/inventory")
+    .subpath("/api")
     .audience(AudienceBinding::ResourceIdentifier)
-    .resource_name("Inventory API")
-    .resource_documentation("https://api.example.com/docs/inventory")
+    .resource_name("Example API")
     .build()?;
-assert_eq!(inventory.resource(), "https://api.example.com/gateway/mcp/inventory");
-assert_eq!(inventory.incoming_mount(), "/edge/mcp/inventory");
+assert_eq!(definition.audiences(), &["https://api.example.com/api"]);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-You can prepare a resource with `BoundResource::builder()` and pass
-`bound.into_route()` to `ResourceAssembly::register_bound`. Its definition,
-authenticated branch, and metadata remain paired until the assembly consumes it.
-For a custom consuming server, see the publication contribution guide.
+Use `AudienceBinding::mapped(["my-api"])` when the issuer uses another audience.
+See the [standalone authentication recipe](crate::_docs::how_to::resource_proxy)
+for RFC 9068 validator construction. The runnable
+[resource example](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/resource_proxy.rs)
+passes `definition.audiences()` to its validator helper.
 
-Alternatively, pass the definition, validator, validated policy, and inner proxy
-to `ResourceAssembly::register` using `.register().definition(&definition)`
-followed by `.validator(validator).policy(policy).inner(inner).call()`.
-`ResourcePolicy` contains access rules and
-path-guard assumptions; it cannot carry a validator or URL mapping. The definition
-supplies the only resource mapping. Policy routes use incoming request coordinates,
-including the ingress prefix and resource mount (for example, `/edge/mcp/inventory`).
-The assembly binds authentication, mounts its branch, collects metadata, and
-checks consistency. Finish with `.assemble().fallback(fallback).slot(slot)`
-followed by `.path_guard(path_guard).call()`, supplying the fallback route,
-application route-slot lens, and a server-wide `GuardConfig`.
-Path ambiguity is checked before selecting
-a branch or invoking its early hooks. The existing router still owns hook
-delegation and module initialization. For composition with unrelated public
-endpoints, the advanced `publication_proxy` example consumes the contributions directly
-in its own server router, alongside an operator-supplied `security.txt`.
+## 2. Give every branch the same context
 
-Metadata publication has an independent mapping. For the resource above, its
-canonical URL is
-`https://api.example.com/.well-known/oauth-protected-resource/gateway/mcp/inventory`.
-That URL is outside `/gateway`, so the resource mapping cannot locate it. Supply
-an origin-root mapping for metadata, or explicitly describe the rewrite your
-front proxy applies to that namespace. The advertised public URL stays canonical;
-only the incoming dispatch path changes.
+The context holds validated credentials and a `RouteSlot` that remembers which
+branch receives later Pingora hooks. `AuthCtx` supplies credential storage; this
+example delegates the trait methods to it. The validator uses RFC 9068 claims.
 
-## Shared contract with Axum
+```rust
+use std::sync::Arc;
+use huskarl_pingora::{
+    resource::{AuthCtx, HasAuthState},
+    resource_server::validator::{ValidatedRequest, rfc9068::Rfc9068AccessTokenClaims},
+};
+use pingora_proxy_router::RouteSlot;
 
-Axum's `ResourceRouter::register` consumes the same definition, a validator,
-a scope list (`Vec<String>`), and a router whose routes are relative to the resource
-mount. It installs the authentication layer and publishes metadata separately.
-The public URL is reconstructed from `OriginalUri`, preserving nested prefixes.
-Build the assembly at the application root; nesting the assembled router later
-would change the configured ingress coordinates. For custom nesting, use
-`ValidatorLayer::for_resource` and mount its metadata service separately.
+type Claims = Rfc9068AccessTokenClaims;
+#[derive(Default)]
+struct AppContext {
+    auth: AuthCtx<(), Claims>,
+    route: RouteSlot<Self>,
+}
+impl HasAuthState<Claims> for AppContext {
+    fn validated_token(&self) -> Option<&Arc<ValidatedRequest<Claims>>> {
+        self.auth.validated_token()
+    }
+    fn validated_token_mut(&mut self) -> &mut Option<Arc<ValidatedRequest<Claims>>> {
+        self.auth.validated_token_mut()
+    }
+    fn dpop_nonce_mut(&mut self) -> &mut Option<String> { self.auth.dpop_nonce_mut() }
+    fn strip_credentials(&self) -> bool { self.auth.strip_credentials() }
+    fn set_strip_credentials(&mut self, strip: bool) { self.auth.set_strip_credentials(strip); }
+}
+```
 
-Both assemblies reject overlapping authentication mounts, mixed public origins,
-and metadata endpoint collisions. Root-mounted resources are supported. The
-registered metadata paths are reserved public exceptions, even if an application
-handler has the same path. Other application paths, unknown well-known paths,
-and descendants or lookalikes of metadata paths remain subject to authentication.
-Routing syntax is validated by each adapter, not by the shared resource model.
+Use this context as `ProxyHttp::CTX` for the upstream and fallback branches.
+The complete example's [transport support](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/support/resource_server.rs)
+shows both implementations and listener startup.
 
-Axum dispatches metadata by path and rejects query-only collisions. Pingora
-selects the document by path and query: an unregistered query on a reserved
-metadata path returns 404 and never reaches the application's fallback. Other
-methods on a published endpoint return 405 without invoking authentication.
-Query parameters in a resource identifier do not restrict the authentication
-subtree to requests with those parameters: the entire mounted subtree belongs
-to that resource.
+## 3. Register the resource and assemble the router
 
-The definition builder also accepts `resource_policy_uri`, `resource_tos_uri`,
-and `scopes_supported`. Explicit scopes override adapter defaults; an explicit
-empty list omits the field. When unset, Axum uses its supplied list and Pingora
-collects scopes from guard rules. Lists are sorted and deduplicated. Scope advertisement does not grant access; configure scope
-requirements in the guard or the Axum subtree's authorization layers.
+This function accepts your configured validator, upstream proxy, and fallback.
+The fallback should return 404 when requests outside the registered resources
+have no application handler. Resource policy paths include the incoming mount.
 
-## Login URL mapping
+```rust
+use huskarl_pingora::{
+    resource::{CaseSensitivity, DecodeDepth, GuardConfig, ResourcePolicy, Rule,
+        assembly::{AssembledResources, ResourceAssembly}},
+    resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition,
+        validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata}},
+};
+use pingora_proxy::ProxyHttp;
+use pingora_proxy_router::{context_lens, route};
+# use std::sync::Arc;
+# use huskarl_pingora::{resource::{AuthCtx, HasAuthState},
+#     resource_server::validator::{ValidatedRequest, rfc9068::Rfc9068AccessTokenClaims}};
+# use pingora_proxy_router::RouteSlot;
+# type Claims = Rfc9068AccessTokenClaims;
+# #[derive(Default)]
+# struct AppContext { auth: AuthCtx<(), Claims>, route: RouteSlot<Self> }
+# impl HasAuthState<Claims> for AppContext {
+# fn validated_token(&self) -> Option<&Arc<ValidatedRequest<Claims>>> { self.auth.validated_token() }
+# fn validated_token_mut(&mut self) -> &mut Option<Arc<ValidatedRequest<Claims>>> { self.auth.validated_token_mut() }
+# fn dpop_nonce_mut(&mut self) -> &mut Option<String> { self.auth.dpop_nonce_mut() }
+# fn strip_credentials(&self) -> bool { self.auth.strip_credentials() }
+# fn set_strip_credentials(&mut self, strip: bool) { self.auth.set_strip_credentials(strip); }
+# }
 
-`PublicUrlMapping` also backs login URL reconstruction. Pass it through
-`LoginConfig::builder().url_mapping(mapping)` and derive the callback using
-`huskarl_login::url::callback_path(&mapping, &redirect_uri, None)`. An explicit
-callback override can be supplied as the final argument and must map back to the
-public callback path. Configure logout paths in ingress coordinates.
+fn assemble<P, F, V>(
+    definition: &ResourceDefinition,
+    metadata_mapping: PublicUrlMapping,
+    validator: V,
+    upstream: P,
+    not_found: F,
+) -> Result<AssembledResources<AppContext>, Box<dyn std::error::Error>>
+where
+    P: ProxyHttp<CTX = AppContext> + Send + Sync + 'static,
+    F: ProxyHttp<CTX = AppContext> + Send + Sync + 'static,
+    V: AccessTokenValidator<Claims = Claims> + ProvideValidatorMetadata + Send + Sync + 'static,
+{
+    let paths = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
+    let policy = ResourcePolicy::builder()
+        .path_guard(paths.clone())
+        .subtree(definition.incoming_mount(), Rule::required().scopes(["api.read"]))
+        .build()?;
+    let router = ResourceAssembly::new(metadata_mapping)
+        .register()
+        .definition(definition)
+        .validator(validator)
+        .policy(policy)
+        .inner(upstream)
+        .call()?
+        .assemble()
+        .fallback(route(not_found))
+        .slot(context_lens!(AppContext, ctx => ctx.route))
+        .path_guard(paths)
+        .call()?;
+    Ok(router)
+}
+```
 
-Engine construction rejects a callback whose browser-facing path disagrees with
-the grant's redirect URI, and a mapping whose origin disagrees with the grant.
-This moves configuration failures to startup. Axum's trusted `RequestUrl` is
-already a public URL: login inverse-maps it before routing and reconstructs it
-once for redirects. Overrides outside the configured origin or public prefix
-return 400. Arbitrary non-prefix rewrites require a custom adapter contract.
+For the direct deployment above, pass `mapping` as `metadata_mapping`. Supply
+this router to Pingora's `http_proxy_service`. To add resources, repeat
+`.register()...call()?` before `.assemble()`. Each resource can use a different
+validator and inner proxy, but their context type must agree. Mounts must be
+disjoint and public origins must agree.
 
-## Standalone authentication and limits
+To customize rejection bodies, build a `BoundResource` with `.error_body(renderer)`,
+then use `.register_bound(bound.into_route())?`; see
+[error responses](crate::_docs::how_to::error_responses).
 
-For authentication without a resource definition, use `Guard::builder()` with
-`.validator(validator)` and `.policy(policy)`, then wrap the built guard with
-`AuthProxy::new`. Set `.url_mapping(mapping)` for trusted public URL reconstruction,
-or omit it to pass the original request URI to the validator. DPoP validation
-requires a public target; origin-form requests with no mapping fail closed.
+## 4. Check routing and authorization
 
-Resource-bound proxies are constructed only through `BoundResource::builder` and
-cannot be rebound. Legacy resource `base_uri`, `strip_prefix`, and binding setters
-have been removed. Use `PublicUrlMapping` for all resource URL reconstruction.
-Bare prefixes and trailing slashes remain distinct: mapping `/edge` to
-`https://api.example.com/gateway` does not silently append `/`.
+- Fetch `/.well-known/oauth-protected-resource/api` without a token: expect JSON.
+- Fetch `/api` without credentials: expect 401 and a metadata URL in the challenge.
+- Send a valid token with `api.read`: expect the upstream response.
+- Send a token without that scope: expect 403.
+- Fetch an unrelated path: expect your fallback's response.
+- Add an unregistered query to the metadata path: expect 404, without authentication.
 
-Mapping preserves escaped bytes and queries and does not rewrite forwarded
-requests, trust incoming Host headers, or normalize paths. It does not replace
-the path guard. An endpoint must round-trip through the mapping; a public base
-path without its joining slash cannot silently become a different callback URL.
+The assembly reserves exact metadata paths for all methods, including under a
+root resource. Unsupported methods on a published endpoint return 405. Query
+components in resource identifiers do not restrict authentication to that query:
+the entire incoming subtree belongs to the resource.
 
-This change does not alter session finalization, cache isolation, cookie delivery,
-or disconnect guarantees. Those remain adapter lifecycle responsibilities; see
-the login finalization reference and per-user caching guide.
+For ingress rewrites, separate application and metadata mappings as described in
+[Publish protected-resource metadata](crate::_docs::how_to::resource_metadata).

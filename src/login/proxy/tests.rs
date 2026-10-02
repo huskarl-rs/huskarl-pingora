@@ -28,9 +28,9 @@ use huskarl::{
 };
 use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_login::{
-    CompletedLogin, ConfigError, DriverLoad, LoginConfig, SessionDriver, SessionError,
-    SessionErrorKind, SessionLifetime, SessionPolicy, SessionState,
-    core::crypto::seal::{AeadSealerUnsealer, AeadV1Sealer},
+    CompletedLogin, ExternalSessionStore, LoginConfig, PersistedSession, PersistedSessionState,
+    SaveOutcome, SessionDriver, SessionError, SessionErrorKind, SessionLifetime, SessionState,
+    StoreBackedSessionStore, core::crypto::seal::AeadV1Sealer,
 };
 use huskarl_route_guard::PathRegistration;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -48,8 +48,8 @@ use crate::{
 
 #[derive(Clone, Builder)]
 struct MockSession {
-    #[builder(default = default_session_state())]
-    state: SessionState,
+    #[builder(default = default_persisted_state())]
+    persisted: PersistedSessionState,
     role: Option<&'static str>,
 }
 
@@ -74,7 +74,11 @@ fn owed_persist_for<S: huskarl_login::Session>(
         .into_token_response(None, SystemTime::now())
         .unwrap();
     let revision = session.state().refresh_revision;
-    huskarl_login::engine::PendingPersist::new(session, token_response, revision)
+    huskarl_login::engine::PendingPersist::builder()
+        .session(session)
+        .token_response(token_response)
+        .expected_refresh_revision(revision)
+        .build()
 }
 
 fn owed_persist() -> huskarl_login::engine::PendingPersist<MockSession> {
@@ -89,11 +93,35 @@ impl Default for MockSession {
 
 impl huskarl_login::Session for MockSession {
     fn state(&self) -> &SessionState {
-        &self.state
+        &self.persisted.state
     }
 
     fn set_state(&mut self, state: SessionState) {
-        self.state = state;
+        self.persisted.state = state;
+    }
+}
+
+fn default_persisted_state() -> PersistedSessionState {
+    PersistedSessionState::builder()
+        .session_key(uuid::Uuid::nil())
+        .state(default_session_state())
+        .build()
+}
+
+impl PersistedSession for MockSession {
+    fn persisted(&self) -> &PersistedSessionState {
+        &self.persisted
+    }
+    fn persisted_mut(&mut self) -> &mut PersistedSessionState {
+        &mut self.persisted
+    }
+}
+impl From<PersistedSessionState> for MockSession {
+    fn from(persisted: PersistedSessionState) -> Self {
+        Self {
+            persisted,
+            role: None,
+        }
     }
 }
 
@@ -105,21 +133,21 @@ struct SaveGate {
 
 // ── Mock session store ───────────────────────────────────────────
 
-#[derive(Builder, Default)]
-struct MockSessionDriver {
-    #[builder(with = |s: MockSession| Mutex::new(Some(s)), default)]
-    load_session: Mutex<Option<MockSession>>,
-    #[builder(with = |s: bool| Mutex::new(s), default)]
-    revoke_called: Mutex<bool>,
-    #[builder(with = |s: usize| Mutex::new(s), default)]
-    save_calls: Mutex<usize>,
+#[derive(Builder, Clone, Default)]
+struct TestBackend {
+    #[builder(with = |s: MockSession| Arc::new(Mutex::new(Some(s))), default)]
+    load_session: Arc<Mutex<Option<MockSession>>>,
+    #[builder(with = |s: bool| Arc::new(Mutex::new(s)), default)]
+    revoke_called: Arc<Mutex<bool>>,
+    #[builder(with = |s: usize| Arc::new(Mutex::new(s)), default)]
+    save_calls: Arc<Mutex<usize>>,
     #[builder(default)]
     fail_save: bool,
     #[builder(default)]
-    save_cookies: Vec<HeaderValue>,
+    version: Arc<Mutex<u64>>,
     save_gate: Option<Arc<SaveGate>>,
     #[builder(default)]
-    save_completions: Mutex<usize>,
+    save_completions: Arc<Mutex<usize>>,
     #[builder(default)]
     fail_revoke: bool,
     #[builder(default)]
@@ -127,9 +155,10 @@ struct MockSessionDriver {
 }
 
 /// The `Set-Cookie` clear this driver emits for the browser's session cookie.
-const MOCK_SESSION_CLEAR: &str = "mock-session=; Max-Age=0";
+const MOCK_SESSION_CLEAR: &str =
+    "__Host-mock-session=; HttpOnly; SameSite=Lax; Path=/; Secure; Max-Age=0";
 
-impl MockSessionDriver {
+impl TestBackend {
     fn was_revoke_called(&self) -> bool {
         *self.revoke_called.lock().unwrap()
     }
@@ -141,74 +170,43 @@ impl MockSessionDriver {
     }
 }
 
-impl huskarl_login::session::sealed::Sealed for MockSessionDriver {}
+// Use the real sealed driver with a controllable external backend. The backend
+// models one fixed-key record with CAS/delete, cancellation gates, and counters.
+// Backend TTL expiry is outside these adapter lifecycle tests.
+type TestDriver = StoreBackedSessionStore<TestBackend>;
 
-impl SessionDriver for MockSessionDriver {
+impl ExternalSessionStore for TestBackend {
     type SessionType = MockSession;
-    type LoadError = SessionError;
-
-    fn apply_session_policy(&mut self, _policy: &SessionPolicy) -> Result<(), ConfigError> {
+    type Version = u64;
+    async fn insert(&self, session: &MockSession, _: SystemTime) -> Result<(), SessionError> {
+        let mut current = self.load_session.lock().unwrap();
+        let mut version = self.version.lock().unwrap();
+        *current = Some(session.clone());
+        *version += 1;
         Ok(())
     }
-
-    fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
-        // The engine is always built with an explicit `.sealer(...)` below, so
-        // this default is never reached.
-        unimplemented!()
-    }
-
-    fn clear_session_cookies(&self, _: &http::HeaderMap) -> Vec<HeaderValue> {
-        vec![HeaderValue::from_static(MOCK_SESSION_CLEAR)]
-    }
-
-    fn strip_session_credentials(&self, headers: &mut http::HeaderMap) {
-        let retained = headers
-            .get(http::header::COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| {
-                value
-                    .split(';')
-                    .map(str::trim)
-                    .filter(|pair| !pair.starts_with("mock-session="))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            });
-        headers.remove(http::header::COOKIE);
-        if let Some(retained) = retained.filter(|value| !value.is_empty()) {
-            headers.insert(
-                http::header::COOKIE,
-                HeaderValue::from_str(&retained).unwrap(),
-            );
-        }
-    }
-
-    async fn create(
+    async fn load(
         &self,
-        _: CompletedLogin,
-        _: Duration,
-        _: &http::HeaderMap,
-    ) -> Result<(MockSession, Vec<HeaderValue>), SessionError> {
-        unimplemented!()
-    }
-    async fn load(&self, _: &http::HeaderMap) -> Result<DriverLoad<MockSession>, SessionError> {
+        key: uuid::Uuid,
+    ) -> Result<huskarl_login::LoadOutcome<Self>, SessionError> {
         if self.fail_load {
             return Err(SessionError::new(
                 SessionErrorKind::Unavailable,
                 "load failed",
             ));
         }
-        Ok(self
-            .load_session
-            .lock()
-            .unwrap()
-            .take()
-            .map_or(DriverLoad::Absent, DriverLoad::Valid))
+        let session = self.load_session.lock().unwrap();
+        Ok(session
+            .as_ref()
+            .filter(|s| s.persisted.session_key == key)
+            .map(|s| (s.clone(), *self.version.lock().unwrap())))
     }
-    async fn save(
+    async fn compare_and_swap(
         &self,
-        _: &MockSession,
-        _: &http::HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
+        session: &MockSession,
+        expected: u64,
+        _: SystemTime,
+    ) -> Result<SaveOutcome, SessionError> {
         *self.save_calls.lock().unwrap() += 1;
         if let Some(gate) = &self.save_gate {
             gate.entered.notify_one();
@@ -220,10 +218,20 @@ impl SessionDriver for MockSessionDriver {
                 "save failed",
             ));
         }
+        let mut current = self.load_session.lock().unwrap();
+        let mut version = self.version.lock().unwrap();
+        if current.is_none() {
+            return Ok(SaveOutcome::Missing);
+        }
+        if *version != expected {
+            return Ok(SaveOutcome::Conflict);
+        }
+        *current = Some(session.clone());
+        *version += 1;
         *self.save_completions.lock().unwrap() += 1;
-        Ok(self.save_cookies.clone())
+        Ok(SaveOutcome::Committed)
     }
-    async fn revoke(&self, _: &MockSession) -> Result<(), SessionError> {
+    async fn delete(&self, _: &MockSession) -> Result<(), SessionError> {
         *self.revoke_called.lock().unwrap() = true;
         if self.fail_revoke {
             return Err(SessionError::new(
@@ -231,19 +239,93 @@ impl SessionDriver for MockSessionDriver {
                 "revoke failed",
             ));
         }
+        *self.load_session.lock().unwrap() = None;
         Ok(())
+    }
+}
+
+trait TestStore {
+    type Driver: SessionDriver;
+    fn into_driver(self) -> impl std::future::Future<Output = Self::Driver>;
+}
+impl TestStore for TestBackend {
+    type Driver = TestDriver;
+    async fn into_driver(self) -> TestDriver {
+        StoreBackedSessionStore::builder()
+            .external(self)
+            .sealer(test_sealer().await)
+            .cookie_name("mock-session".parse().unwrap())
+            .build()
+    }
+}
+impl<E: ExternalSessionStore> TestStore for StoreBackedSessionStore<E> {
+    type Driver = Self;
+    async fn into_driver(self) -> Self {
+        self
+    }
+}
+
+// Mint a real encrypted pointer once. Each backend independently controls the
+// record for this fixed key; a pointer alone does not authenticate a request.
+async fn test_pointer_cookie() -> &'static str {
+    static COOKIE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    COOKIE
+        .get_or_init(|| async {
+            let store = StoreBackedSessionStore::builder()
+                .external(TestBackend::default())
+                .sealer(test_sealer().await)
+                .cookie_name("mock-session".parse().unwrap())
+                .build_with_claims(|mut state, _| {
+                    state.session_key = uuid::Uuid::nil();
+                    Ok(MockSession::from(state))
+                });
+            let engine = build_engine(store).await;
+            let (_, headers) = engine
+                .session_store()
+                .create(
+                    store_backed::completed_login(),
+                    Duration::from_hours(1),
+                    &http::HeaderMap::new(),
+                )
+                .await
+                .unwrap();
+            headers
+                .iter()
+                .filter_map(|h| h.to_str().ok())
+                .filter_map(|h| h.split(';').next())
+                .find(|h| h.starts_with("__Host-mock-session="))
+                .unwrap()
+                .to_owned()
+        })
+        .await
+}
+
+// Real engine output for a cookie-delivery obligation, independently of the
+// store-backed refresh (which deliberately returns no replacement pointer).
+async fn owed_cookies() -> huskarl_login::engine::SetCookies {
+    let engine = build_engine(TestBackend::default()).await;
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::COOKIE,
+        HeaderValue::from_static("__Host-mock-session=invalid"),
+    );
+    match engine.load_session(&headers).await.unwrap() {
+        LoadedSession::Cleared { clears, .. } => clears,
+        _ => panic!("invalid pointer must produce cookie clears"),
     }
 }
 
 // ── Mock inner proxy ─────────────────────────────────────────────
 
 struct InnerProxy {
+    store: Option<TestBackend>,
     forwarded: Mutex<bool>,
 }
 
 impl InnerProxy {
     fn new() -> Self {
         Self {
+            store: None,
             forwarded: Mutex::new(false),
         }
     }
@@ -333,11 +415,14 @@ async fn test_grant() -> AuthorizationCodeGrant {
 
 // ── Build helpers ────────────────────────────────────────────────
 
-type TestProxy = LoginProxy<InnerProxy, MockSessionDriver>;
+type TestProxy = LoginProxy<InnerProxy, TestDriver>;
 
 /// Wraps a session store in a `LoginEngine` over the shared test config, grant,
 /// and cipher — the engine every proxy-under-test is built on.
-async fn build_engine<SD: SessionDriver>(store: SD) -> Arc<huskarl_login::engine::LoginEngine<SD>> {
+async fn build_engine<T: TestStore>(
+    store: T,
+) -> Arc<huskarl_login::engine::LoginEngine<T::Driver>> {
+    let store = store.into_driver().await;
     Arc::new(
         huskarl_login::engine::LoginEngine::builder()
             .config(default_config())
@@ -359,11 +444,13 @@ fn admin_only(s: &MockSession) -> Result<(), CheckError> {
 }
 
 async fn build_proxy_with_routes(
-    store: MockSessionDriver,
+    store: TestBackend,
     routes: Vec<(&'static str, LoginRule<MockSession>)>,
 ) -> TestProxy {
+    let mut inner = InnerProxy::new();
+    inner.store = Some(store.clone());
     let mut builder = LoginProxy::builder()
-        .inner(InnerProxy::new())
+        .inner(inner)
         .engine(build_engine(store).await)
         .path_guard(crate::login::GuardConfig::new(
             crate::login::CaseSensitivity::Sensitive,
@@ -375,12 +462,17 @@ async fn build_proxy_with_routes(
     builder.build().expect("valid routes")
 }
 
-async fn build_proxy(store: MockSessionDriver) -> TestProxy {
+async fn build_proxy(store: TestBackend) -> TestProxy {
     build_proxy_with_routes(store, vec![]).await
 }
 
 async fn make_session(method: &str, path: &str, extra_headers: &str) -> (Session, DuplexStream) {
-    let raw = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{extra_headers}\r\n");
+    let cookie = if extra_headers.to_ascii_lowercase().contains("cookie:") {
+        String::new()
+    } else {
+        format!("Cookie: {}\r\n", test_pointer_cookie().await)
+    };
+    let raw = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{cookie}{extra_headers}\r\n");
     let (mut client, server) = tokio::io::duplex(4096);
     client.write_all(raw.as_bytes()).await.unwrap();
     let mut session = Session::new_h1(Box::new(server));
@@ -415,7 +507,7 @@ async fn read_status(client: &mut DuplexStream) -> u16 {
 #[tokio::test]
 async fn default_required_with_session_forwards() {
     let proxy = build_proxy(
-        MockSessionDriver::builder()
+        TestBackend::builder()
             .load_session(MockSession::default())
             .build(),
     )
@@ -432,7 +524,7 @@ async fn default_required_with_session_forwards() {
 
 #[tokio::test]
 async fn default_required_no_session_xhr_returns_401() {
-    let proxy = build_proxy(MockSessionDriver::default()).await;
+    let proxy = build_proxy(TestBackend::default()).await;
     let (mut s, mut c) = make_session("GET", "/api", "Accept: application/json\r\n").await;
     let mut ctx = proxy.inner.new_ctx();
 
@@ -445,7 +537,7 @@ async fn default_required_no_session_xhr_returns_401() {
 
 #[tokio::test]
 async fn default_required_no_session_navigation_redirects() {
-    let proxy = build_proxy(MockSessionDriver::default()).await;
+    let proxy = build_proxy(TestBackend::default()).await;
     let (mut s, mut c) = make_session("GET", "/dashboard", "Sec-Fetch-Mode: navigate\r\n").await;
     let mut ctx = proxy.inner.new_ctx();
 
@@ -464,7 +556,7 @@ async fn subtree_required_covers_path_and_descendants() {
         huskarl_login::engine::LoginEngine::builder()
             .config(default_config())
             .grant(test_grant().await)
-            .session_store(MockSessionDriver::default())
+            .session_store(TestBackend::default().into_driver().await)
             .sealer(test_sealer().await)
             .build()
             .unwrap(),
@@ -497,7 +589,7 @@ async fn subtree_required_covers_path_and_descendants() {
 
 #[tokio::test]
 async fn public_route_passes_through_without_loading() {
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy_with_routes(store, vec![("/health", LoginRule::public())]).await;
@@ -516,14 +608,14 @@ async fn public_route_passes_through_without_loading() {
 #[tokio::test]
 async fn session_cookie_is_stripped_but_application_cookies_are_preserved() {
     let proxy = build_proxy_with_routes(
-        MockSessionDriver::default(),
+        TestBackend::default(),
         vec![("/health", LoginRule::public())],
     )
     .await;
     let (mut session, _client) = make_session(
         "GET",
         "/health",
-        "Cookie: mock-session=secret; theme=dark\r\n",
+        "Cookie: __Host-mock-session=secret; theme=dark\r\n",
     )
     .await;
     let mut ctx = proxy.inner.new_ctx();
@@ -531,7 +623,7 @@ async fn session_cookie_is_stripped_but_application_cookies_are_preserved() {
 
     let mut upstream = RequestHeader::build("GET", b"/health", None).unwrap();
     upstream
-        .insert_header("Cookie", "mock-session=secret; theme=dark")
+        .insert_header("Cookie", "__Host-mock-session=secret; theme=dark")
         .unwrap();
     upstream.insert_header("X-App", "preserved").unwrap();
 
@@ -555,18 +647,18 @@ async fn session_cookie_is_stripped_but_application_cookies_are_preserved() {
 #[tokio::test]
 async fn cookie_header_is_removed_when_it_only_contains_the_session_cookie() {
     let proxy = build_proxy_with_routes(
-        MockSessionDriver::default(),
+        TestBackend::default(),
         vec![("/health", LoginRule::public())],
     )
     .await;
     let (mut session, _client) =
-        make_session("GET", "/health", "Cookie: mock-session=secret\r\n").await;
+        make_session("GET", "/health", "Cookie: __Host-mock-session=secret\r\n").await;
     let mut ctx = proxy.inner.new_ctx();
     proxy.request_filter(&mut session, &mut ctx).await.unwrap();
 
     let mut upstream = RequestHeader::build("GET", b"/health", None).unwrap();
     upstream
-        .insert_header("Cookie", "mock-session=secret")
+        .insert_header("Cookie", "__Host-mock-session=secret")
         .unwrap();
 
     proxy
@@ -586,7 +678,7 @@ async fn cookie_header_is_removed_when_it_only_contains_the_session_cookie() {
 
 #[tokio::test]
 async fn optional_route_forwards_with_session_when_present() {
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy_with_routes(store, vec![("/", LoginRule::optional())]).await;
@@ -602,11 +694,8 @@ async fn optional_route_forwards_with_session_when_present() {
 
 #[tokio::test]
 async fn optional_route_forwards_without_session() {
-    let proxy = build_proxy_with_routes(
-        MockSessionDriver::default(),
-        vec![("/", LoginRule::optional())],
-    )
-    .await;
+    let proxy =
+        build_proxy_with_routes(TestBackend::default(), vec![("/", LoginRule::optional())]).await;
     let (mut s, _c) = make_session("GET", "/", "Accept: application/json\r\n").await;
     let mut ctx = proxy.inner.new_ctx();
 
@@ -621,7 +710,7 @@ async fn optional_route_forwards_without_session() {
 
 #[tokio::test]
 async fn required_check_pass_forwards() {
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::builder().role("admin").build())
         .build();
     let proxy = build_proxy_with_routes(
@@ -640,7 +729,7 @@ async fn required_check_pass_forwards() {
 
 #[tokio::test]
 async fn required_check_fail_returns_403() {
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::builder().role("user").build())
         .build();
     let proxy = build_proxy_with_routes(
@@ -662,7 +751,7 @@ async fn required_check_fail_returns_403() {
 
 #[tokio::test]
 async fn cors_preflight_passes_through() {
-    let proxy = build_proxy(MockSessionDriver::default()).await;
+    let proxy = build_proxy(TestBackend::default()).await;
     let (mut s, _c) =
         make_session("OPTIONS", "/api", "Access-Control-Request-Method: POST\r\n").await;
     let mut ctx = proxy.inner.new_ctx();
@@ -680,7 +769,7 @@ async fn cors_preflight_not_passed_through_when_disabled() {
     // letting it reach the inner proxy.
     let proxy = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(build_engine(MockSessionDriver::default()).await)
+        .engine(build_engine(TestBackend::default()).await)
         .path_guard(crate::login::GuardConfig::new(
             crate::login::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -724,7 +813,7 @@ async fn cors_preflight_still_runs_path_confusion_guard() {
 
 #[tokio::test]
 async fn callback_with_missing_state_returns_400() {
-    let proxy = build_proxy(MockSessionDriver::default()).await;
+    let proxy = build_proxy(TestBackend::default()).await;
     let (mut s, mut c) = make_session("GET", "/callback?code=abc", "").await;
     let mut ctx = proxy.inner.new_ctx();
 
@@ -739,7 +828,7 @@ async fn callback_with_missing_state_returns_400() {
 
 #[tokio::test]
 async fn response_filter_save_on_dirty_persistence() {
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy(store).await;
@@ -757,8 +846,8 @@ async fn response_filter_save_on_dirty_persistence() {
         .await
         .unwrap();
 
-    assert!(proxy.engine().session_store().was_save_called());
-    assert!(!proxy.engine().session_store().was_revoke_called());
+    assert!(proxy.inner.store.as_ref().unwrap().was_save_called());
+    assert!(!proxy.inner.store.as_ref().unwrap().was_revoke_called());
 }
 
 #[tokio::test]
@@ -766,7 +855,7 @@ async fn response_filter_owes_nothing_on_plain_request() {
     // A loaded, fully-persisted session with no owed save touches no store.
     // (Activity/idle tracking is now server-side in huskarl-login's liveness
     // store, not adapter-visible.)
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy(store).await;
@@ -781,13 +870,13 @@ async fn response_filter_owes_nothing_on_plain_request() {
         .await
         .unwrap();
 
-    assert!(!proxy.engine().session_store().was_save_called());
-    assert!(!proxy.engine().session_store().was_revoke_called());
+    assert!(!proxy.inner.store.as_ref().unwrap().was_save_called());
+    assert!(!proxy.inner.store.as_ref().unwrap().was_revoke_called());
 }
 
 #[tokio::test]
 async fn response_filter_termination_path() {
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy(store).await;
@@ -803,9 +892,18 @@ async fn response_filter_termination_path() {
         .await
         .unwrap();
 
-    assert!(proxy.engine().session_store().was_revoke_called());
-    assert!(!proxy.engine().session_store().was_save_called());
-    assert_eq!(set_cookies(&resp), vec![MOCK_SESSION_CLEAR]);
+    assert!(proxy.inner.store.as_ref().unwrap().was_revoke_called());
+    assert!(!proxy.inner.store.as_ref().unwrap().was_save_called());
+    assert_eq!(
+        set_cookies(&resp),
+        proxy
+            .engine()
+            .session_store()
+            .clear_session_cookies(&http::HeaderMap::new())
+            .iter()
+            .map(|h| h.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -814,7 +912,7 @@ async fn response_filter_termination_delivers_clears_when_revocation_fails() {
     // reach the response either way: a store outage can leave a copied
     // pointer usable, but must not keep this browser logged in. Failing the
     // request instead would replace the response — clears and all.
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .fail_revoke(true)
         .build();
@@ -831,8 +929,17 @@ async fn response_filter_termination_delivers_clears_when_revocation_fails() {
         .await
         .unwrap();
 
-    assert!(proxy.engine().session_store().was_revoke_called());
-    assert_eq!(set_cookies(&resp), vec![MOCK_SESSION_CLEAR]);
+    assert!(proxy.inner.store.as_ref().unwrap().was_revoke_called());
+    assert_eq!(
+        set_cookies(&resp),
+        proxy
+            .engine()
+            .session_store()
+            .clear_session_cookies(&http::HeaderMap::new())
+            .iter()
+            .map(|h| h.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -840,7 +947,7 @@ async fn response_filter_forces_no_store_when_session_cookie_appended() {
     // A re-sealed session cookie (here, an eager-refresh result handed back on
     // the load state) riding on the upstream response must not be cacheable by
     // shared caches — even if the upstream marked it cacheable (RFC 6749 §5.1).
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy(store).await;
@@ -880,7 +987,7 @@ async fn response_filter_forces_no_store_when_session_cookie_appended() {
 async fn response_filter_preserves_cache_control_without_session_cookie() {
     // Steady-state authenticated request: no owed persistence, no session
     // cookie. The upstream's cache headers must be left exactly as set.
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy(store).await;
@@ -914,7 +1021,7 @@ async fn response_filter_preserves_cache_control_without_session_cookie() {
 async fn persist_save_failure_fails_closed_with_policy_status() {
     // Save is the retry of a failed eager refresh persist — the default
     // policy fails closed (503) rather than strand the rotated token.
-    let mut store = MockSessionDriver::builder()
+    let mut store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
 
@@ -945,10 +1052,10 @@ async fn denied_check_returns_403() {
     // save from a failed eager refresh, which this mock can't produce; that
     // path is covered in huskarl-login.)
     let session = MockSession {
-        state: default_session_state(),
+        persisted: default_persisted_state(),
         role: Some("user"),
     };
-    let store = MockSessionDriver::builder().load_session(session).build();
+    let store = TestBackend::builder().load_session(session).build();
     let proxy = build_proxy_with_routes(
         store,
         vec![("/admin", LoginRule::required().check(admin_only))],
@@ -967,7 +1074,7 @@ async fn denied_check_returns_403() {
 async fn logging_fallback_persists_when_response_not_proxied() {
     // The inner proxy self-handled the request (or proxying failed), so
     // `response_filter` never ran — `logging` picks up the owed save.
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy(store).await;
@@ -978,12 +1085,12 @@ async fn logging_fallback_persists_when_response_not_proxied() {
     ctx.login_state_mut().pending = Some(owed_persist());
     proxy.logging(&mut s, None, &mut ctx).await;
 
-    assert!(proxy.engine().session_store().was_save_called());
+    assert!(proxy.inner.store.as_ref().unwrap().was_save_called());
 }
 
 #[tokio::test]
 async fn logging_after_response_filter_does_not_double_persist() {
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy(store).await;
@@ -1000,12 +1107,12 @@ async fn logging_after_response_filter_does_not_double_persist() {
         .unwrap();
     proxy.logging(&mut s, None, &mut ctx).await;
 
-    assert_eq!(proxy.engine().session_store().save_count(), 1);
+    assert_eq!(proxy.inner.store.as_ref().unwrap().save_count(), 1);
 }
 
 #[tokio::test]
 async fn logging_fallback_revokes_when_termination_requested() {
-    let store = MockSessionDriver::builder()
+    let store = TestBackend::builder()
         .load_session(MockSession::default())
         .build();
     let proxy = build_proxy(store).await;
@@ -1016,16 +1123,13 @@ async fn logging_fallback_revokes_when_termination_requested() {
     ctx.login_state_mut().terminate_requested = true;
     proxy.logging(&mut s, None, &mut ctx).await;
 
-    assert!(proxy.engine().session_store().was_revoke_called());
+    assert!(proxy.inner.store.as_ref().unwrap().was_revoke_called());
 }
 
 #[tokio::test]
 async fn response_filter_no_session_does_nothing() {
-    let proxy = build_proxy_with_routes(
-        MockSessionDriver::default(),
-        vec![("/", LoginRule::optional())],
-    )
-    .await;
+    let proxy =
+        build_proxy_with_routes(TestBackend::default(), vec![("/", LoginRule::optional())]).await;
     let (mut s, _c) = make_session("GET", "/", "Accept: application/json\r\n").await;
     let mut ctx = proxy.inner.new_ctx();
 
@@ -1037,8 +1141,8 @@ async fn response_filter_no_session_does_nothing() {
         .await
         .unwrap();
 
-    assert!(!proxy.engine().session_store().was_revoke_called());
-    assert!(!proxy.engine().session_store().was_save_called());
+    assert!(!proxy.inner.store.as_ref().unwrap().was_revoke_called());
+    assert!(!proxy.inner.store.as_ref().unwrap().was_save_called());
 }
 
 // ── Path-confusion guard ────────────────────────────────────────
@@ -1049,7 +1153,7 @@ async fn build_structural_proxy(
 ) -> TestProxy {
     let mut builder = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(build_engine(MockSessionDriver::default()).await)
+        .engine(build_engine(TestBackend::default()).await)
         .path_guard(
             crate::login::GuardConfig::new(
                 crate::login::CaseSensitivity::Sensitive,
@@ -1125,7 +1229,7 @@ async fn structural_allows_same_rule_encoded_content() {
 async fn method_specific_rule_does_not_escape_to_catchall() {
     // A method gap must deny before session loading or catch-all fallback.
     let proxy = build_proxy_with_routes(
-        MockSessionDriver::default(),
+        TestBackend::default(),
         vec![
             ("/{*rest}", LoginRule::public()),
             ("/admin", LoginRule::public().method(http::Method::GET)),
@@ -1142,7 +1246,7 @@ async fn method_specific_rule_does_not_escape_to_catchall() {
 
     // POST has no configured policy and returns 403.
     let proxy = build_proxy_with_routes(
-        MockSessionDriver::default(),
+        TestBackend::default(),
         vec![
             ("/{*rest}", LoginRule::public()),
             ("/admin", LoginRule::public().method(http::Method::GET)),
@@ -1178,7 +1282,7 @@ async fn structural_off_allows_traversal() {
 async fn build_rejects_pattern_with_empty_segment() {
     let result = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(build_engine(MockSessionDriver::default()).await)
+        .engine(build_engine(TestBackend::default()).await)
         .path_guard(crate::login::GuardConfig::new(
             crate::login::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -1197,7 +1301,7 @@ async fn build_rejects_pattern_with_empty_segment() {
 async fn build_rejects_check_on_public_rule() {
     let result = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(build_engine(MockSessionDriver::default()).await)
+        .engine(build_engine(TestBackend::default()).await)
         .path_guard(crate::login::GuardConfig::new(
             crate::login::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -1214,9 +1318,9 @@ async fn build_rejects_check_on_public_rule() {
 
 // ── Store-backed (server-side) integration ───────────────────────
 //
-// The tests above drive the low-level `SessionDriver` through a mock. These
-// exercise the real `StoreBackedSessionStore` over a user-implemented
-// `ExternalSessionStore`, using `PersistedSessionState` as the session type —
+// The tests above use the real driver with a controllable backend. These
+// additionally exercise the shared in-memory backend and use
+// `PersistedSessionState` as the session type —
 // the "simplest case" server-side setup — end to end through `LoginProxy`.
 // Everything is imported from the `crate::login` facade, so the test also
 // pins that the server-side path is reachable without dipping into
@@ -1304,7 +1408,7 @@ mod store_backed {
     /// A minimal completed login (bearer token, no ID token claims) — enough to
     /// drive `SessionDriver::create`, which seeds the external store and mints
     /// the encrypted pointer cookie.
-    fn completed_login() -> CompletedLogin {
+    pub(super) fn completed_login() -> CompletedLogin {
         let token_response = huskarl::grant::core::RawTokenResponse::builder()
             .access_token(huskarl::core::secrets::SecretString::new("access-token"))
             .token_type("Bearer")
@@ -1452,7 +1556,7 @@ mod store_backed {
 async fn disabled_guard_denies_method_gaps_with_public_default() {
     let proxy = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(build_engine(MockSessionDriver::default()).await)
+        .engine(build_engine(TestBackend::default()).await)
         .path_guard(
             crate::login::GuardConfig::new(
                 crate::login::CaseSensitivity::Sensitive,
@@ -1489,7 +1593,7 @@ async fn shared_path_guard_config_preserves_downstream_assumptions() {
     .unwrap();
     let proxy = LoginProxy::builder()
         .inner(InnerProxy::new())
-        .engine(build_engine(MockSessionDriver::default()).await)
+        .engine(build_engine(TestBackend::default()).await)
         .path_guard(config)
         .subtree("/public", LoginRule::public())
         .subtree("/admin", LoginRule::required())
@@ -1527,9 +1631,8 @@ mod lifecycle;
 async fn interim_headers_preserve_work_until_final_or_upgrade_response() {
     for final_status in [101, 200, 204, 304] {
         let proxy = build_proxy(
-            MockSessionDriver::builder()
+            TestBackend::builder()
                 .load_session(MockSession::default())
-                .save_cookies(vec![HeaderValue::from_static("mock-session=updated")])
                 .build(),
         )
         .await;
@@ -1538,6 +1641,7 @@ async fn interim_headers_preserve_work_until_final_or_upgrade_response() {
         let mut ctx = proxy.new_ctx();
         proxy.request_filter(&mut session, &mut ctx).await.unwrap();
         ctx.login_state_mut().pending = Some(owed_persist());
+        ctx.login_state_mut().set_cookies = owed_cookies().await;
         for status in [100, 103] {
             let mut header = ResponseHeader::build(status, None).unwrap();
             proxy
@@ -1545,7 +1649,7 @@ async fn interim_headers_preserve_work_until_final_or_upgrade_response() {
                 .await
                 .unwrap();
             assert!(set_cookies(&header).is_empty());
-            assert_eq!(proxy.engine().session_store().save_count(), 0);
+            assert_eq!(proxy.inner.store.as_ref().unwrap().save_count(), 0);
             assert!(ctx.login_state().pending.is_some());
         }
         let mut header = ResponseHeader::build(final_status, None).unwrap();
@@ -1553,14 +1657,26 @@ async fn interim_headers_preserve_work_until_final_or_upgrade_response() {
             .response_filter(&mut session, &mut header, &mut ctx)
             .await
             .unwrap();
-        assert_eq!(set_cookies(&header), ["mock-session=updated"]);
+        assert_eq!(
+            set_cookies(&header),
+            [
+                MOCK_SESSION_CLEAR,
+                "__Host-mock-session.kid=; HttpOnly; SameSite=Lax; Path=/; Secure; Max-Age=0"
+            ]
+        );
         proxy
             .response_filter(&mut session, &mut header, &mut ctx)
             .await
             .unwrap();
         proxy.logging(&mut session, None, &mut ctx).await;
-        assert_eq!(set_cookies(&header), ["mock-session=updated"]);
-        assert_eq!(proxy.engine().session_store().save_count(), 1);
+        assert_eq!(
+            set_cookies(&header),
+            [
+                MOCK_SESSION_CLEAR,
+                "__Host-mock-session.kid=; HttpOnly; SameSite=Lax; Path=/; Secure; Max-Age=0"
+            ]
+        );
+        assert_eq!(proxy.inner.store.as_ref().unwrap().save_count(), 1);
         assert!(ctx.login_state().session.is_some());
     }
 }
@@ -1577,9 +1693,9 @@ fn telemetry_classifies_login_decisions_with_bounded_labels() {
         (LoginRule::required().check(admin_only), true, "forbidden"),
     ] {
         let ((), counters) = with_metrics(async {
-            let mut store = MockSessionDriver::default();
+            let mut store = TestBackend::default();
             if has_session {
-                store.load_session = Mutex::new(Some(MockSession::default()));
+                store.load_session = Arc::new(Mutex::new(Some(MockSession::default())));
             }
             let proxy = LoginProxy::builder()
                 .inner(InnerProxy::new())
@@ -1664,11 +1780,10 @@ fn telemetry_finalizes_once_and_preserves_handled_failure_diagnostics() {
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&diagnostics);
         let ((), counters) = with_metrics(async {
-            let store = MockSessionDriver::builder()
+            let store = TestBackend::builder()
                 .load_session(MockSession::default())
                 .fail_save(fail)
                 .fail_revoke(fail)
-                .save_cookies(vec![HeaderValue::from_static("mock-session=updated")])
                 .build();
             let proxy = LoginProxy::builder()
                 .inner(InnerProxy::new())
@@ -1688,6 +1803,9 @@ fn telemetry_finalizes_once_and_preserves_handled_failure_diagnostics() {
             proxy.request_filter(&mut session, &mut ctx).await.unwrap();
             ctx.login_state_mut().pending = Some(owed_persist());
             ctx.login_state_mut().terminate_requested = revoke;
+            if !revoke {
+                ctx.login_state_mut().set_cookies = owed_cookies().await;
+            }
             if phase == LoginPhase::Response {
                 let mut interim = ResponseHeader::build(103, None).unwrap();
                 proxy
@@ -1726,7 +1844,7 @@ fn telemetry_finalizes_once_and_preserves_handled_failure_diagnostics() {
             &[("name", ""), ("outcome", phase.as_str())],
             1,
         );
-        let stranded = u64::from(phase == LoginPhase::Logging && (!fail || revoke));
+        let stranded = 2 * u64::from(phase == LoginPhase::Logging);
         assert_counter(
             &counters,
             "huskarl.pingora.login.stranded_cookies",
@@ -1734,10 +1852,7 @@ fn telemetry_finalizes_once_and_preserves_handled_failure_diagnostics() {
             stranded,
         );
         let details = diagnostics.lock().unwrap();
-        assert_eq!(
-            details.len(),
-            usize::from(fail) + usize::try_from(stranded).unwrap()
-        );
+        assert_eq!(details.len(), usize::from(fail) + usize::from(stranded > 0));
         if fail {
             assert!(
                 details
@@ -1779,7 +1894,7 @@ fn telemetry_counts_preflights_engine_routes_and_route_denials() {
     ] {
         let ((), counters) = with_metrics(async {
             let proxy = build_proxy_with_routes(
-                MockSessionDriver::default(),
+                TestBackend::default(),
                 vec![("/api", rule), ("/public", LoginRule::public())],
             )
             .await;
@@ -1812,7 +1927,7 @@ fn telemetry_load_failure_preserves_the_original_error_without_metrics() {
     let ((), counters) = with_metrics(async {
         let proxy = LoginProxy::builder()
             .inner(InnerProxy::new())
-            .engine(build_engine(MockSessionDriver::builder().fail_load(true).build()).await)
+            .engine(build_engine(TestBackend::builder().fail_load(true).build()).await)
             .path_guard(crate::login::GuardConfig::new(
                 crate::login::CaseSensitivity::Sensitive,
                 crate::login::DecodeDepth::UpToOne,
@@ -1870,7 +1985,7 @@ fn telemetry_cancellation_does_not_claim_a_completed_persist() {
 
     let ((), counters) = with_metrics(async {
         let gate = Arc::new(SaveGate::default());
-        let store = MockSessionDriver::builder()
+        let store = TestBackend::builder()
             .load_session(MockSession::default())
             .save_gate(Arc::clone(&gate))
             .build();
@@ -1890,7 +2005,7 @@ fn telemetry_cancellation_does_not_claim_a_completed_persist() {
         }
         assert!(ctx.login_state().finalized);
         proxy.logging(&mut session, None, &mut ctx).await;
-        assert_eq!(proxy.engine().session_store().save_count(), 1);
+        assert_eq!(proxy.inner.store.as_ref().unwrap().save_count(), 1);
     });
     assert_counter(
         &counters,

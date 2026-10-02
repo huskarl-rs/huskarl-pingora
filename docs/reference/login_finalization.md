@@ -3,7 +3,8 @@
 This is the response contract for [`LoginProxy`](crate::login::LoginProxy),
 including exceptions observed by the Pingora 0.9 lifecycle tests. See
 [Login state through the Pingora lifecycle](crate::_docs::explanation::login_lifecycle)
-for the sequence of operations and a local-response example. The
+for the sequence of operations and [Return a local response](crate::_docs::how_to::local_responses)
+for the integration recipe. The
 [named finalization invariants](crate::_docs::reference::login_invariants) state
 the review obligations and map them to regression tests and coverage gaps.
 
@@ -48,7 +49,7 @@ Changing storage can reduce its consequences, but does not fix the bypass.
 | A new login response is lost | The browser never receives its new session cookie. | The browser never receives its new pointer cookie, even if the record was created. | Both modes require browser delivery to establish a new session. Users may need to start login again. |
 | Persistence infrastructure fails | No external session database is required, though sealing or serialization can fail. | Loads, saves, and revocation depend on the backend; failures can interrupt requests or prevent revocation. | Store-backed resilience to delivery loss comes with a backend availability requirement. Choose and operate the backend accordingly. |
 
-Body-transfer failures, Pingora's 500-versus-503 error mapping, personalized
+Body-transfer failures, Pingora's cache-hit error mapping, personalized
 content caching, and informational-header forwarding affect both modes. Storage
 choice does not make an interrupted application operation safe to repeat. The
 exception table below gives the proxy-code mitigations and remaining user impact.
@@ -62,7 +63,7 @@ exception table below gives the proxy-code mitigations and remaining user impact
 | A client disconnects before receiving final headers, or resets an HTTP/2 stream | Allow the request task to complete cleanup where possible. Distinguish transport errors from task cancellation in monitoring. Store-backed sessions reduce dependence on replacement cookies for refresh once the durable write succeeds. | A save may complete without the client receiving cookies. Cookie-session users can lose the refreshed session; store-backed users may continue with their existing pointer cookie. Neither delivery nor recovery is guaranteed. |
 | A client disconnects during the response body | Do not repeat session persistence merely because body delivery failed. Treat the application operation and session update as separate outcomes. | The client may already have received the new session cookie while seeing a truncated or failed application response. The application operation may have completed; retrying it can duplicate effects unless it is safe to retry. |
 | The request future is dropped by task abortion, an enclosing timeout, or forced shutdown | Prefer graceful draining. Scope timeouts around fallible inner operations and handle them before writing, rather than dropping the entire request future when finalization is required. A hard shutdown deadline still leaves this exception possible. | Async logging cleanup does not run. Pending work and cookies can be lost; a backend write may have committed before cancellation. Users can see an interrupted response or need to sign in again. Cancellation does not establish rollback or make a retry safe. |
-| A rejecting persistence policy fails a fresh cache-hit response | Account for Pingora 0.9's 500 mapping in monitoring and clients. Other tested paths use the configured status, normally 503. Do not rely on `fail_to_proxy` alone to normalize the fresh-hit path; test any custom error integration through the real request runner. | Users receive 500 instead of the usual 503, but the successful application response is blocked in the tested default integration. Replacement policy headers and bodies are not delivered, so clients must not depend on a policy-provided error page or retry header. |
+| A rejecting persistence policy fails a fresh cache-hit response | Account for Pingora 0.9's 500 mapping in monitoring and clients. Other paths normally use the policy-selected status; see the status table below. Do not rely on `fail_to_proxy` alone to normalize the fresh-hit path; test any custom error integration through the real request runner. | Users can receive 500 instead of the policy-selected status, but the successful application response is blocked in the tested default integration. Replacement policy headers and bodies are not delivered, so clients must not depend on a policy-provided error page or retry header. |
 | Server-side revocation fails during response finalization | Preserve the clearing cookies and monitor the revocation error. Use store-backed sessions when server-side revocation is needed, while accounting for backend availability. Do not treat browser clearing as proof of deletion. | The current browser can appear signed out if it accepts the clears, while a copied store-pointer cookie may remain usable until the record is revoked or expires. |
 | Personalized content is admitted to a shared cache | Disable shared caching for personalized content or implement an appropriate isolation policy before cache admission. Preserve downstream `no-store` when session cookies are attached. | Session cookies stay outside Pingora's cached representation, but that alone does not prevent one user's application content being served to another. Cache admission precedes downstream persistence finalization. |
 | An HTTP/2 upstream sends informational headers | Do not rely on those headers reaching the inner response hook in Pingora 0.9. Exercise informational-response behavior when upgrading Pingora. HTTP/1 upstream informational headers do reach the hook. | Early resource-loading hints may be absent. Final response and session-cookie processing still occur; the tested case does not cause session loss. |
@@ -77,6 +78,25 @@ For an application that deliberately caches personalized content, follow
 [Cache responses per authenticated user](crate::_docs::how_to::user_caching).
 Cookie isolation and user-specific response-body isolation are separate contracts.
 
+## Persistence failure status
+
+With `huskarl-login` 0.5, `DefaultPersistFailurePolicy` selects:
+
+| Session error kind | Policy status |
+|---|---|
+| `Gone` (for example, a concurrently deleted session) | 401 |
+| `Conflict` | 409 |
+| `Crypto`, `Encoding`, `Store` | 500 |
+| `Unavailable` | 503 |
+
+Pingora's ordinary error handler uses the selected status, while response-filter
+errors on fresh cache hits become 500 in Pingora 0.9. The adapter passes only the
+policy response's status into this error path: its body and headers, including
+the shared policy's Cookie challenge for `Gone`, are not delivered. Custom inner
+error handlers can change the rendered result. See the shared
+[policy API](https://docs.rs/huskarl-login/0.5.0/huskarl_login/struct.DefaultPersistFailurePolicy.html)
+for engine behavior and test your adapter's error path before relying on a response.
+
 ## Session-storage limits still apply
 
 Correct response finalization does not order different requests' responses.
@@ -84,7 +104,7 @@ Cookie-session responses can arrive out of order, restore an older token, or
 restore browser state after logout. Store-backed sessions support server-side
 revocation when deletion succeeds, but neither storage choice by itself
 serializes refresh exchanges or ends provider SSO. Follow the shared
-[deployment guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/deployment/)
+[deployment guide](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/deployment/)
 for these limits and storage choices.
 
 ## Evidence and scope

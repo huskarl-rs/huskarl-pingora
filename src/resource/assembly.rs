@@ -42,7 +42,17 @@ impl std::error::Error for AssemblyError {
     }
 }
 
-/// Collects resource branches and their separately mounted metadata endpoints.
+/// Builds a router that protects resources and publishes their discovery metadata.
+///
+/// Start with [`Self::new`], call [`Self::register`] for each definition, validator,
+/// policy, and inner proxy, then finish with [`Self::assemble`]. Use
+/// [`Self::register_bound`] when a resource needs a custom rejection renderer.
+///
+/// All branches share context type `C`, which must hold authentication state and
+/// a [`RouteSlot<C>`]. The slot records the selected branch so later Pingora hooks
+/// reach the same proxy. Pass a lens to that field when assembling.
+/// The [assembly recipe](crate::_docs::how_to::resource_registration) shows the
+/// context, fallback, registration, and final router together.
 ///
 /// The resulting router checks path ambiguity before invoking any branch hook.
 /// Resources in this assembly must have disjoint incoming mounts and one public
@@ -58,7 +68,12 @@ pub struct ResourceAssembly<C> {
 }
 #[bon::bon]
 impl<C: Send + Sync + 'static> ResourceAssembly<C> {
-    /// Creates an assembly with explicit mapping for the metadata namespace.
+    /// Creates an empty assembly with a public-to-incoming mapping for metadata.
+    ///
+    /// Use an origin-root mapping for direct deployments. Metadata paths begin at
+    /// `/.well-known/oauth-protected-resource`, so an application's public path
+    /// prefix alone generally cannot represent them. See
+    /// [metadata rewrites](crate::_docs::how_to::resource_metadata).
     #[must_use]
     pub fn new(metadata_mapping: PublicUrlMapping) -> Self {
         Self {
@@ -107,6 +122,7 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
             .validator(validator)
             .policy(policy)
             .inner(inner)
+            .error_body(())
             .build()
             .map_err(AssemblyError::Configuration)?;
         self.register_bound(bound.into_route())
@@ -149,7 +165,10 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
         self,
         /// Route to invoke when no resource or metadata path matches.
         fallback: Route<C>,
-        /// Lens for the router's selected-route slot in the application context.
+        /// Access to a `RouteSlot<C>` field in your application context, for example
+        /// `context_lens!(AppContext, ctx => ctx.route)`. The router stores its selected
+        /// branch there so subsequent lifecycle hooks reach the same proxy.
+        /// See the [assembly recipe](crate::_docs::how_to::resource_registration).
         slot: Lens<C, RouteSlot<C>>,
         /// Required path-confusion configuration shared by the mounted branches.
         /// Declare their downstream case-sensitivity and decoding assumptions.

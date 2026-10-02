@@ -3,28 +3,28 @@
 Use this after the browser-login tutorial, before exposing the proxy beyond
 localhost. The upstream trust and routing steps also apply to bearer-token proxies.
 
-## Choose your deployment
+## Configure the shared login engine first
 
-| Session storage | Use when | Limit |
-|---|---|---|
-| Cookie sessions (the example) | You want no external session backend and can accept browser-dependent refresh and logout | Missed refresh cookies can force re-login; delayed responses can restore older cookies, including after logout |
-| Store-backed sessions with a shared backend | You need server-side revocation or want committed refreshes to survive lost responses without replacing the browser cookie | Requires an available backend and an existing valid pointer; revocation depends on successful deletion, and stored-state protection does not prevent simultaneous refresh exchanges |
+For browser sessions, use the `huskarl-login` guides for decisions shared across
+adapters:
 
-A disconnect can prevent cookie delivery in either mode. With store-backed
-sessions, a durably committed refresh can still be used through the browser's
-existing pointer, and successful deletion invalidates that pointer even when
-logout clears are lost. A new login still requires delivery of the initial
-cookie in both modes. Storage choice does not fix direct writes bypassing
-finalization or guarantee cleanup after task abortion.
+| Task | Shared guide |
+|---|---|
+| Choose cookie or server-side sessions, persist keys, configure replicas | [Deployment](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/deployment/) |
+| Implement a session database | [External session stores](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/external_store/) |
+| Rotate encryption keys and understand cookie paths/chunks | [Cookie security](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/explanation/cookie_security/) |
+| Test provider refresh-token reuse and concurrent exchanges | [Refresh-token rotation](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/rotation/) |
+| Set absolute and idle session limits | [Session lifetime](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/explanation/session_lifetime/) |
 
-See [how session storage changes the impact](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/login_finalization/#how-session-storage-changes-the-impact)
-for a per-failure comparison and the remaining conditions on recovery.
+Store-backed sessions can survive lost refresh-cookie delivery after a durable
+commit and support revocation when deletion succeeds. Cookie sessions depend on
+browser updates. Neither storage mode coordinates simultaneous provider refresh
+exchanges. The [Pingora finalization reference](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/login_finalization/)
+explains how storage choice changes the impact of adapter response failures.
 
-Neither choice prevents two requests from exchanging the same refresh token,
-even on one replica. Local logout also leaves provider SSO active. Resolve
-these choices using the shared [deployment guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/deployment/),
-which covers provider reuse, keys, storage, and logout. The steps below cover
-this adapter's integration.
+For bearer-token proxies, configure trusted resource audiences and public URL
+mappings, then apply the routing, upstream trust, and response checks below.
+Session-key and logout configuration applies only to browser login.
 
 ## Configure Pingora
 
@@ -55,7 +55,7 @@ this adapter's integration.
    follow [Cache responses per authenticated user](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/how_to/user_caching/)
    for identity keys, authorization before lookup, and downstream cache policy.
    See also the shared
-   [caching guide](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/caching/).
+   [caching guide](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/caching/).
 
 ## Account for Pingora's response lifecycle
 
@@ -73,7 +73,7 @@ Callback and logout responses are handled directly by the login engine; the
 boundary above concerns application requests continuing through the inner proxy.
 A successful refresh exchange alone does not prove delivery to the browser.
 See the [login lifecycle](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/explanation/login_lifecycle/)
-and the shared guide's [delivery and response-ordering limits](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/deployment/#limits-configuration-cannot-remove).
+and the shared guide's [delivery and response-ordering limits](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/deployment/#limits-configuration-cannot-remove).
 
 For each exception, its coding mitigation, and its effect on service users,
 consult the [login finalization reference](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/login_finalization/).
@@ -83,7 +83,7 @@ not just successful upstream responses.
 
 ## Verify the integration
 
-Run the shared guide's [rollout checks](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/how_to/deployment/#verify-before-rollout)
+Run the shared guide's [rollout checks](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/how_to/deployment/#verify-before-rollout)
 for restart persistence, replicas, concurrent refresh, and logout. Then check
 these Pingora-specific paths:
 

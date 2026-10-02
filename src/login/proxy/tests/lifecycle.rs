@@ -13,7 +13,7 @@ use super::*;
 
 static CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
 static NEXT_KEY: AtomicUsize = AtomicUsize::new(0);
-const COOKIE: &str = "mock-session=rotated; Secure; HttpOnly";
+const COOKIE: &str = MOCK_SESSION_CLEAR;
 
 #[derive(Clone, Copy, Debug)]
 enum ResponsePath {
@@ -47,6 +47,7 @@ impl ProxyHttp for LifecycleInner {
     }
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         ctx.login_state_mut().pending = Some(owed_persist());
+        ctx.login_state_mut().set_cookies = owed_cookies().await;
         if let Some(gate) = &self.request_gate {
             gate.entered.notify_one();
             gate.release.notified().await;
@@ -260,11 +261,12 @@ async fn start_upstream(
     }
 }
 
-type LifecycleApp = pingora_proxy::HttpProxy<LoginProxy<LifecycleInner, MockSessionDriver>>;
+type LifecycleApp = pingora_proxy::HttpProxy<LoginProxy<LifecycleInner, TestDriver>>;
 
 async fn exchange_h1(app: Arc<impl HttpServerApp>, method: &str) -> String {
     let (mut client, server) = tokio::io::duplex(16384);
-    client.write_all(format!("{method} /api HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let cookie = test_pointer_cookie().await;
+    client.write_all(format!("{method} /api HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nAccept: application/json\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
     let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let serve = async {
         drop(
@@ -308,6 +310,7 @@ async fn exchange_h2(app: Arc<impl HttpServerApp>, method: &str) -> String {
         .method(method)
         .uri("https://localhost/api")
         .header("accept", "application/json")
+        .header("cookie", test_pointer_cookie().await)
         .body(())
         .unwrap();
     let (response, _stream) = sender.send_request(request, true).unwrap();
@@ -345,7 +348,7 @@ async fn exchange_h2(app: Arc<impl HttpServerApp>, method: &str) -> String {
 
 #[tokio::test]
 async fn login_denial_omits_head_body_for_both_downstream_protocols() {
-    let proxy = build_proxy(MockSessionDriver::default()).await;
+    let proxy = build_proxy(TestBackend::default()).await;
     let mut app = pingora_proxy::HttpProxy::new(proxy, Arc::new(ServerConf::default()));
     app.handle_init_modules();
     let app = Arc::new(app);
@@ -403,14 +406,11 @@ async fn run_case_with_protocols(
         seed_cache(&key, matches!(path, ResponsePath::Revalidated)).await;
     }
     let (upstream, task) = start_upstream(path, upstream_h2).await;
-    let engine = build_engine(
-        MockSessionDriver::builder()
-            .load_session(MockSession::default())
-            .fail_save(fail_save)
-            .save_cookies(vec![HeaderValue::from_static(COOKIE)])
-            .build(),
-    )
-    .await;
+    let store = TestBackend::builder()
+        .load_session(MockSession::default())
+        .fail_save(fail_save)
+        .build();
+    let engine = build_engine(store.clone()).await;
     let observed = Arc::new(Mutex::new(Vec::new()));
     let proxy = LoginProxy::builder()
         .inner(LifecycleInner {
@@ -452,7 +452,7 @@ async fn run_case_with_protocols(
             .unwrap();
     }
     assert_eq!(
-        engine.session_store().save_count(),
+        store.save_count(),
         1,
         "{path:?}: must finalize exactly once"
     );
@@ -627,7 +627,7 @@ async fn http2_persist_failures_never_deliver_success_or_cookies() {
 
 struct LocalFixture {
     app: Arc<LifecycleApp>,
-    engine: Arc<LoginEngine<MockSessionDriver>>,
+    store: TestBackend,
     observed: Arc<Mutex<Vec<&'static str>>>,
 }
 
@@ -636,14 +636,11 @@ async fn local_fixture(
     save_gate: Option<Arc<SaveGate>>,
     request_gate: Option<Arc<SaveGate>>,
 ) -> LocalFixture {
-    let engine = build_engine(
-        MockSessionDriver::builder()
-            .load_session(MockSession::default())
-            .save_cookies(vec![HeaderValue::from_static(COOKIE)])
-            .maybe_save_gate(save_gate)
-            .build(),
-    )
-    .await;
+    let store = TestBackend::builder()
+        .load_session(MockSession::default())
+        .maybe_save_gate(save_gate)
+        .build();
+    let engine = build_engine(store.clone()).await;
     let observed = Arc::new(Mutex::new(Vec::new()));
     let proxy = LoginProxy::builder()
         .inner(LifecycleInner {
@@ -665,7 +662,7 @@ async fn local_fixture(
     app.handle_init_modules();
     LocalFixture {
         app: Arc::new(app),
-        engine,
+        store,
         observed,
     }
 }
@@ -674,7 +671,7 @@ async fn start_local_request(
     app: Arc<LifecycleApp>,
 ) -> (DuplexStream, tokio::task::JoinHandle<()>) {
     let (mut client, server) = tokio::io::duplex(1024);
-    client.write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n").await.unwrap();
+    client.write_all(format!("GET /api HTTP/1.1\r\nHost: localhost\r\nCookie: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n", test_pointer_cookie().await).as_bytes()).await.unwrap();
     let task = tokio::spawn(async move {
         let (_tx, shutdown) = tokio::sync::watch::channel(false);
         drop(
@@ -693,15 +690,7 @@ async fn disconnect_before_headers_does_not_repeat_completed_persistence() {
     tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
         .await
         .unwrap();
-    assert_eq!(
-        *fixture
-            .engine
-            .session_store()
-            .save_completions
-            .lock()
-            .unwrap(),
-        0
-    );
+    assert_eq!(*fixture.store.save_completions.lock().unwrap(), 0);
     // Persistence is in flight. Closing the reader guarantees the subsequent
     // downstream header write fails, without relying on socket timing.
     drop(client);
@@ -710,16 +699,8 @@ async fn disconnect_before_headers_does_not_repeat_completed_persistence() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fixture.engine.session_store().save_count(), 1);
-    assert_eq!(
-        *fixture
-            .engine
-            .session_store()
-            .save_completions
-            .lock()
-            .unwrap(),
-        1
-    );
+    assert_eq!(fixture.store.save_count(), 1);
+    assert_eq!(*fixture.store.save_completions.lock().unwrap(), 1);
     assert_eq!(
         *fixture.observed.lock().unwrap(),
         ["final", "error", "logging"]
@@ -748,16 +729,8 @@ async fn disconnect_during_body_preserves_the_already_delivered_cookie() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fixture.engine.session_store().save_count(), 1);
-    assert_eq!(
-        *fixture
-            .engine
-            .session_store()
-            .save_completions
-            .lock()
-            .unwrap(),
-        1
-    );
+    assert_eq!(fixture.store.save_count(), 1);
+    assert_eq!(*fixture.store.save_completions.lock().unwrap(), 1);
     assert_eq!(
         *fixture.observed.lock().unwrap(),
         ["final", "error", "logging"]
@@ -789,19 +762,8 @@ async fn aborting_the_request_task_does_not_run_async_cleanup() {
             wire.is_empty(),
             "cancellation before headers cannot deliver cookies"
         );
-        assert_eq!(
-            fixture.engine.session_store().save_count(),
-            usize::from(during_save)
-        );
-        assert_eq!(
-            *fixture
-                .engine
-                .session_store()
-                .save_completions
-                .lock()
-                .unwrap(),
-            0
-        );
+        assert_eq!(fixture.store.save_count(), usize::from(during_save));
+        assert_eq!(*fixture.store.save_completions.lock().unwrap(), 0);
         assert_eq!(
             *fixture.observed.lock().unwrap(),
             if during_save { vec!["final"] } else { vec![] }
@@ -877,6 +839,7 @@ async fn http2_stream_reset_during_save_completes_once_and_runs_cleanup() {
         let request = http::Request::builder()
             .uri("https://localhost/api")
             .header("accept", "application/json")
+            .header("cookie", test_pointer_cookie().await)
             .body(())
             .unwrap();
         let (response, mut stream) = sender.send_request(request, true).unwrap();
@@ -907,16 +870,8 @@ async fn http2_stream_reset_during_save_completes_once_and_runs_cleanup() {
     })
     .await
     .expect("reset lifecycle timed out");
-    assert_eq!(fixture.engine.session_store().save_count(), 1);
-    assert_eq!(
-        *fixture
-            .engine
-            .session_store()
-            .save_completions
-            .lock()
-            .unwrap(),
-        1
-    );
+    assert_eq!(fixture.store.save_count(), 1);
+    assert_eq!(*fixture.store.save_completions.lock().unwrap(), 1);
     assert_eq!(
         *fixture.observed.lock().unwrap(),
         ["final", "error", "logging"]

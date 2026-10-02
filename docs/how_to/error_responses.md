@@ -7,11 +7,11 @@ challenge values. Metadata endpoints keep their own JSON and method responses.
 
 ## Resource-server error bodies
 
-Both adapters accept an `ErrorBody` renderer through `.error_body(...)`.
-The default is an empty body. Use the structured fields instead of parsing
+Resource proxies accept an `ErrorBody` renderer through `.error_body(...)`.
+The renderer `()` produces an empty body. Use the structured fields instead of parsing
 `WWW-Authenticate`; missing credentials have no error code, and server-side
 failures deliberately omit internal descriptions. This JSON example has the
-same payload in both adapters:
+following payload:
 
 ```rust
 # #[cfg(feature = "resource")]
@@ -38,24 +38,43 @@ impl ErrorBody for ApiErrors {
 #     + huskarl_pingora::resource_server::validator::metadata::ProvideValidatorMetadata {
 let proxy = proxy.error_body(ApiErrors);
 # }
+# fn bind<P, V>(
+#     definition: huskarl_pingora::resource_server::resource::ResourceDefinition,
+#     validator: V,
+#     policy: huskarl_pingora::resource::ResourcePolicy<V::Claims>,
+#     inner: P,
+# ) -> Result<huskarl_pingora::resource::BoundResource<huskarl_pingora::resource::ProtectedResourceProxy<P, V, ApiErrors>>, huskarl_pingora::resource::ConfigError>
+# where V: huskarl_pingora::resource_server::validator::AccessTokenValidator
+#     + huskarl_pingora::resource_server::validator::metadata::ProvideValidatorMetadata {
+let resource = huskarl_pingora::resource::BoundResource::builder()
+    .definition(definition)
+    .validator(validator)
+    .policy(policy)
+    .inner(inner)
+    .error_body(ApiErrors)
+    .build()?;
+# Ok(resource)
+# }
 # }
 ```
 
-Configure the renderer on `AuthProxy`, or on `BoundResource` for a defined
-resource. The resource binding is retained. It applies to validation, audience, scope, custom-check,
+Configure the renderer on `AuthProxy`, or on `BoundResource::builder()` for a defined
+resource. The bound-resource builder requires an explicit renderer; use
+`.error_body(())` for an empty body. The resource binding is retained.
+The renderer applies to validation, audience, scope, custom-check,
 and path-policy denials. It does not run for forwarded requests or metadata.
 `ErrorBodyResponse` accepts only body bytes and a content type. The library
 sets status, `WWW-Authenticate`, `DPoP-Nonce`, `Retry-After`, `Cache-Control`, and
 content length. HEAD returns the representation headers without body bytes.
 
-For resource assembly, configure the bound resource before converting it to a
-route: `bound.error_body(ApiErrors).into_route()`. Pass that bundle to
+For resource assembly, configure the renderer on the builder, then convert the
+built resource with `resource.into_route()`. Pass that bundle to
 `ResourceAssembly::register_bound`; its resource definition and prepared metadata
-are retained. Calling `error_body` again replaces the renderer.
+are retained. Calling `error_body` on an already built resource replaces the renderer.
 
 ## Browser-login error pages
 
-Both adapters use `huskarl_login::ErrorPage`. The renderer controls the media
+Browser-login error pages use the shared `huskarl_login::ErrorPage`. The renderer controls the media
 type and body; the login engine controls the response status and protocol
 headers. This example uses plain text so provider-supplied messages cannot be
 interpreted as HTML:

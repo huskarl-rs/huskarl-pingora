@@ -92,8 +92,7 @@ pub enum LoginRule<S = ()> {
         /// report it with the affected route pattern.
         check_requested: bool,
     },
-    /// Load the session if a cookie is present, but pass through to the inner
-    /// proxy either way. Use this when the path is publicly accessible but
+    /// Allow requests without a session; load and check a session when available. Use this when the path is publicly accessible but
     /// should still render personalized content (e.g. a "Sign in" vs
     /// "Welcome, Alice" header on the landing page). An attached `check` runs
     /// only when a session is present.
@@ -184,9 +183,10 @@ impl<S> LoginRule<S> {
         }
     }
 
-    /// A rule that loads the session if a cookie is present but never gates
-    /// the request. The inner proxy can read `ctx.login_state().session` to
-    /// personalize the response.
+    /// Allows requests without a session and loads a session when one is available.
+    /// The inner proxy can read `ctx.login_state().session` to personalize responses.
+    /// A configured check can reject a loaded session. Session-load failures and
+    /// temporarily unavailable refresh can also stop the request.
     ///
     /// Chain [`check`](Self::check) to run an authorization check when a
     /// session is present.

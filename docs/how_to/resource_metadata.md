@@ -11,7 +11,10 @@ endpoints; it gets one metadata document, not one per endpoint.
 To integrate with an existing server or export metadata for a separate publisher,
 use [publication contributions](crate::_docs::how_to::publication_contributions).
 
-For a server hosting several resources, prefer the [shared registration assembly](crate::_docs::how_to::resource_registration). It derives mounts and metadata from one validated definition; the lower-level APIs below remain available for custom routing.
+For one or several resources on a listener you own, use
+[resource assembly](crate::_docs::how_to::resource_registration). It derives the
+protected mounts and metadata routes together. This guide covers identifier and
+audience choices, manual publication, rewrites, and request checks.
 
 ## Choose identifiers and audiences
 
@@ -29,7 +32,7 @@ Resources accepting the same audience are not isolated by their different URLs;
 use distinct audiences or additional authorization checks when tokens must not
 cross between resources.
 
-## Publish one resource
+## Publish one resource with a custom wrapper
 
 Bind the proxy to the resource and publish the returned endpoint outside its
 authentication handling:
@@ -59,6 +62,7 @@ let bound = BoundResource::builder()
     .validator(validator)
     .policy(policy)
     .inner(inner)
+    .error_body(())
     .build()?;
 let (_definition, inventory, metadata) = bound.into_parts();
 let proxy = ResourceMetadataProxy::new(inventory).publish(metadata)?;
@@ -87,7 +91,7 @@ and route each protected subtree to its own auth proxy. Selection must happen
 in the router's early phase so metadata requests never enter an auth branch's
 early-filter lifecycle.
 
-Use [examples/multi_resource_proxy.rs](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/multi_resource_proxy.rs) for the complete routing and context setup:
+For built-in assembly, use [examples/multi_resource_proxy.rs](https://github.com/huskarl-rs/huskarl-pingora/blob/main/examples/multi_resource_proxy.rs) for the complete routing and context setup:
 
 ```sh
 PUBLIC_BASE=https://api.example.com \

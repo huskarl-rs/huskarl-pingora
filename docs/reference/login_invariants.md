@@ -89,12 +89,14 @@ committed downstream. In the tested default Pingora integration, the client gets
 an error rather than the successful application response or its body. The policy
 can explicitly permit continuation; a custom error handler can change the
 outcome and must be tested. A fresh cache hit maps the error to 500 in Pingora
-0.9; other tested paths use the configured status, normally 503. Exact status,
+0.9; other paths normally use the policy-selected status. See the
+[status table](crate::_docs::reference::login_finalization#persistence-failure-status). Exact status,
 policy response body, and policy headers are not universal invariants.
 
 **E2 — Revocation failure does not suppress browser clears.** When termination
 returns clearing cookies and a revocation error, the adapter appends the clears,
-logs the error, and does not reject the response solely because revocation
+reports the error to the configured diagnostic handler, and does not reject the
+response solely because revocation
 failed. This permits the current browser to clear its session; it does not
 assert successful server-side deletion or revoke copied credentials.
 
@@ -123,28 +125,9 @@ that every pending save succeeds, or that every cookie reaches a browser.
 Any stronger progress claim needs explicit assumptions about task lifetime,
 backend availability, transport delivery, and browser cookie acceptance.
 
-## Regression evidence and coverage gaps
+## Regression evidence
 
-Test names below are in `src/login/proxy/tests.rs` or its `lifecycle.rs` child.
-The lifecycle harness drives Pingora's real request runner; adapter unit tests
-exercise individual hooks. A passing scenario supports the stated obligation
-under its fixture assumptions, not every possible execution.
-
-| Invariant | Existing evidence | Remaining boundary or gap |
-|---|---|---|
-| F1 | `logging_after_response_filter_does_not_double_persist`; `interim_headers_preserve_work_until_final_or_upgrade_response`; lifecycle save counts | Driver-internal retries and real backend commit ambiguity are outside the mock's count. |
-| F2 | `interim_headers_preserve_work_until_final_or_upgrade_response`; HTTP/1 early-hints and HTTP/2 upstream scenarios | `101` is tested at hook level, not a full upgraded connection. |
-| F3 | `response_filter_termination_path`; `logging_fallback_revokes_when_termination_requested` | These termination tests do not also inject a pending refresh. Simultaneous pending-plus-termination and repeated termination need dedicated regression coverage. |
-| F4 | Lifecycle `logging` assertions; interim/final header unit test | Identity retained after termination is not separately asserted end to end. |
-| C1 | `real_pingora_response_paths_deliver_cookies_once`; `http2_response_paths_finalize_and_keep_cookies_out_of_cache`; `http2_upstreams_finalize_for_both_downstream_protocols` | Uses a mock cookie header, not browser chunk parsing or acceptance. |
-| C2 | Lifecycle cache-admission and stored-header assertions | Application-supplied cookies and user isolation require application tests. |
-| C3 | `response_filter_forces_no_store_when_session_cookie_appended`; `response_filter_preserves_cache_control_without_session_cookie` | Outer filters and downstream caches are deployment responsibilities. |
-| C4 | `direct_writes_demonstrate_the_documented_boundary`; `upstream_failure_uses_cleanup_without_claiming_cookie_delivery` | These verify no cookie delivery and store attempts, not the optional diagnostic notification. |
-| E1 | `real_pingora_persist_failures_never_serve_success`; `http2_persist_failures_never_deliver_success_or_cookies`; HTTP/2 upstream failure matrix | Custom permissive policies and custom error handlers need their own scenarios. |
-| E2 | `response_filter_termination_delivers_clears_when_revocation_fails` | Hook-level test; no real external-store outage or browser involved. |
-| E3 | `disconnect_before_headers_does_not_repeat_completed_persistence`; `disconnect_during_body_preserves_the_already_delivered_cookie`; `http2_stream_reset_during_save_completes_once_and_runs_cleanup` | These do not establish that a browser accepted a cookie. |
-| Cancellation limit | `aborting_the_request_task_does_not_run_async_cleanup` | The blocked mock save does not commit; real backend durability after cancellation remains uncertain. |
-
-When changing finalization, name the affected invariant in review and add a
-counterexample sequence to the appropriate test. Keep stronger desired properties
-labelled as unverified until their assumptions and regression coverage are clear.
+The [maintainer evidence table](https://github.com/huskarl-rs/huskarl-pingora/blob/main/docs/contributing/login_lifecycle.md#regression-evidence-and-coverage-gaps)
+maps these obligations to tests and known coverage gaps. Applications must test
+their own middleware, backend, and cancellation behavior; the adapter fixtures
+do not prove browser cookie acceptance or real-backend rollback.

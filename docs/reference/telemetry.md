@@ -30,13 +30,19 @@ shared `LoginEngine` retains its own name. None of these APIs automatically
 wraps a supplied validator, HTTP client, or cryptographic implementation in a
 metrics decorator. Applications own instrumentation of supplied dependencies.
 
-The `metrics` feature forwards to `huskarl?/metrics` and
-`huskarl-core?/metrics`, without enabling unused functional dependencies.
-Current dependencies limit complete alignment: `huskarl-login` 0.4 emits its
-own metrics and logs unconditionally, while `huskarl-resource-server` 0.11.4
-has no metrics feature to forward to. This crate's feature cannot silence those
-libraries or instrument their entire dependency graph. Upstream names, labels,
-and behavior are separate contracts until those libraries adopt this direction.
+The adapter's `metrics` feature forwards to `huskarl?/metrics`,
+`huskarl-core?/metrics`, and `huskarl-login?/metrics`, without enabling unused
+authentication modes. Enabling `login` and `metrics` also enables the shared
+engine counters.
+
+The engine has its own diagnostic handler: `LoginProxy::diagnostics` configures
+only adapter diagnostics. See the shared
+[telemetry reference](https://docs.rs/huskarl-login/0.5.0/huskarl_login/metrics/)
+for engine setup, counters, and observation boundaries.
+
+The resource-server dependency has no metrics feature forwarded here. Supplied
+validators and their HTTP or cryptographic dependencies keep their own
+instrumentation contracts. Adapter counters do not instrument that whole graph.
 
 ## Counter catalog
 
@@ -142,7 +148,7 @@ that a browser session was established or ended.
 
 ## Diagnostics without library logging
 
-Handwritten code in this crate no longer logs. Returned proxy errors remain
+This adapter emits no library log statements. Returned proxy errors remain
 available through Pingora's error hooks. `LoginProxy::diagnostics` provides an
 optional application handler for session load/persist/revocation errors consumed
 inside the adapter and for stranded cookie batches. It works without `metrics`.
@@ -194,6 +200,6 @@ keys, and counting semantics are documented interfaces: changes require an
 explicit migration note rather than silently changing a denominator.
 
 Install a diagnostic handler if you relied on this crate's former login failure
-logs. Other dependency logs, including Pingora and `huskarl-login`, retain their
-own behavior. The Pingora `logging` lifecycle hook still runs; removing library
+logs. Configure the shared engine's diagnostic handler separately if engine failure
+details are needed. Pingora and other dependencies retain their own logging behavior. The Pingora `logging` lifecycle hook still runs; removing library
 log statements does not remove session cleanup or inner-proxy logging hooks.

@@ -26,7 +26,7 @@ pub enum Outcome<C> {
         token: Option<Arc<ValidatedRequest<C>>>,
         /// A `DPoP` nonce to set in the `DPoP-Nonce` response header, if any.
         dpop_nonce: Option<String>,
-        /// Whether to strip the `Authorization` header before forwarding upstream.
+        /// Whether to strip `Authorization` and `DPoP` before forwarding upstream.
         strip_credentials: bool,
     },
     /// The request should be denied. The caller must write the challenge

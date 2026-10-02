@@ -23,13 +23,27 @@ Pass this value to `.path_guard(path_guard)` on `LoginProxy::builder()` or
 `ResourcePolicy::builder()`. The tutorial's small Python upstream compares the path
 without decoding or case folding, so these declarations cover it.
 
-## 2. Add structural forms your downstream accepts
+## 2. Check the structural forms your downstream accepts
 
-If a downstream component treats backslashes as separators, enable
-`StructuralClasses::new().with_backslash()` through
-`GuardConfig::with_structural_classes`. Declare any other supported equivalents
-that apply. See the [configuration reference](crate::_docs::reference::path_guard)
-for overlong encodings and custom probes.
+Backslash separators are already included in the default configuration. Keep
+that setting unless every downstream component preserves them as content. For
+a legacy decoder that accepts overlong UTF-8 slash or dot encodings, add those
+forms explicitly:
+
+```rust
+use huskarl_pingora::path_confusion::{
+    CaseSensitivity, DecodeDepth, GuardConfig, StructuralChar, StructuralClasses,
+};
+let path_guard = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne)
+    .with_structural_classes(
+        StructuralClasses::new().with_overlong([StructuralChar::Slash, StructuralChar::Dot]),
+    );
+# let _ = path_guard;
+```
+
+Do this only when those declarations match your deployment. See the
+[configuration reference](crate::_docs::reference::path_guard) for fullwidth
+structural forms and custom probes.
 
 ## 3. Select a mode and budget
 

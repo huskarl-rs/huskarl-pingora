@@ -46,60 +46,27 @@ mod tests;
 
 // ── LoginProxy ────────────────────────────────────────────────────────────────
 
-/// A [`ProxyHttp`] decorator implementing OAuth 2.0 Authorization Code Grant login.
+/// Adds browser login and per-route session policy to an inner Pingora proxy.
 ///
-/// All OAuth-flow logic lives in the shared [`LoginEngine`]. This decorator
-/// adapts it to pingora's `ProxyHttp` lifecycle and applies a per-route
-/// [`LoginRule`]:
+/// Supply a configured [`LoginEngine`] and an inner [`ProxyHttp`] implementation.
+/// Its context must implement [`HasLoginSession`]; [`super::LoginCtx`] wraps your
+/// application context with that state. `P` is the inner proxy and `SD` is the
+/// session driver, such as [`super::CookieSessionStore`].
 ///
-/// - `request_filter` runs the engine's route handlers (callback/logout),
-///   looks up the [`LoginRule`] for the request path, loads the session if
-///   the rule requires it, and either gates the request (rule = `required`)
-///   or forwards it to the inner proxy with the loaded session in the
-///   context (rules `required` or `optional`). Paths matched by a `public`
-///   rule skip session loading entirely.
-/// - `response_filter` persists or terminates the session once, on the final
-///   downstream response (including cache hits). It appends `Set-Cookie` after
-///   cache processing, preserving the session for subsequent hooks. Interim
-///   responses are skipped; a `101` upgrade finalizes the session.
-/// - Inner handlers can queue a local response with
-///   [`LoginState::respond`](super::LoginState::respond), then return `Ok(false)`.
-///   The proxy finalizes and writes it without contacting an upstream.
-///   A failure here is handled by the configured [`PersistFailurePolicy`].
-/// - `logging` is the persistence fallback for requests that never reach
-///   `response_filter` — the inner proxy answered the request
-///   itself in `request_filter`, or proxying failed. The response is
-///   already sent at that point, so any `Set-Cookie` values the store
-///   returns are counted and reported to the optional diagnostic handler before
-///   being discarded: external stores persist fine,
-///   cookie-backed stores cannot. Eager refresh persistence prepares cookie
-///   updates but does not deliver them: even a successful cookie save depends
-///   on the response reaching the browser. See the
-///   [lifecycle explanation](crate::_docs::explanation::login_lifecycle).
-///
-/// # Session credential stripping
-///
-/// Before forwarding, this proxy removes the session driver's cookies from the
-/// inbound `Cookie` header, including cookie-session chunks and key-id sidecars.
-/// Unrelated application cookies are preserved. The inner proxy can read identity
-/// from its session context. A separate upstream service needs an explicit
-/// identity assertion; see [Forward session identity](crate::_docs::how_to::identity).
-///
-/// # Type parameters
-///
-/// - `P` — inner proxy implementing [`ProxyHttp`]
-/// - `SD` — session driver ([`CookieSessionStore`](super::CookieSessionStore) or
-///   [`StoreBackedSessionStore`](super::StoreBackedSessionStore))
+/// Unmatched paths require a session by default. Required routes redirect browser
+/// navigations to login and challenge API requests. Public routes skip session
+/// loading; optional routes allow anonymous access but apply checks to loaded sessions.
 ///
 /// # Example
 ///
 /// ```no_run
-/// # use std::sync::Arc;
+/// use std::sync::Arc;
+///
 /// # use huskarl::grant::authorization_code::AuthorizationCodeGrant;
-/// # use huskarl_pingora::login::{
-/// #     CaseSensitivity, DecodeDepth, GuardConfig, HasLoginSession, LoginConfig, LoginEngine, LoginProxy,
-/// #     LoginRule, SessionDriver,
-/// # };
+/// use huskarl_pingora::login::{
+///     CaseSensitivity, DecodeDepth, GuardConfig, LoginEngine, LoginProxy, LoginRule,
+/// };
+/// # use huskarl_pingora::login::{HasLoginSession, LoginConfig, SessionDriver};
 /// # use pingora_proxy::ProxyHttp;
 /// # fn build<P, SD>(
 /// #     my_upstream: P,
@@ -126,7 +93,10 @@ mod tests;
 /// let proxy = LoginProxy::builder()
 ///     .inner(my_upstream)
 ///     .engine(engine)
-///     .path_guard(GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
+///     .path_guard(GuardConfig::new(
+///         CaseSensitivity::Sensitive,
+///         DecodeDepth::UpToOne,
+///     ))
 ///     // Defaults to `LoginRule::required()` for paths that don't match.
 ///     // `subtree` covers a path and everything beneath it; `route` is one
 ///     // exact path.
@@ -137,6 +107,31 @@ mod tests;
 ///     .expect("valid routes");
 /// # }
 /// ```
+///
+/// Configure `login_config`, `grant`, and `store` with the shared
+/// [engine tutorial](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/tutorial/getting_started/),
+/// or follow the [Pingora tutorial](crate::_docs::tutorial::browser_login)
+/// for a complete runnable server.
+///
+/// # Request and response contract
+///
+/// The proxy handles callback/logout and loads or refreshes sessions before the
+/// inner request filter. Inner hooks can read the session through their context.
+/// Before the inner upstream request filter, the proxy removes its session cookies,
+/// including chunks and key-id sidecars; unrelated application cookies remain.
+/// A separate upstream needs [explicit identity forwarding](crate::_docs::how_to::identity).
+///
+/// On the final downstream response, including cache hits, the proxy completes
+/// pending persistence or termination once and appends session cookies after
+/// cache processing. Informational responses are skipped; a 101 upgrade finalizes.
+/// The session snapshot remains available to later hooks, including logging.
+///
+/// Queue local responses with [`super::LoginState::respond`] and return `Ok(false)`.
+/// Direct writes bypass response finalization. The logging fallback can attempt
+/// outstanding server-side work and report discarded cookies, but cannot deliver
+/// cookies after the response is sent. Task cancellation may skip cleanup entirely.
+/// See the [finalization reference](crate::_docs::reference::login_finalization)
+/// for failure statuses, delivery limits, and storage-dependent consequences.
 pub struct LoginProxy<P, SD>
 where
     P: ProxyHttp + Send + Sync,
@@ -197,6 +192,8 @@ where
         /// persist) fails — letting the response through would strand the
         /// rotated token.
         ///
+        /// The default policy selects 401 for a missing session, 409 for a conflict,
+        /// 500 for internal persistence failures, and 503 for unavailability.
         /// A replacement response becomes a filter error carrying its status;
         /// its headers and body are not used. Pingora 0.9 maps errors on fresh
         /// cache hits to 500; other paths normally use the supplied status.
@@ -278,9 +275,7 @@ where
 
     /// Applies a [`LoginRule`] to a path **and everything beneath it**.
     ///
-    /// Mirrors `ResourcePolicyBuilder::subtree` on the resource side (plain code span, not a link:
-    /// this module compiles without the `resource` feature). Matching only an exact
-    /// path (via [`route`](Self::route))
+    /// Matching only an exact path (via [`route`](Self::route))
     /// is a common source of gaps — a request to `/dashboard/` or
     /// `/dashboard/reports` would otherwise fall through to the default rule.
     ///

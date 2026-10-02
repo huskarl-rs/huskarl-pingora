@@ -40,80 +40,30 @@ Personalized application content still requires a suitable cache policy.
 
 ## Local responses
 
-An inner proxy can queue a buffered response instead of writing directly:
-
-```rust
-# use huskarl_pingora::login::{HasLoginSession, LoginResponse, LoginCtx, CookieSession};
-# fn handler(ctx: &mut LoginCtx<(), CookieSession>) -> pingora_error::Result<bool> {
-ctx.login_state_mut().respond(LoginResponse::Rendered {
-    status: http::StatusCode::OK,
-    headers: vec![],
-    body: "Hello".into(),
-})?;
-Ok(false)
-# }
-```
-
-Return `Ok(false)` from `request_filter` after queuing the response. The enclosing
-`LoginProxy` invokes the inner downstream response filter, finalizes session
-work, and writes the buffered response without contacting an upstream. Set
-`terminate_requested` before queuing it to terminate a session with the response.
-Informational responses are rejected by this API. `HEAD`, `204`, and `304`
-responses send no body.
-
-Direct calls to `Session::write_response_header` or `respond_error` bypass the
-proxy response hooks. Queuing a response and also writing directly is unsupported.
-Proxy-generated error responses can bypass the hooks too. Logging performs
-best-effort cleanup on these paths and reports undelivered cookies; it cannot
-repair a response already sent or guarantee delivery after a connection fails.
+A local application response still needs to deliver session updates. Queuing it
+through `LoginState::respond` lets the enclosing proxy run downstream response
+filtering and finalization before writing. Writing directly to the session skips
+that coordination. Follow [Return a local response](crate::_docs::how_to::local_responses)
+for the supported integration.
 
 ## Persistence failures
 
 A pending-save failure follows the configured `PersistFailurePolicy`. A rejecting
 policy produces a filter error: its replacement body and headers are not used.
 Pingora 0.9 returns 500 for response-filter errors on fresh cache hits, while its
-usual error handler honors the supplied status (503 for the default policy).
+usual error handler honors the status selected by the policy. The default
+policy distinguishes missing sessions, conflicts, internal failures, and temporary
+unavailability; see the [status reference](crate::_docs::reference::login_finalization#persistence-failure-status).
 Both paths block the successful response. Custom inner error handlers can change
 that behavior and should be included in integration tests.
 
-## Testing the contract
+## Contract and evidence
 
-Use the [named invariants](crate::_docs::reference::login_invariants) as the
-review and test checklist for finalization, cookie handling, and failure behavior.
-They distinguish safety obligations from progress assumptions and list current
-coverage gaps.
-
-`src/login/proxy/tests/lifecycle.rs` drives Pingora's actual `HttpProxy` request
-runner over in-memory HTTP/1 and HTTP/2 downstream connections, with loopback
-HTTP/1 and HTTP/2 upstreams and Pingora's in-memory cache. The scenario table
-covers upstream responses, early hints, cache hits, revalidation, queued local
-responses, and direct writes. Assertions check client-observed headers and bodies,
-cached headers, persistence counts, and identity visibility during logging.
-HTTP/2 responses are decoded by the `h2` client. Pingora currently consumes
-HTTP/2 upstream informational headers without invoking the adapter's response
-hook; HTTP/1 upstream informational headers do reach it.
-
-Failure tests use notifications to pause at known boundaries, without sleeps:
-
-- Disconnect before response headers while persistence is pending: the save
-  completes once, the write fails, and logging does not repeat persistence.
-- Disconnect during a large buffered body: the client has received the cookie
-  header, and the body-write failure does not repeat persistence.
-- Reset an HTTP/2 stream during persistence: the request task completes its save
-  and error cleanup even though the client cannot receive the response.
-- Abort the request task before finalization or during a save: no response is
-  delivered and async logging cleanup does not run. The mock save does not
-  complete; a real backend may already have committed, so cancellation does not
-  establish rollback or safe retry.
-
-These tests distinguish request-task cancellation from a client disconnect.
-Cookie receipt here means transport delivery, not browser acceptance. Extend
-the inner proxy implementations and scenarios when adding middleware or
-upgrading Pingora.
-
-Run `cargo test --lib login::proxy::tests::lifecycle` (loopback access is required).
-Unit tests additionally cover termination, interim headers, upgrades, and
-repeated finalization.
+The [finalization reference](crate::_docs::reference::login_finalization) states
+supported behavior and exceptions. The [named invariants](crate::_docs::reference::login_invariants)
+collect the obligations for custom integrations. Maintainers can use the
+[lifecycle test guide](https://github.com/huskarl-rs/huskarl-pingora/blob/main/docs/contributing/login_lifecycle.md)
+when changing hooks or upgrading Pingora.
 
 `public` rules skip session loading; `optional` rules load a session without
 requiring one; `required` rules gate unauthenticated requests. Browser navigation
@@ -122,7 +72,7 @@ failure after access-token expiry produces a retryable response rather than
 silently treating the user as anonymous.
 
 For the full engine model, read
-[Token refresh](https://docs.rs/huskarl-login/latest/huskarl_login/_docs/explanation/refresh/).
+[Token refresh](https://docs.rs/huskarl-login/0.5.0/huskarl_login/_docs/explanation/refresh/).
 For the upstream process boundary, follow
 [Forward session identity](crate::_docs::how_to::identity).
 

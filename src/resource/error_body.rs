@@ -54,7 +54,7 @@ impl ErrorBodyResponse {
 /// Renders the body of a resource-server rejection.
 ///
 /// Configure with [`AuthProxy::error_body`](super::AuthProxy::error_body) or
-/// [`BoundResource::error_body`](super::BoundResource::error_body).
+/// [`BoundResourceBuilder::error_body`](super::BoundResourceBuilder::error_body).
 /// The default renderer `()` produces an empty body. This does not customize
 /// browser-login pages or metadata endpoint responses.
 pub trait ErrorBody: Clone + Send + Sync + 'static {
