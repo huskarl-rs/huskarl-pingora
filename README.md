@@ -40,10 +40,10 @@ For one authentication mode, choose one of these dependency declarations:
 
 ```toml
 # Access-token protection.
-huskarl-pingora = { version = "0.6", default-features = false, features = ["resource", "default-jws-verifier-platform"] }
+huskarl-pingora = { version = "0.7", default-features = false, features = ["resource", "default-jws-verifier-platform"] }
 
 # Browser login.
-huskarl-pingora = { version = "0.6", default-features = false, features = ["login", "default-jws-verifier-platform"] }
+huskarl-pingora = { version = "0.7", default-features = false, features = ["login", "default-jws-verifier-platform"] }
 ```
 
 | Feature | Effect |

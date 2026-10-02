@@ -8,7 +8,7 @@ and diagnostic APIs remain available in either build.
 
 ```toml
 [dependencies]
-huskarl-pingora = { version = "0.6", features = ["metrics"] }
+huskarl-pingora = { version = "0.7", features = ["metrics"] }
 ```
 
 For bearer-only applications, use `default-features = false` with `resource`,
