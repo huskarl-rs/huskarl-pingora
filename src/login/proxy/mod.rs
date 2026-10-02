@@ -7,7 +7,7 @@
 //! fallback for requests that never reach downstream finalization.
 //!
 //! Per-path policy is configured via a routing DSL that mirrors the resource
-//! side's [`Guard`](crate::resource::Guard). Register a [`LoginRule`] with
+//! side's [`ResourcePolicy`](crate::resource::ResourcePolicy). Register a [`LoginRule`] with
 //! [`subtree`](LoginProxyBuilder::subtree) to cover a path and everything
 //! beneath it (the usual choice), or [`route`](LoginProxyBuilder::route) for a
 //! single exact path.
@@ -270,7 +270,7 @@ where
 
     /// Applies a [`LoginRule`] to a path **and everything beneath it**.
     ///
-    /// Mirrors `Guard::subtree` on the resource side (plain code span, not a link:
+    /// Mirrors `ResourcePolicyBuilder::subtree` on the resource side (plain code span, not a link:
     /// this module compiles without the `resource` feature). Matching only an exact
     /// path (via [`route`](Self::route))
     /// is a common source of gaps — a request to `/dashboard/` or

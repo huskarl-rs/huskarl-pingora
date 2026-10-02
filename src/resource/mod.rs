@@ -1,24 +1,29 @@
 //! OAuth 2.0 resource server (bearer token) protection for Pingora.
 //!
-//! Provides [`AuthProxy`], a [`ProxyHttp`](pingora_proxy::ProxyHttp) decorator
-//! that validates bearer tokens on incoming requests before forwarding them to
-//! the inner proxy.
+//! Construct a [`BoundResource`] from a resource definition, token validator,
+//! validated [`ResourcePolicy`], and inner proxy. Its [`ProtectedResourceProxy`]
+//! authenticates requests, while its matching metadata is published separately.
+//! Use [`assembly::ResourceAssembly`] to mount resource bundles together.
+//!
+//! For standalone authentication without a resource definition, combine
+//! [`Guard::new`] and [`AuthProxy::new`]. Both proxies implement
+//! [`ProxyHttp`](pingora_proxy::ProxyHttp) with the inner proxy's context.
 //!
 //! Access control is defined through path-based [`Rule`]s registered on a
-//! [`Guard`]. Each rule specifies whether a route is public, optionally
+//! [`ResourcePolicy`]. Each rule specifies whether a route is public, optionally
 //! authenticated, or requires a valid token — and can additionally enforce
 //! audience, scope, and custom checks.
 //!
-//! Register rules with [`Guard::builder`]: prefer
-//! [`subtree`](GuardBuilder::subtree) to protect a path and everything beneath
-//! it, and use [`route`](GuardBuilder::route) for a single exact path. See the
+//! Register rules with [`ResourcePolicy::builder`]: prefer
+//! [`subtree`](ResourcePolicyBuilder::subtree) to protect a path and everything beneath
+//! it, and use [`route`](ResourcePolicyBuilder::route) for a single exact path. See the
 //! [crate-level routing notes](crate#routing) for why the choice matters.
 //!
 //! # Features
 //!
 //! - **Path-based routing** — protect a path and all descendants with
-//!   [`subtree`](crate::resource::GuardBuilder::subtree), or match one exact
-//!   path with [`route`](crate::resource::GuardBuilder::route). Patterns use
+//!   [`subtree`](crate::resource::ResourcePolicyBuilder::subtree), or match one exact
+//!   path with [`route`](crate::resource::ResourcePolicyBuilder::route). Patterns use
 //!   `matchit` syntax (e.g. `/users/{id}`, `/public/{*rest}`).
 //! - **Scope enforcement** — requires tokens to carry specific scopes via the
 //!   [`HasScopes`] trait.
@@ -26,7 +31,7 @@
 //!   `DPoP-Nonce` headers are propagated automatically.
 //! - **Credential stripping** — `Authorization` and `DPoP` headers are removed
 //!   before forwarding to upstream by default.
-//! - **[RFC 9728] resource metadata** — each [`AuthProxy`] can bind one logical
+//! - **[RFC 9728] resource metadata** — each [`BoundResource`] binds one logical
 //!   protected resource to its token audience, while a server-level
 //!   [`ResourceMetadataProxy`] publishes the documents collected from all such
 //!   integrations under `/.well-known/oauth-protected-resource[/path]`.
@@ -36,7 +41,7 @@
 //!
 //! # Multiple resource servers
 //!
-//! Build one resource-bound [`AuthProxy`] per protected subtree, then place
+//! Build one [`BoundResource`] per protected subtree, then place
 //! those independent proxies behind a `ProxyHttp` router. Publish the returned
 //! metadata endpoints through a separate router branch so metadata requests do
 //! not enter any resource server's early-filter lifecycle. See the
@@ -51,21 +56,25 @@ pub(crate) mod error;
 pub mod error_body;
 mod guard;
 mod outcome;
+mod policy;
 mod proxy;
 pub(crate) mod response;
 pub mod rule;
 pub mod scopes;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub(crate) mod uri;
 
 pub use bound::BoundResource;
 pub use ctx::{AuthCtx, HasAuthState};
 pub use error::ConfigError;
 pub use error_body::{ErrorBody, ErrorBodyResponse, ErrorDetails, FailureDetails};
-pub use guard::{ClientCertDer, Guard, GuardBuilder};
+pub use guard::{ClientCertDer, Guard};
 pub use outcome::Outcome;
-pub use proxy::{AudienceBinding, AuthProxy, ResourceMetadataEndpoint, ResourceMetadataProxy};
+pub use policy::{ResourcePolicy, ResourcePolicyBuilder};
+pub use proxy::{
+    AudienceBinding, AuthProxy, ProtectedResourceProxy, ResourceMetadataEndpoint,
+    ResourceMetadataProxy,
+};
 pub use rule::{CheckError, Rule, TokenRequirement};
 pub use scopes::HasScopes;
 

@@ -1,6 +1,6 @@
 # Path-guard configuration
 
-Both `LoginProxy::builder()` and `Guard::builder()` require
+Both `LoginProxy::builder()` and `ResourcePolicy::builder()` require
 `.path_guard(GuardConfig::new(case_sensitivity, decode_depth))`. Configure the
 mode, additional structural classes, and analysis budget on that `GuardConfig`
 with `with_mode`, `with_structural_classes`, and `with_max_analysis_path_len`.

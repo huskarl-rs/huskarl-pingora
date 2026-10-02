@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use huskarl_pingora::{
     resource::{
-        AudienceBinding, AuthCtx, BoundResource, CaseSensitivity, DecodeDepth, Guard, GuardConfig,
-        HasAuthState, ResourceMetadataProxy,
+        AudienceBinding, AuthCtx, BoundResource, CaseSensitivity, DecodeDepth, GuardConfig,
+        HasAuthState, ResourceMetadataProxy, ResourcePolicy,
     },
     resource_server::{
         core::{
@@ -352,20 +352,19 @@ fn main() {
 
         // Both upstreams have the same downstream parsing assumptions.
         let path_guard = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
-        let inventory_guard = Guard::builder()
-            .validator(inventory_validator)
+        let inventory_policy = ResourcePolicy::builder()
             .path_guard(path_guard.clone())
             .build()
-            .expect("failed to build inventory guard");
+            .expect("failed to build inventory policy");
 
-        let payments_guard = Guard::builder()
-            .validator(payments_validator)
+        let payments_policy = ResourcePolicy::builder()
             .path_guard(path_guard.clone())
             .build()
-            .expect("failed to build payments guard");
+            .expect("failed to build payments policy");
         let inventory = BoundResource::new(
             inventory_definition.clone(),
-            inventory_guard,
+            inventory_validator,
+            inventory_policy,
             Upstream {
                 address: std::env::var("INVENTORY_UPSTREAM")
                     .unwrap_or_else(|_| "127.0.0.1:3001".into()),
@@ -375,7 +374,8 @@ fn main() {
         .into_route();
         let payments = BoundResource::new(
             payments_definition.clone(),
-            payments_guard,
+            payments_validator,
+            payments_policy,
             Upstream {
                 address: std::env::var("PAYMENTS_UPSTREAM")
                     .unwrap_or_else(|_| "127.0.0.1:3002".into()),

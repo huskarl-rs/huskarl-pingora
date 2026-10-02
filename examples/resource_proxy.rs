@@ -8,7 +8,7 @@
 //! See examples/README.md for requests and the next examples.
 use huskarl_pingora::{
     resource::{
-        AudienceBinding, CaseSensitivity, DecodeDepth, Guard, GuardConfig,
+        AudienceBinding, CaseSensitivity, DecodeDepth, GuardConfig, ResourcePolicy,
         assembly::ResourceAssembly,
     },
     resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition},
@@ -40,11 +40,10 @@ fn main() {
         let issuer = std::env::var("ISSUER").expect("ISSUER is required");
         let validator = build_validator(&issuer, &definition.audiences()[0]).await;
         let paths = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne);
-        let guard = Guard::builder()
-            .validator(validator)
+        let policy = ResourcePolicy::builder()
             .path_guard(paths.clone())
             .build()
-            .expect("invalid guard"); // Authentication is required by default.
+            .expect("invalid policy"); // Authentication is required by default.
         let upstream = Upstream {
             address: std::env::var("UPSTREAM").unwrap_or_else(|_| "127.0.0.1:3000".into()),
         };
@@ -52,7 +51,7 @@ fn main() {
         // 3. Install /api and its descendants plus the derived public metadata
         // endpoint. Other paths return 404. register() performs binding for us.
         ResourceAssembly::new(mapping)
-            .register(&definition, guard, upstream)
+            .register(&definition, validator, policy, upstream)
             .expect("resource registration failed")
             .build(
                 route(NotFound),

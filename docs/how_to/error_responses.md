@@ -41,8 +41,8 @@ let proxy = proxy.error_body(ApiErrors);
 # }
 ```
 
-Configure the renderer before or after `with_protected_resource`; the resource
-binding is retained. It applies to validation, audience, scope, custom-check,
+Configure the renderer on `AuthProxy`, or on `BoundResource` for a defined
+resource. The resource binding is retained. It applies to validation, audience, scope, custom-check,
 and path-policy denials. It does not run for forwarded requests or metadata.
 `ErrorBodyResponse` accepts only body bytes and a content type. The library
 sets status, `WWW-Authenticate`, `DPoP-Nonce`, `Retry-After`, `Cache-Control`, and

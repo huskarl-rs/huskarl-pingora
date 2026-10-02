@@ -28,14 +28,16 @@ assert_eq!(inventory.incoming_mount(), "/edge/mcp/inventory");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-You can prepare a `BoundResource::new(definition, guard, inner)` and pass
+You can prepare a `BoundResource::new(definition, validator, policy, inner)` and pass
 `bound.into_route()` to `ResourceAssembly::register_bound`. Its definition,
 authenticated branch, and metadata remain paired until the assembly consumes it.
 For a custom consuming server, see the publication contribution guide.
 
-Alternatively, build the guard with its validator and route policies, then pass the definition,
-guard, and inner proxy to `ResourceAssembly::register`. The definition supplies
-the guard's URL mapping; an explicitly configured guard mapping must agree.
+Alternatively, pass the definition, validator, validated policy, and inner proxy
+to `ResourceAssembly::register`. `ResourcePolicy` contains access rules and
+path-guard assumptions; it cannot carry a validator or URL mapping. The definition
+supplies the only resource mapping. Policy routes use incoming request coordinates,
+including the ingress prefix and resource mount (for example, `/edge/mcp/inventory`).
 The assembly binds authentication, mounts its branch, collects metadata, and
 checks consistency. `build` consumes the fallback route, application route-slot
 lens, and a server-wide `GuardConfig`. Path ambiguity is checked before selecting
@@ -98,13 +100,19 @@ already a public URL: login inverse-maps it before routing and reconstructs it
 once for redirects. Overrides outside the configured origin or public prefix
 return 400. Arbitrary non-prefix rewrites require a custom adapter contract.
 
-## Compatibility and limits
+## Standalone authentication and limits
 
-Existing `base_uri`, `base_url`, `base_path`, `strip_prefix`, and
-`with_protected_resource` APIs remain available. Do not combine the new mapping
-setter with legacy prefix setters. Malformed mappings and callback mismatches
-now fail during construction. The lower-level APIs remain appropriate when an
-application deliberately owns overlapping routes or metadata publication.
+For authentication without a resource definition, construct
+`Guard::new(validator, policy, mapping)` and wrap it with `AuthProxy::new`.
+The mapping is `Some(PublicUrlMapping)` for trusted public URL reconstruction,
+or `None` to pass the original request URI to the validator. DPoP validation
+requires a public target; origin-form requests with no mapping fail closed.
+
+Resource-bound proxies are constructed only through `BoundResource::new` and
+cannot be rebound. Legacy resource `base_uri`, `strip_prefix`, and binding setters
+have been removed. Use `PublicUrlMapping` for all resource URL reconstruction.
+Bare prefixes and trailing slashes remain distinct: mapping `/edge` to
+`https://api.example.com/gateway` does not silently append `/`.
 
 Mapping preserves escaped bytes and queries and does not rewrite forwarded
 requests, trust incoming Host headers, or normalize paths. It does not replace

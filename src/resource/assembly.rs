@@ -8,8 +8,8 @@ use pingora_proxy::{ProxyHttp, Session};
 use pingora_proxy_router::{Lens, Route, RouteSelector, RouteSlot, Router, route};
 
 use super::{
-    BoundResource, ConfigError, Guard, HasAuthState, HasScopes, ResourceMetadataEndpoint,
-    ResourceMetadataProxy,
+    BoundResource, ConfigError, HasAuthState, HasScopes, ResourceMetadataEndpoint,
+    ResourceMetadataProxy, ResourcePolicy,
 };
 use crate::resource_server::{
     core::url_mapping::PublicUrlMapping,
@@ -83,7 +83,8 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
     pub fn register<P, V>(
         self,
         definition: &ResourceDefinition,
-        guard: Guard<V>,
+        validator: V,
+        policy: ResourcePolicy<V::Claims>,
         inner: P,
     ) -> Result<Self, AssemblyError>
     where
@@ -92,7 +93,7 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
         V::Claims: HasScopes + Send + Sync,
         C: HasAuthState<V::Claims>,
     {
-        let bound = BoundResource::new(definition.clone(), guard, inner)
+        let bound = BoundResource::new(definition.clone(), validator, policy, inner)
             .map_err(AssemblyError::Configuration)?;
         self.register_bound(bound.into_route())
     }

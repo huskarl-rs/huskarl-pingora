@@ -24,6 +24,29 @@ Enable the optional `metrics` feature for named adapter counters. See the
 [telemetry reference](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/telemetry/) for counting boundaries,
 application diagnostics, and dependency limitations.
 
+# Cargo features
+
+The defaults enable `resource`, `login`, and `default-jws-verifier-platform`.
+This suits a gateway serving both token-authenticated APIs and browser sessions.
+For a gateway dedicated to one mode, disable defaults and select that mode:
+
+```toml
+# Bearer/DPoP/mTLS resource protection only.
+huskarl-pingora = { version = "0.6", default-features = false, features = ["resource", "default-jws-verifier-platform"] }
+
+# Browser login only.
+huskarl-pingora = { version = "0.6", default-features = false, features = ["login", "default-jws-verifier-platform"] }
+```
+
+These are alternative dependency declarations. Add `metrics` for adapter
+counters; add `upstream_modules` when using Pingora upstream modules. Neither
+feature selects an authentication mode. To use an application-supplied verifier
+platform, omit `default-jws-verifier-platform` and supply the platform explicitly
+when configuring token validation. Cargo features are additive, so other
+dependencies may still enable the underlying default platform. Enabling a
+feature compiles its APIs; it does
+not install authentication on a proxy automatically.
+
 # Deployment limits
 
 Before deploying browser login beyond localhost:
@@ -50,7 +73,7 @@ session-store choices, cookie delivery, and rollout checks.
 - **Look up a contract:** use the [configuration reference](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/_docs/reference/)
   and feature-specific API modules below.
 The [`login`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/login/) module documents `LoginProxy`, `LoginRule`, and `LoginCtx`.
-The [`resource`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/resource/) module documents `AuthProxy`, `Guard`, and `Rule`.
+The [`resource`](https://docs.rs/huskarl-pingora/latest/huskarl_pingora/resource/) module documents `ResourcePolicy`, `BoundResource`, and standalone `AuthProxy`.
 
 # Routing
 

@@ -4,7 +4,8 @@ use pingora_proxy::ProxyHttp;
 use pingora_proxy_router::{Route, route};
 
 use super::{
-    AuthProxy, ConfigError, ErrorBody, Guard, HasAuthState, HasScopes, ResourceMetadataEndpoint,
+    ConfigError, ErrorBody, HasAuthState, HasScopes, ProtectedResourceProxy,
+    ResourceMetadataEndpoint, ResourcePolicy,
 };
 use crate::resource_server::{
     resource::ResourceDefinition,
@@ -18,6 +19,37 @@ use crate::resource_server::{
 /// at that boundary; mounting the resulting proxy at the correct path remains
 /// the server's responsibility.
 ///
+/// The definition supplies the only URL mapping. Pass a validated
+/// [`ResourcePolicy`], rather than an already configured [`super::Guard`]:
+///
+/// ```compile_fail,E0308
+/// use huskarl_pingora::resource::{BoundResource, Guard};
+/// use huskarl_pingora::resource_server::{
+///     resource::ResourceDefinition,
+///     validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata},
+/// };
+/// fn bind<P, V>(definition: ResourceDefinition, validator: V, guard: Guard<V>, inner: P)
+/// where V: AccessTokenValidator + ProvideValidatorMetadata {
+///     let _ = BoundResource::new(definition, validator, guard, inner);
+/// }
+/// ```
+///
+/// Resource binding is a construction step; the resulting proxy has no rebinding setter:
+///
+/// ```compile_fail,E0599
+/// use huskarl_pingora::resource::ProtectedResourceProxy;
+/// use huskarl_pingora::resource_server::{
+///     resource::ResourceDefinition,
+///     validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata},
+/// };
+/// fn rebind<P, V>(definition: ResourceDefinition, proxy: ProtectedResourceProxy<P, V>)
+/// where V: AccessTokenValidator + ProvideValidatorMetadata {
+///     let _ = proxy.with_resource_definition(&definition);
+/// }
+/// ```
+///
+/// Independently prepared definitions cannot replace the bundled definition:
+///
 /// ```compile_fail
 /// use huskarl_pingora::resource::BoundResource;
 /// fn replace_definition<P>(bound: &mut BoundResource<P>, other: huskarl_pingora::resource_server::resource::ResourceDefinition) {
@@ -30,22 +62,24 @@ pub struct BoundResource<P> {
     metadata: ResourceMetadataEndpoint,
 }
 
-impl<P, V> BoundResource<AuthProxy<P, V>>
+impl<P, V> BoundResource<ProtectedResourceProxy<P, V>>
 where
     V: AccessTokenValidator + ProvideValidatorMetadata,
 {
     /// Binds authentication and prepares its matching publication contribution.
-    /// No HTTP route is installed.
+    /// No HTTP route is installed. Policy paths use incoming request coordinates,
+    /// including the ingress prefix and resource mount. The definition alone
+    /// supplies resource identity, accepted audiences and URL reconstruction.
     ///
     /// # Errors
-    /// Rejects inconsistent guard mappings or invalid metadata.
+    /// Rejects inconsistent validator metadata or metadata serialization failures.
     pub fn new(
         definition: ResourceDefinition,
-        guard: Guard<V>,
+        validator: V,
+        policy: ResourcePolicy<V::Claims>,
         inner: P,
     ) -> Result<Self, ConfigError> {
-        let (proxy, metadata) =
-            AuthProxy::new(inner, guard).with_resource_definition(&definition)?;
+        let (proxy, metadata) = ProtectedResourceProxy::new(&definition, validator, policy, inner)?;
         Ok(Self {
             definition,
             proxy,
@@ -54,17 +88,17 @@ where
     }
 }
 
-impl<P, V, E> BoundResource<AuthProxy<P, V, E>>
+impl<P, V, E> BoundResource<ProtectedResourceProxy<P, V, E>>
 where
     V: AccessTokenValidator + ProvideValidatorMetadata,
 {
     /// Configures rejection bodies while retaining the resource definition and
-    /// prepared metadata. See [`AuthProxy::error_body`] for renderer semantics.
+    /// prepared metadata. See [`ProtectedResourceProxy::error_body`] for renderer semantics.
     #[must_use]
     pub fn error_body<NewE: ErrorBody>(
         self,
         error_body: NewE,
-    ) -> BoundResource<AuthProxy<P, V, NewE>> {
+    ) -> BoundResource<ProtectedResourceProxy<P, V, NewE>> {
         BoundResource {
             definition: self.definition,
             proxy: self.proxy.error_body(error_body),

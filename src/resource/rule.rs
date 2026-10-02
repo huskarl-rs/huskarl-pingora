@@ -3,7 +3,7 @@
 //! A [`Rule`] defines the authentication and authorization policy for a route:
 //! whether a token is required, optional, or unnecessary, plus optional
 //! audience, scope, and custom checks. Rules are registered on a
-//! [`Guard`](super::Guard) via its builder.
+//! [`ResourcePolicy`](super::ResourcePolicy) via its builder.
 
 use std::sync::Arc;
 
@@ -142,7 +142,7 @@ impl<C> Rule<C> {
     ///
     /// Attaching a check to a [`public`](Self::public) rule is a configuration
     /// error: the validator is never called for public routes, so the check
-    /// would never run. [`Guard::new`](crate::resource::Guard) returns
+    /// would never run. Building [`ResourcePolicy`](crate::resource::ResourcePolicy) returns
     /// [`ConfigError::PublicRuleWithConstraints`](crate::resource::error::ConfigError)
     /// if a public rule carries a check function.
     pub fn check(

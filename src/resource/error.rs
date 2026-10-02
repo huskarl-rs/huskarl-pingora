@@ -1,6 +1,6 @@
 //! Error types for the resource server module.
 //!
-//! [`ConfigError`] covers build-time issues with [`Guard`](super::Guard)
+//! [`ConfigError`] covers build-time issues with [`ResourcePolicy`](super::ResourcePolicy)
 //! construction (invalid route patterns, unreachable constraints on public
 //! rules, metadata serialization failures). Internal error helpers map
 //! validation outcomes to [RFC 6750] challenge responses.
@@ -11,8 +11,8 @@ use crate::resource_server::error::{
     Challenge, ToRfc6750Error, TokenErrorCode, TokenValidationError,
 };
 
-/// Errors that can occur when building or configuring a [`Guard`](super::Guard)
-/// or [`AuthProxy`](super::AuthProxy).
+/// Errors when validating [`ResourcePolicy`](super::ResourcePolicy), binding a
+/// [`BoundResource`](super::BoundResource), or collecting metadata endpoints.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ConfigError {
@@ -33,8 +33,6 @@ pub enum ConfigError {
     PublicRuleWithConstraints(String),
     /// Failed to serialize resource metadata.
     Metadata(serde_json::Error),
-    /// Invalid mapping between ingress paths and public URLs.
-    UrlMapping(crate::resource_server::core::url_mapping::MappingError),
     /// Validator metadata unexpectedly could not produce a resource document.
     ResourceMetadataDocumentUnavailable,
     /// The derived RFC 9728 resource identifier is invalid.
@@ -44,21 +42,6 @@ pub enum ConfigError {
         /// A human-readable reason.
         reason: &'static str,
     },
-    /// The base URI used for `DPoP` request reconstruction is invalid.
-    InvalidBaseUri {
-        /// The offending base URI.
-        base_uri: String,
-        /// A human-readable reason.
-        reason: &'static str,
-    },
-    /// Protected-resource metadata was enabled without the trusted public base
-    /// URI also required for `DPoP` reconstruction.
-    MissingBaseUri,
-    /// A protected-resource subpath is invalid.
-    InvalidResourcePath {
-        /// The offending subpath.
-        path: String,
-    },
     /// A metadata publisher was given an endpoint for a different public
     /// origin than the endpoints it already owns.
     ResourceMetadataOriginMismatch {
@@ -66,18 +49,6 @@ pub enum ConfigError {
         endpoint: String,
         /// The public origin established by the first published endpoint.
         expected_origin: String,
-    },
-    /// The configured `resource` identifier is not a URL RFC 9728 §3.1 can derive a
-    /// Protected Resource Metadata URL from — it must be absolute HTTPS with no
-    /// fragment.
-    ///
-    /// This is a configuration error so the proxy cannot advertise an
-    /// identifier from which clients could not locate a metadata document.
-    ResourceMetadataUrl {
-        /// The offending resource identifier.
-        resource: String,
-        /// Why the derivation failed.
-        source: crate::resource_server::core::Error,
     },
     /// A validator advertises a metadata URL other than the local endpoint
     /// derived from the configured resource identifier.
@@ -87,19 +58,11 @@ pub enum ConfigError {
         /// URL derived for the local endpoint.
         derived: String,
     },
-    /// This auth integration was already bound to a protected resource.
-    ProtectedResourceAlreadyConfigured,
     /// More than one document was registered for the same canonical metadata
     /// path and query.
     DuplicateResourceMetadataEndpoint {
         /// The complete path and optional query shared by the documents.
         path_and_query: String,
-    },
-    /// A protected resource was configured without any acceptable token
-    /// audience.
-    EmptyResourceAudiences {
-        /// The protected-resource identifier.
-        resource: String,
     },
     /// A registered route pattern is non-canonical: it carries a structural byte
     /// (`%2F`, `..`, `//`, `;`, or an enabled opt-in form) that the path-confusion
@@ -135,7 +98,6 @@ impl std::fmt::Display for ConfigError {
                  that can never be enforced: the token validator is not called for public routes"
             ),
             Self::Metadata(_) => f.write_str("failed to serialize resource metadata"),
-            Self::UrlMapping(source) => write!(f, "invalid public URL mapping: {source}"),
             Self::ResourceMetadataDocumentUnavailable => {
                 f.write_str("validator metadata could not produce an RFC 9728 document")
             }
@@ -145,26 +107,12 @@ impl std::fmt::Display for ConfigError {
                     "invalid protected-resource identifier {resource:?}: {reason}"
                 )
             }
-            Self::InvalidBaseUri { base_uri, reason } => {
-                write!(f, "invalid DPoP base URI {base_uri:?}: {reason}")
-            }
-            Self::MissingBaseUri => f.write_str(
-                "a protected resource requires the public base URI used for DPoP reconstruction",
-            ),
-            Self::InvalidResourcePath { path } => {
-                write!(f, "invalid protected-resource subpath {path:?}")
-            }
             Self::ResourceMetadataOriginMismatch {
                 endpoint,
                 expected_origin,
             } => write!(
                 f,
                 "metadata endpoint {endpoint:?} is outside publisher origin {expected_origin:?}"
-            ),
-            Self::ResourceMetadataUrl { resource, .. } => write!(
-                f,
-                "resource identifier {resource:?} cannot be used to derive an \
-                 RFC 9728 metadata URL"
             ),
             Self::ResourceMetadataUrlMismatch {
                 configured,
@@ -173,16 +121,9 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "validator metadata URL {configured:?} does not match local endpoint {derived:?}"
             ),
-            Self::ProtectedResourceAlreadyConfigured => {
-                f.write_str("this auth integration already has a protected resource")
-            }
             Self::DuplicateResourceMetadataEndpoint { path_and_query } => write!(
                 f,
                 "protected-resource metadata is already published at {path_and_query:?}"
-            ),
-            Self::EmptyResourceAudiences { resource } => write!(
-                f,
-                "protected resource {resource:?} must accept at least one token audience"
             ),
             Self::NonCanonicalPattern { pattern } => write!(
                 f,
@@ -204,20 +145,13 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Metadata(e) => Some(e),
-            Self::UrlMapping(e) => Some(e),
-            Self::ResourceMetadataUrl { source, .. } => Some(source),
             Self::Route { .. }
             | Self::PublicRuleWithConstraints(_)
             | Self::ResourceMetadataDocumentUnavailable
             | Self::InvalidResourceIdentifier { .. }
-            | Self::InvalidBaseUri { .. }
-            | Self::MissingBaseUri
-            | Self::InvalidResourcePath { .. }
             | Self::ResourceMetadataOriginMismatch { .. }
             | Self::ResourceMetadataUrlMismatch { .. }
-            | Self::ProtectedResourceAlreadyConfigured
             | Self::DuplicateResourceMetadataEndpoint { .. }
-            | Self::EmptyResourceAudiences { .. }
             | Self::NonCanonicalPattern { .. }
             | Self::NonCanonicalCasePattern { .. } => None,
         }

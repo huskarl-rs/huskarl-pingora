@@ -16,7 +16,7 @@ For bearer-only applications, use `default-features = false` with `resource`,
 
 ## Names and ownership
 
-Set `Guard::builder().metrics_name("inventory")`,
+Set `ResourcePolicy::builder().metrics_name("inventory")`,
 `LoginProxy::builder().metrics_name("browser")`, or
 `ResourceAssembly::new(mapping).metrics_name("edge")`. Every local series has a
 `name` label; unnamed instances emit `name=""`. Names must be stable deployment
@@ -82,9 +82,23 @@ or nested auth proxies each own their evaluation; their counts are evaluations,
 not globally deduplicated requests. Give independently meaningful instances
 distinct names.
 
+One owner applies to each logical observation, not to the whole request: a
+proxy and its wrapper must not both report the same proxy decision, while two
+distinct policy gates may each report their own decision. These counters alone
+do not provide an overall rejection rate for all requests entering an assembly.
+That would require a separate assembly-owned counter and a decision-reporting
+contract with its branches, including explicit treatment of metadata, fallback,
+and branches without authentication. No such aggregate counter is emitted.
+
 `forward` permits the inner proxy to continue. It does not prove upstream
 contact, application authorization, a cache hit, or successful response delivery.
 Checks in an inner application are outside this metric's authorization boundary.
+
+Axum's `huskarl.axum.resource.middleware_completion` has a different population:
+it counts only middleware calls that return a response and shares one observation
+across nested validators. A later service error or cancellation can exclude an
+Axum sample after authorization passed; it does not erase a Pingora decision.
+Do not combine these counters into a cross-framework authorization rate.
 
 ### Login outcomes
 

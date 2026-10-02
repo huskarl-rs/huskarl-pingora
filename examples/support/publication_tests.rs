@@ -128,17 +128,22 @@ fn branch(
 ) -> BoundResource<Route<AppContext>> {
     let definition =
         ResourceDefinition::new(mapping, path, AudienceBinding::ResourceIdentifier).unwrap();
-    let guard = Guard::builder()
-        .validator(Validator {
-            observed: Arc::clone(observed),
-            audience: definition.resource().to_owned(),
-        })
+    let validator = Validator {
+        observed: Arc::clone(observed),
+        audience: definition.resource().to_owned(),
+    };
+    let policy = ResourcePolicy::builder()
         .path_guard(guard_config())
         .build()
         .unwrap();
-    BoundResource::new(definition, guard, Application(Arc::clone(observed)))
-        .unwrap()
-        .into_route()
+    BoundResource::new(
+        definition,
+        validator,
+        policy,
+        Application(Arc::clone(observed)),
+    )
+    .unwrap()
+    .into_route()
 }
 
 async fn exchange(
@@ -334,7 +339,7 @@ fn convenience_assembly_consumes_bound_resource_without_repreparing() {
     let bound = branch(mapping.clone(), "/", &observed);
     assert_eq!(bound.definition().metadata_uri(), bound.metadata().uri());
     let prepared = observed.prepared.load(Ordering::SeqCst);
-    assert!(prepared > 0);
+    assert_eq!(prepared, 1, "binding prepares metadata exactly once");
     let _proxy = huskarl_pingora::resource::assembly::ResourceAssembly::new(mapping)
         .register_bound(bound)
         .unwrap()

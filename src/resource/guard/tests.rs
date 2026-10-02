@@ -119,17 +119,14 @@ fn build_guard(
     validator: MockValidator,
     routes: Vec<(&str, Rule<MockClaims>)>,
 ) -> Guard<MockValidator> {
-    let mut builder =
-        Guard::builder()
-            .validator(validator)
-            .path_guard(crate::resource::GuardConfig::new(
-                crate::resource::CaseSensitivity::Sensitive,
-                crate::resource::DecodeDepth::UpToOne,
-            ));
+    let mut builder = ResourcePolicy::builder().path_guard(crate::resource::GuardConfig::new(
+        crate::resource::CaseSensitivity::Sensitive,
+        crate::resource::DecodeDepth::UpToOne,
+    ));
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
-    builder.build().unwrap()
+    Guard::new(validator, builder.build().unwrap(), None)
 }
 
 fn build_guard_with_base_uri(
@@ -138,18 +135,18 @@ fn build_guard_with_base_uri(
     base_uri: &str,
     strip_prefix: Option<&str>,
 ) -> Guard<MockValidator> {
-    let mut builder = Guard::builder()
-        .validator(validator)
-        .path_guard(crate::resource::GuardConfig::new(
-            crate::resource::CaseSensitivity::Sensitive,
-            DecodeDepth::UpToOne,
-        ))
-        .base_uri(base_uri.parse().unwrap())
-        .maybe_strip_prefix(strip_prefix);
+    let mut builder = ResourcePolicy::builder().path_guard(crate::resource::GuardConfig::new(
+        crate::resource::CaseSensitivity::Sensitive,
+        DecodeDepth::UpToOne,
+    ));
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
-    builder.build().unwrap()
+    Guard::new(
+        validator,
+        builder.build().unwrap(),
+        Some(PublicUrlMapping::new(base_uri, strip_prefix.unwrap_or("/")).unwrap()),
+    )
 }
 
 async fn check(
@@ -187,15 +184,36 @@ fn subtree_guard(
     pattern: &str,
     rule: Rule<MockClaims>,
 ) -> Guard<MockValidator> {
-    Guard::builder()
-        .validator(validator)
+    crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .subtree(pattern, rule)
         .build()
+        .map(|policy| Guard::new(validator, policy, None))
         .unwrap()
+}
+
+fn bind_guard<V: AccessTokenValidator + ProvideValidatorMetadata>(
+    guard: Guard<V>,
+    resource: &str,
+) -> Result<(Guard<V>, ResourceMetadataConfig), ConfigError> {
+    use crate::resource_server::resource::{AudienceBinding, ResourceDefinition};
+    let uri: http::Uri = resource.parse().unwrap();
+    let origin = format!(
+        "{}://{}",
+        uri.scheme_str().unwrap(),
+        uri.authority().unwrap()
+    );
+    let definition = ResourceDefinition::new(
+        PublicUrlMapping::new(&origin, "/").unwrap(),
+        uri.path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str),
+        AudienceBinding::ResourceIdentifier,
+    )
+    .unwrap();
+    Guard::for_resource(guard.validator, guard.policy, &definition)
 }
 
 // --- Outcome assertions ---
@@ -232,15 +250,13 @@ fn assert_forward_authed(outcome: &Outcome<MockClaims>) {
 #[test]
 fn resource_metadata_with_resource_path() {
     let guard = build_guard(MockValidator::no_token(), vec![]);
-    let config = guard
-        .build_resource_metadata("https://api.example.com/tenant1?version=1")
-        .unwrap();
+    let (guard, config) = bind_guard(guard, "https://api.example.com/tenant1?version=1").unwrap();
     assert_eq!(
         config.endpoint_uri.path_and_query().unwrap().as_str(),
         "/.well-known/oauth-protected-resource/tenant1?version=1"
     );
     assert_eq!(
-        config.validator_metadata.resource_metadata.as_deref(),
+        guard.metadata.resource_metadata.as_deref(),
         Some("https://api.example.com/.well-known/oauth-protected-resource/tenant1?version=1")
     );
     let value: serde_json::Value = serde_json::from_slice(&config.body).unwrap();
@@ -253,9 +269,7 @@ fn resource_metadata_with_resource_path() {
 #[test]
 fn resource_metadata_root_path_no_suffix() {
     let guard = build_guard(MockValidator::no_token(), vec![]);
-    let config = guard
-        .build_resource_metadata("https://api.example.com/")
-        .unwrap();
+    let (_guard, config) = bind_guard(guard, "https://api.example.com/").unwrap();
     assert_eq!(
         config.endpoint_uri.path(),
         "/.well-known/oauth-protected-resource"
@@ -305,15 +319,10 @@ async fn advertised_metadata_url_matches_the_served_path() {
         "https://api.example.com/tenant1",
     ] {
         let guard = build_guard(MockValidator::no_token(), vec![("/api", Rule::required())]);
-        let config = guard.build_resource_metadata(resource).unwrap();
+        let (guard, config) = bind_guard(guard, resource).unwrap();
 
-        let outcome = check_with_metadata(
-            &guard,
-            &http::Method::GET,
-            "/api",
-            &config.validator_metadata,
-        )
-        .await;
+        let outcome =
+            check_with_metadata(&guard, &http::Method::GET, "/api", &guard.metadata).await;
         let challenges = deny_challenges(&outcome).expect("expected a denial");
         let advertised = advertised_metadata_url(challenges)
             .unwrap_or_else(|| unreachable!("no metadata URL for {resource}: {challenges:?}"));
@@ -333,29 +342,35 @@ async fn one_origin_can_back_distinct_resource_guards() {
     for resource_path in ["payments", "inventory"] {
         let resource = format!("https://api.example.com/{resource_path}");
         let request_path = format!("/{resource_path}/item");
-        let guard = Guard::builder()
-            .validator(MockValidator::no_token())
+        let guard = crate::resource::ResourcePolicy::builder()
             .path_guard(crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
                 DecodeDepth::UpToOne,
             ))
-            .base_uri("https://api.example.com".parse().unwrap())
             .route(&request_path, Rule::required())
             .build()
+            .map(|policy| {
+                Guard::new(
+                    MockValidator::no_token(),
+                    policy,
+                    Some(
+                        crate::resource_server::core::url_mapping::PublicUrlMapping::new(
+                            "https://api.example.com",
+                            "/",
+                        )
+                        .unwrap(),
+                    ),
+                )
+            })
             .unwrap();
-        let config = guard.build_resource_metadata(&resource).unwrap();
+        let (guard, config) = bind_guard(guard, &resource).unwrap();
         assert_eq!(
             config.endpoint_uri.path(),
             format!("/.well-known/oauth-protected-resource/{resource_path}")
         );
 
-        let outcome = check_with_metadata(
-            &guard,
-            &http::Method::GET,
-            &request_path,
-            &config.validator_metadata,
-        )
-        .await;
+        let outcome =
+            check_with_metadata(&guard, &http::Method::GET, &request_path, &guard.metadata).await;
         let challenges = deny_challenges(&outcome).expect("expected a denial");
         assert_eq!(
             advertised_metadata_url(challenges),
@@ -412,14 +427,14 @@ async fn explicit_validator_metadata_url_is_not_overwritten() {
         }
     }
 
-    let guard = Guard::builder()
-        .validator(CustomUrlValidator(MockValidator::no_token()))
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .route("/api", Rule::required())
         .build()
+        .map(|policy| Guard::new(CustomUrlValidator(MockValidator::no_token()), policy, None))
         .unwrap();
 
     // Called directly: the shared `check` helper is typed to `Guard<MockValidator>`.
@@ -439,58 +454,19 @@ async fn explicit_validator_metadata_url_is_not_overwritten() {
     );
 
     assert!(matches!(
-        guard.build_resource_metadata("https://api.example.com"),
+        bind_guard(guard, "https://api.example.com"),
         Err(ConfigError::ResourceMetadataUrlMismatch { .. })
     ));
 }
 
-/// Invalid or insecure identifiers are rejected by the operation that uses them.
 #[test]
-fn resource_metadata_rejects_invalid_resource_identifiers() {
-    for resource in [
-        "/api",
-        "http://api.example.com",
-        "ftp://api.example.com",
-        "https://api.example.com/path#fragment",
-    ] {
-        let guard = Guard::builder()
-            .validator(MockValidator::no_token())
-            .path_guard(crate::resource::GuardConfig::new(
-                crate::resource::CaseSensitivity::Sensitive,
-                DecodeDepth::UpToOne,
-            ))
-            .route("/api", Rule::required())
-            .build()
-            .unwrap();
-        let result = guard.build_resource_metadata(resource);
-
-        assert!(
-            matches!(result, Err(ConfigError::InvalidResourceIdentifier { .. })),
-            "expected InvalidResourceIdentifier for {resource:?}",
-        );
-    }
-}
-
-#[test]
-fn invalid_dpop_base_uri_is_a_build_error() {
-    for base_uri in [
+fn invalid_public_mapping_is_a_build_error() {
+    for base in [
         "/api",
         "ftp://api.example.com",
         "https://api.example.com/base?tenant=one",
     ] {
-        let result = Guard::builder()
-            .validator(MockValidator::no_token())
-            .path_guard(crate::resource::GuardConfig::new(
-                crate::resource::CaseSensitivity::Sensitive,
-                DecodeDepth::UpToOne,
-            ))
-            .base_uri(base_uri.parse().unwrap())
-            .build();
-
-        assert!(
-            matches!(result, Err(ConfigError::InvalidBaseUri { .. })),
-            "expected InvalidBaseUri for {base_uri:?}"
-        );
+        assert!(PublicUrlMapping::new(base, "/").is_err());
     }
 }
 
@@ -503,11 +479,9 @@ fn resource_metadata_includes_scopes() {
             ("/read", Rule::required().scopes(["read"])),
         ],
     );
-    let config = guard
-        .build_resource_metadata("https://api.example.com")
-        .unwrap();
+    let (_guard, config) = bind_guard(guard, "https://api.example.com").unwrap();
     let value: serde_json::Value = serde_json::from_slice(&config.body).unwrap();
-    assert_eq!(value["resource"], "https://api.example.com");
+    assert_eq!(value["resource"], "https://api.example.com/");
     let scopes = value["scopes_supported"].as_array().unwrap();
     let scope_strs: Vec<&str> = scopes.iter().map(|v| v.as_str().unwrap()).collect();
     // BTreeSet orders alphabetically
@@ -517,9 +491,7 @@ fn resource_metadata_includes_scopes() {
 #[test]
 fn resource_metadata_no_scopes_omits_field() {
     let guard = build_guard(MockValidator::no_token(), vec![]);
-    let config = guard
-        .build_resource_metadata("https://api.example.com")
-        .unwrap();
+    let (_guard, config) = bind_guard(guard, "https://api.example.com").unwrap();
     let value: serde_json::Value = serde_json::from_slice(&config.body).unwrap();
     assert!(value.get("scopes_supported").is_none());
 }
@@ -577,8 +549,7 @@ async fn optional_route_valid_token_forwards_with_token() {
 
 #[tokio::test]
 async fn default_rule_applies_to_unmatched_paths() {
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -586,6 +557,7 @@ async fn default_rule_applies_to_unmatched_paths() {
         .route("/health", Rule::public())
         .default(Rule::optional())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/health").await;
@@ -837,8 +809,7 @@ async fn subtree_covers_path_and_descendants() {
 
 #[tokio::test]
 async fn subtree_exact_route_carve_out_wins() {
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -846,6 +817,7 @@ async fn subtree_exact_route_carve_out_wins() {
         .subtree("/admin", Rule::required())
         .route("/admin/health", Rule::public())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     // The more-specific exact route is public — no token still forwards.
@@ -939,16 +911,26 @@ async fn guard_400_challenges_carry_no_scope_hint() {
     );
 
     // Unreconstructable URI (strip_prefix mismatch): same rule-independent 400.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
-        .base_uri("https://api.example.com".parse().unwrap())
-        .strip_prefix("/proxy")
         .default(Rule::required().scopes(["admin"]))
         .build()
+        .map(|policy| {
+            Guard::new(
+                MockValidator::no_token(),
+                policy,
+                Some(
+                    crate::resource_server::core::url_mapping::PublicUrlMapping::new(
+                        "https://api.example.com",
+                        "/proxy",
+                    )
+                    .unwrap(),
+                ),
+            )
+        })
         .unwrap();
     let (status, challenges) = deny_parts(check(&guard, &http::Method::GET, "/other/users").await);
     assert_eq!(status, Some(http::StatusCode::BAD_REQUEST));
@@ -987,14 +969,14 @@ async fn blob_subtree_tolerates_structural_byte_in_key() {
     // `blob_subtree` declares the tail an opaque key space. Tolerance is scoped to the
     // subtree: an encoded slash in the key forwards, as does a climb that resolves
     // inside the blob — but a climb that escapes it still denies.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .blob_subtree("/files", Rule::public())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     let forwarded = check(&guard, &http::Method::GET, "/files/a%2fb").await;
@@ -1010,8 +992,7 @@ async fn blob_subtree_tolerates_structural_byte_in_key() {
 #[tokio::test]
 async fn method_specific_rule_closes_other_methods_no_backtrack() {
     // A method gap denies rather than escaping into a broader public catch-all.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -1019,6 +1000,7 @@ async fn method_specific_rule_closes_other_methods_no_backtrack() {
         .route("/{*rest}", Rule::public()) // catch-all, any method, public
         .route("/admin", Rule::public().method(http::Method::GET)) // GET /admin public
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     // GET /admin → its GET rule → public.
@@ -1036,8 +1018,7 @@ async fn method_specific_rule_closes_other_methods_no_backtrack() {
 async fn method_wildcard_fallback_is_per_terminal() {
     // A wildcard-method rule on the *same path* is the fallback for unlisted methods —
     // and it is not inherited from a broader catch-all (see the test above).
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -1045,6 +1026,7 @@ async fn method_wildcard_fallback_is_per_terminal() {
         .route("/admin", Rule::public().method(http::Method::GET)) // GET public
         .route("/admin", Rule::required()) // every other method requires a token
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     assert_forward(&check(&guard, &http::Method::GET, "/admin").await);
@@ -1057,8 +1039,7 @@ async fn method_wildcard_fallback_is_per_terminal() {
 #[tokio::test]
 async fn method_gap_denies_with_public_default() {
     // An unlisted method denies even when the default policy is public.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -1066,6 +1047,7 @@ async fn method_gap_denies_with_public_default() {
         .default(Rule::public()) // permissive fallback
         .route("/admin", Rule::required().method(http::Method::POST)) // only POST is protected
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     // POST /admin → its method rule → required → 401 without a token.
@@ -1082,15 +1064,15 @@ async fn method_gap_denies_with_public_default() {
 #[test]
 fn blob_subtree_with_nested_route_is_build_error() {
     // A more-specific route under the blob would let a structural byte relocate into it.
-    let result = Guard::builder()
-        .validator(MockValidator::no_token())
+    let result = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .blob_subtree("/files", Rule::public())
         .route("/files/secret", Rule::required())
-        .build();
+        .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::Route { .. })
@@ -1113,8 +1095,7 @@ async fn plain_subtree_scopes_structural_byte_to_its_uniformity() {
 
     // Registering a distinct rule under the subtree breaks that uniformity — the byte
     // could now relocate the path across a rule boundary, so it goes back to denying.
-    let nested = Guard::builder()
-        .validator(MockValidator::no_token())
+    let nested = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -1122,6 +1103,7 @@ async fn plain_subtree_scopes_structural_byte_to_its_uniformity() {
         .subtree("/files", Rule::public())
         .route("/files/secret", Rule::required())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     let denied = check(&nested, &http::Method::GET, "/files/a%2fb").await;
@@ -1166,8 +1148,7 @@ async fn guard_rejects_long_suspicious_path() {
 async fn guard_off_allows_traversal() {
     // With the guard disabled, `/x/../admin/secret` falls to the default
     // (required) rule and is denied for the missing token (401), not 400.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(
             crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
@@ -1177,6 +1158,7 @@ async fn guard_off_allows_traversal() {
         )
         .subtree("/admin", Rule::required().scopes(["admin"]))
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/x/../admin/secret").await;
@@ -1188,15 +1170,15 @@ async fn guard_off_allows_traversal() {
 #[test]
 fn build_rejects_pattern_with_empty_segment() {
     // An interior empty segment is not representable in the route grammar.
-    let result = Guard::builder()
-        .validator(MockValidator::no_token())
+    let result = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .route("/a/b", Rule::public())
         .route("/a//b", Rule::required())
-        .build();
+        .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::Route { pattern, reason })
@@ -1207,14 +1189,14 @@ fn build_rejects_pattern_with_empty_segment() {
 #[test]
 fn build_rejects_traversal_pattern() {
     // `/x/../b` carries a `..` dot-segment → non-canonical.
-    let result = Guard::builder()
-        .validator(MockValidator::no_token())
+    let result = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .route("/x/../b", Rule::required())
-        .build();
+        .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::NonCanonicalPattern { .. })
@@ -1225,8 +1207,7 @@ fn build_rejects_traversal_pattern() {
 fn build_allows_noncanonical_pattern_when_guard_off() {
     // With the guard off, the build-time non-canonical-pattern check is skipped, so a
     // pattern carrying a structural byte (here `%2f`) is accepted as a literal route.
-    let result = Guard::builder()
-        .validator(MockValidator::no_token())
+    let result = crate::resource::ResourcePolicy::builder()
         .path_guard(
             crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
@@ -1236,7 +1217,8 @@ fn build_allows_noncanonical_pattern_when_guard_off() {
         )
         .route("/a/b", Rule::public())
         .route("/a%2fb", Rule::required())
-        .build();
+        .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
     assert!(result.is_ok());
 }
 
@@ -1244,14 +1226,14 @@ fn build_allows_noncanonical_pattern_when_guard_off() {
 fn build_rejects_public_rule_with_check() {
     // A check function on a public rule can never run — the validator is skipped
     // for public routes. Reject it at build time rather than store a dead check.
-    let result = Guard::builder()
-        .validator(MockValidator::no_token())
+    let result = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .route("/health", Rule::public().check(|_| Ok(())))
-        .build();
+        .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::PublicRuleWithConstraints(p)) if p == "/health"
@@ -1260,14 +1242,14 @@ fn build_rejects_public_rule_with_check() {
 
 #[test]
 fn build_rejects_public_default_rule_with_check() {
-    let result = Guard::builder()
-        .validator(MockValidator::no_token())
+    let result = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .default(Rule::public().check(|_| Ok(())))
-        .build();
+        .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::PublicRuleWithConstraints(p)) if p == "<default>"
@@ -1277,15 +1259,15 @@ fn build_rejects_public_default_rule_with_check() {
 #[test]
 fn build_allows_distinct_canonical_trailing_slash_routes() {
     // Both `/admin` and `/admin/` are canonical (no structural bytes) → no conflict.
-    let result = Guard::builder()
-        .validator(MockValidator::no_token())
+    let result = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .route("/admin", Rule::public())
         .route("/admin/", Rule::required())
-        .build();
+        .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
     assert!(result.is_ok());
 }
 
@@ -1293,14 +1275,14 @@ fn build_allows_distinct_canonical_trailing_slash_routes() {
 
 #[tokio::test]
 async fn structural_case_opt_in_catches_relocation() {
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Insensitive,
             DecodeDepth::UpToOne,
         ))
         .subtree("/admin", Rule::required())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     // `/Admin/x` carries uppercase a case-insensitive backend would fold onto the
@@ -1326,8 +1308,7 @@ async fn hygiene_rejects_noncanonical_even_when_same_rule() {
     use crate::resource::GuardMode;
     // `/files/a%2fb` stays in the same `/files` rule (no relocation), so the default
     // RejectStructural allows it (inert blob key) — but strict hygiene rejects it.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(
             crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
@@ -1337,6 +1318,7 @@ async fn hygiene_rejects_noncanonical_even_when_same_rule() {
         )
         .subtree("/files", Rule::public())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/files/a%2fb").await;
@@ -1346,8 +1328,7 @@ async fn hygiene_rejects_noncanonical_even_when_same_rule() {
 #[tokio::test]
 async fn hygiene_allows_canonical_path() {
     use crate::resource::GuardMode;
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(
             crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
@@ -1357,6 +1338,7 @@ async fn hygiene_allows_canonical_path() {
         )
         .subtree("/files", Rule::public())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     // A clean path is canonical → allowed (public → forward).
@@ -1382,8 +1364,7 @@ impl crate::resource::StructuralProbe for DangerPrefixProbe {
 #[tokio::test]
 async fn custom_probe_denies_aliased_prefix() {
     use crate::resource::StructuralClasses;
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(
             crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
@@ -1393,6 +1374,7 @@ async fn custom_probe_denies_aliased_prefix() {
         )
         .subtree("/admin", Rule::required().scopes(["admin"]))
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     // `/danger/secret` carries the probe's form → denied 400 (break-glass).
@@ -1406,8 +1388,7 @@ async fn structural_overlong_opt_in_catches_relocation() {
     // A backend that decodes overlong UTF-8 reads `/x%c0%af..%c0%afadmin/secret`
     // as `/x/../admin/secret` → `/admin/secret`; with the overlong forms recognised
     // the structural scan reveals the `..` and denies it.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(
             crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
@@ -1420,6 +1401,7 @@ async fn structural_overlong_opt_in_catches_relocation() {
         )
         .subtree("/admin", Rule::required())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/x%c0%af..%c0%afadmin/secret").await;
@@ -1442,14 +1424,14 @@ async fn structural_null_truncation_denied_by_default() {
     // A NUL-terminating backend reads `/admin%00/secret` as `/admin`. The truncation
     // class is always-on in huskarl-route-guard (a NUL has no legitimate use in a
     // path), so the default configuration denies the `%00` — no opt-in needed.
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .subtree("/admin", Rule::required())
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/admin%00/secret").await;
@@ -1776,14 +1758,20 @@ async fn rejection_builds_exactly_one_challenge() {
     }
 
     let counter = std::sync::Arc::new(ChallengeCounter::default());
-    let guard = Guard::builder()
-        .validator(CountingValidator(std::sync::Arc::clone(&counter)))
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(crate::resource::GuardConfig::new(
             crate::resource::CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
         ))
         .route("/api", Rule::required())
         .build()
+        .map(|policy| {
+            Guard::new(
+                CountingValidator(std::sync::Arc::clone(&counter)),
+                policy,
+                None,
+            )
+        })
         .unwrap();
 
     let outcome = guard
@@ -1897,8 +1885,7 @@ fn metrics_insufficient_scope_on_missing_scope() {
 #[cfg(feature = "metrics")]
 fn metrics_name_label_present_when_configured() {
     let (_, counters) = with_metrics(async {
-        let guard = Guard::builder()
-            .validator(MockValidator::no_token())
+        let guard = crate::resource::ResourcePolicy::builder()
             .path_guard(crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
                 DecodeDepth::UpToOne,
@@ -1906,6 +1893,7 @@ fn metrics_name_label_present_when_configured() {
             .metrics_name("edge")
             .route("/health", Rule::public())
             .build()
+            .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
             .unwrap();
         check(&guard, &http::Method::GET, "/health").await
     });
@@ -1926,8 +1914,7 @@ fn metrics_name_label_present_when_configured() {
 
 #[tokio::test]
 async fn disabled_guard_still_denies_method_gaps() {
-    let guard = Guard::builder()
-        .validator(MockValidator::no_token())
+    let guard = crate::resource::ResourcePolicy::builder()
         .path_guard(
             crate::resource::GuardConfig::new(
                 crate::resource::CaseSensitivity::Sensitive,
@@ -1938,6 +1925,7 @@ async fn disabled_guard_still_denies_method_gaps() {
         .default(Rule::public())
         .route("/admin", Rule::public().method(http::Method::GET))
         .build()
+        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
         .unwrap();
     assert_deny(
         &check(&guard, &http::Method::POST, "/admin").await,
@@ -1949,8 +1937,7 @@ async fn disabled_guard_still_denies_method_gaps() {
 #[tokio::test]
 async fn configured_analysis_budget_applies_to_encoded_paths() {
     for (budget, allowed) in [(8, false), (64, true)] {
-        let guard = Guard::builder()
-            .validator(MockValidator::no_token())
+        let guard = crate::resource::ResourcePolicy::builder()
             .path_guard(
                 crate::resource::GuardConfig::new(
                     crate::resource::CaseSensitivity::Sensitive,
@@ -1960,6 +1947,7 @@ async fn configured_analysis_budget_applies_to_encoded_paths() {
             )
             .subtree("/files", Rule::public())
             .build()
+            .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
             .unwrap();
         let outcome = check(&guard, &http::Method::GET, "/files/a%2Fb").await;
         if allowed {

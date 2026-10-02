@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use huskarl_pingora::{
-    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, GuardConfig, Rule},
+    resource::{AuthCtx, AuthProxy, CaseSensitivity, DecodeDepth, Guard, GuardConfig, ResourcePolicy, Rule},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
         validator::rfc9068::Rfc9068Validator,
@@ -82,8 +82,7 @@ async fn main() {
     //    `subtree` protects a path and everything beneath it; `route`
     //    matches one exact path. Unmatched paths use the default
     //    (`Rule::required()`), so the whole proxy is closed by default.
-    let guard = Guard::builder()
-        .validator(validator)
+    let policy = ResourcePolicy::builder()
         .path_guard(GuardConfig::new(
             CaseSensitivity::Sensitive,
             DecodeDepth::UpToOne,
@@ -91,8 +90,9 @@ async fn main() {
         .subtree("/api", Rule::required().scopes(["api"])) // /api and below
         .route("/health", Rule::public()) // exactly /health
         .build()
-        .expect("guard");
+        .expect("policy");
 
+    let guard = Guard::new(validator, policy, None);
     let proxy = AuthProxy::new(MyProxy, guard);
     // pass `proxy` to pingora — it implements ProxyHttp
 }

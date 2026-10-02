@@ -20,7 +20,7 @@ let path_guard = GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToO
 ```
 
 Pass this value to `.path_guard(path_guard)` on `LoginProxy::builder()` or
-`Guard::builder()`. The tutorial's small Python upstream compares the path
+`ResourcePolicy::builder()`. The tutorial's small Python upstream compares the path
 without decoding or case folding, so these declarations cover it.
 
 ## 2. Add structural forms your downstream accepts

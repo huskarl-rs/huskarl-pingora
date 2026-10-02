@@ -2,10 +2,10 @@
 
 For server integration, construct a `BoundResource` once. Its private fields keep
 its definition, authenticated branch, and prepared metadata together until the
-consuming server installs them. Existing low-level binding APIs remain available.
+consuming server installs them. Standalone authentication uses `Guard` and `AuthProxy` without a definition.
 
 Pingora exposes `resource::BoundResource`. Construct it with the definition,
-guard, and inner proxy; use `into_route()` when collecting heterogeneous branches.
+validator, validated policy, and inner proxy; use `into_route()` when collecting heterogeneous branches.
 `ResourceAssembly::register_bound` consumes that routed bundle. Existing
 `ResourceAssembly::register` constructs the same bundle internally.
 
@@ -23,16 +23,16 @@ accidental mixing before handoff; it cannot prevent an arbitrary router from
 mounting the extracted parts incorrectly.
 
 ```rust
-use huskarl_pingora::resource::{AuthProxy, BoundResource, ConfigError, Guard};
+use huskarl_pingora::resource::{ProtectedResourceProxy, BoundResource, ConfigError, ResourcePolicy};
 use huskarl_pingora::resource_server::{
     resource::ResourceDefinition,
     validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata},
 };
-fn bind<P, V>(definition: ResourceDefinition, guard: Guard<V>, inner: P)
-    -> Result<BoundResource<AuthProxy<P, V>>, ConfigError>
+fn bind<P, V>(definition: ResourceDefinition, validator: V, policy: ResourcePolicy<V::Claims>, inner: P)
+    -> Result<BoundResource<ProtectedResourceProxy<P, V>>, ConfigError>
 where V: AccessTokenValidator + ProvideValidatorMetadata
 {
-    BoundResource::new(definition, guard, inner)
+    BoundResource::new(definition, validator, policy, inner)
 }
 ```
 

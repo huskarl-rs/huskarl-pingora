@@ -36,20 +36,26 @@ authentication handling:
 
 ```rust
 use huskarl_pingora::resource::{
-    AudienceBinding, AuthProxy, CaseSensitivity, DecodeDepth,
-    Guard, GuardConfig, ResourceMetadataProxy, Rule,
+    AudienceBinding, BoundResource, CaseSensitivity, DecodeDepth,
+    GuardConfig, ResourcePolicy, ResourceMetadataProxy, Rule,
 };
-# fn configure<P, V>(inner: P, validator: V) -> Result<(), huskarl_pingora::resource::ConfigError>
+use huskarl_pingora::resource_server::{
+    core::url_mapping::PublicUrlMapping, resource::ResourceDefinition,
+};
+# fn configure<P, V>(inner: P, validator: V) -> Result<(), Box<dyn std::error::Error>>
 # where V: huskarl_pingora::resource_server::validator::AccessTokenValidator
 #     + huskarl_pingora::resource_server::validator::metadata::ProvideValidatorMetadata {
-let guard = Guard::builder()
-    .validator(validator)
-    .base_uri("https://api.example.com".parse().expect("public origin"))
+let definition = ResourceDefinition::new(
+    PublicUrlMapping::new("https://api.example.com", "/")?,
+    "/mcp/inventory",
+    AudienceBinding::ResourceIdentifier,
+)?;
+let policy = ResourcePolicy::builder()
     .path_guard(GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
     .subtree("/mcp/inventory", Rule::required().scopes(["inventory.read"]))
     .build()?;
-let (inventory, metadata) = AuthProxy::new(inner, guard)
-    .with_protected_resource("/mcp/inventory", AudienceBinding::ResourceIdentifier)?;
+let bound = BoundResource::new(definition, validator, policy, inner)?;
+let (_definition, inventory, metadata) = bound.into_parts();
 let proxy = ResourceMetadataProxy::new(inventory).publish(metadata)?;
 # let _ = proxy;
 # Ok(())
@@ -69,7 +75,7 @@ protection for the whole listener. Keep discovery outside token validation.
 
 ## Add a second resource
 
-Build a separate `Guard` and resource-bound `AuthProxy` for payments. Publish
+Build a separate `ResourcePolicy` and `BoundResource` for payments. Publish
 both returned endpoints through one `ResourceMetadataProxy`. In a multi-resource
 server, route the registered metadata paths to that publisher in a separate branch,
 and route each protected subtree to its own auth proxy. Selection must happen
@@ -107,7 +113,7 @@ endpoints, use the advanced example below.
 ## Publish alongside security.txt
 
 The advanced `publication_proxy` example owns its server router and consumes the metadata returned by each
-`AuthProxy`, independently of `ResourceAssembly`. Set `SECURITY_TXT_FILE` to an
+`BoundResource`, independently of `ResourceAssembly`. Set `SECURITY_TXT_FILE` to an
 operator-maintained UTF-8 file to add `/.well-known/security.txt`. The server
 loads the file at startup; restart to publish changes. Supply a valid security.txt
 with your contact details and expiry. The example serves its bytes without

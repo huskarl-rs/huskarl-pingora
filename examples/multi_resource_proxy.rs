@@ -7,7 +7,7 @@
 //! For custom routing, rewrites and security.txt, see publication_proxy.
 use huskarl_pingora::{
     resource::{
-        AudienceBinding, CaseSensitivity, DecodeDepth, Guard, GuardConfig,
+        AudienceBinding, CaseSensitivity, DecodeDepth, GuardConfig, ResourcePolicy,
         assembly::ResourceAssembly,
     },
     resource_server::{core::url_mapping::PublicUrlMapping, resource::ResourceDefinition},
@@ -38,17 +38,16 @@ fn main() {
             let issuer =
                 std::env::var(format!("{name}_ISSUER")).expect("resource issuer is required");
             let validator = build_validator(&issuer, &definition.audiences()[0]).await;
-            let guard = Guard::builder()
-                .validator(validator)
+            let policy = ResourcePolicy::builder()
                 .path_guard(paths.clone())
                 .build()
-                .expect("invalid guard");
+                .expect("invalid policy");
             let upstream = Upstream {
                 address: std::env::var(format!("{name}_UPSTREAM"))
                     .unwrap_or_else(|_| default_upstream.into()),
             };
             server = server
-                .register(&definition, guard, upstream)
+                .register(&definition, validator, policy, upstream)
                 .expect("resource registration failed");
         }
         // The assembly checks overlaps and publishes both metadata contributions.
