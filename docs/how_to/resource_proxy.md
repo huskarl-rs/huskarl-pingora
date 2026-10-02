@@ -92,7 +92,7 @@ async fn main() {
         .build()
         .expect("policy");
 
-    let guard = Guard::new(validator, policy, None);
+    let guard = Guard::builder().validator(validator).policy(policy).build();
     let proxy = AuthProxy::new(MyProxy, guard);
     // pass `proxy` to pingora — it implements ProxyHttp
 }

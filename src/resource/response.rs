@@ -93,6 +93,7 @@ pub(crate) async fn write_resource_metadata_response(
 ///
 /// Sets the HTTP status code, appends each challenge as a `WWW-Authenticate`
 /// header, and optionally sets the `DPoP-Nonce` header.
+#[bon::builder]
 pub(crate) async fn write_challenge_response(
     session: &mut Session,
     status: http::StatusCode,
@@ -272,16 +273,14 @@ mod tests {
             "DPoP algs=\"ES256\"".to_owned(),
         ];
 
-        write_challenge_response(
-            &mut session,
-            http::StatusCode::UNAUTHORIZED,
-            &challenges,
-            None,
-            None,
-            &ErrorBodyResponse::default(),
-        )
-        .await
-        .unwrap();
+        write_challenge_response()
+            .session(&mut session)
+            .status(http::StatusCode::UNAUTHORIZED)
+            .challenges(&challenges)
+            .body(&ErrorBodyResponse::default())
+            .call()
+            .await
+            .unwrap();
 
         let resp = session.response_written().unwrap();
         assert_eq!(resp.status.as_u16(), 401);
@@ -301,16 +300,15 @@ mod tests {
     async fn challenge_response_with_dpop_nonce() {
         let (mut session, _client) = make_session("GET", "/api").await;
 
-        write_challenge_response(
-            &mut session,
-            http::StatusCode::UNAUTHORIZED,
-            &["Bearer".to_owned()],
-            Some("server-nonce-abc"),
-            None,
-            &ErrorBodyResponse::default(),
-        )
-        .await
-        .unwrap();
+        write_challenge_response()
+            .session(&mut session)
+            .status(http::StatusCode::UNAUTHORIZED)
+            .challenges(&["Bearer".to_owned()])
+            .dpop_nonce("server-nonce-abc")
+            .body(&ErrorBodyResponse::default())
+            .call()
+            .await
+            .unwrap();
 
         let resp = session.response_written().unwrap();
         assert_eq!(resp.headers.get("dpop-nonce").unwrap(), "server-nonce-abc");
@@ -320,16 +318,14 @@ mod tests {
     async fn challenge_response_omits_retry_after_when_absent() {
         let (mut session, _client) = make_session("GET", "/api").await;
 
-        write_challenge_response(
-            &mut session,
-            http::StatusCode::UNAUTHORIZED,
-            &["Bearer".to_owned()],
-            None,
-            None,
-            &ErrorBodyResponse::default(),
-        )
-        .await
-        .unwrap();
+        write_challenge_response()
+            .session(&mut session)
+            .status(http::StatusCode::UNAUTHORIZED)
+            .challenges(&["Bearer".to_owned()])
+            .body(&ErrorBodyResponse::default())
+            .call()
+            .await
+            .unwrap();
 
         let resp = session.response_written().unwrap();
         assert!(resp.headers.get("retry-after").is_none());
@@ -339,16 +335,15 @@ mod tests {
     async fn challenge_response_emits_retry_after_as_delta_seconds() {
         let (mut session, _client) = make_session("GET", "/api").await;
 
-        write_challenge_response(
-            &mut session,
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            &[],
-            None,
-            Some(Duration::from_secs(30)),
-            &ErrorBodyResponse::default(),
-        )
-        .await
-        .unwrap();
+        write_challenge_response()
+            .session(&mut session)
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .challenges(&[])
+            .retry_after(Duration::from_secs(30))
+            .body(&ErrorBodyResponse::default())
+            .call()
+            .await
+            .unwrap();
 
         let resp = session.response_written().unwrap();
         assert_eq!(resp.status.as_u16(), 503);
@@ -365,16 +360,15 @@ mod tests {
             (Duration::ZERO, "0"),
         ] {
             let (mut session, _client) = make_session("GET", "/api").await;
-            write_challenge_response(
-                &mut session,
-                http::StatusCode::SERVICE_UNAVAILABLE,
-                &[],
-                None,
-                Some(interval),
-                &ErrorBodyResponse::default(),
-            )
-            .await
-            .unwrap();
+            write_challenge_response()
+                .session(&mut session)
+                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .challenges(&[])
+                .retry_after(interval)
+                .body(&ErrorBodyResponse::default())
+                .call()
+                .await
+                .unwrap();
             let resp = session.response_written().unwrap();
             assert_eq!(
                 resp.headers.get("retry-after").unwrap(),
@@ -388,16 +382,14 @@ mod tests {
     async fn challenge_response_403() {
         let (mut session, _client) = make_session("GET", "/admin").await;
 
-        write_challenge_response(
-            &mut session,
-            http::StatusCode::FORBIDDEN,
-            &["Bearer error=\"insufficient_scope\"".to_owned()],
-            None,
-            None,
-            &ErrorBodyResponse::default(),
-        )
-        .await
-        .unwrap();
+        write_challenge_response()
+            .session(&mut session)
+            .status(http::StatusCode::FORBIDDEN)
+            .challenges(&["Bearer error=\"insufficient_scope\"".to_owned()])
+            .body(&ErrorBodyResponse::default())
+            .call()
+            .await
+            .unwrap();
 
         let resp = session.response_written().unwrap();
         assert_eq!(resp.status.as_u16(), 403);
@@ -417,15 +409,13 @@ mod tests {
              error_description=\"nope\r\nInjected-Header: evil\""
             .to_owned();
 
-        let result = write_challenge_response(
-            &mut session,
-            http::StatusCode::FORBIDDEN,
-            &[malicious],
-            None,
-            None,
-            &ErrorBodyResponse::default(),
-        )
-        .await;
+        let result = write_challenge_response()
+            .session(&mut session)
+            .status(http::StatusCode::FORBIDDEN)
+            .challenges(&[malicious])
+            .body(&ErrorBodyResponse::default())
+            .call()
+            .await;
 
         // Fail closed: the CRLF value is rejected and nothing is committed downstream —
         // no split, no injected header.
@@ -461,16 +451,16 @@ mod tests {
             let body =
                 ErrorBodyResponse::new("unavailable", http::HeaderValue::from_static("text/plain"));
             let challenges = vec!["Bearer realm=\"api\"".into(), "DPoP realm=\"api\"".into()];
-            write_challenge_response(
-                &mut session,
-                http::StatusCode::UNAUTHORIZED,
-                &challenges,
-                Some("nonce"),
-                Some(Duration::from_millis(1500)),
-                &body,
-            )
-            .await
-            .unwrap();
+            write_challenge_response()
+                .session(&mut session)
+                .status(http::StatusCode::UNAUTHORIZED)
+                .challenges(&challenges)
+                .dpop_nonce("nonce")
+                .retry_after(Duration::from_millis(1500))
+                .body(&body)
+                .call()
+                .await
+                .unwrap();
             let resp = session.response_written().unwrap();
             assert_eq!(resp.status.as_u16(), 401);
             assert_eq!(resp.headers.get_all("www-authenticate").iter().count(), 2);

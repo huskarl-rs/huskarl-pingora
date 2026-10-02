@@ -1635,6 +1635,20 @@ fn telemetry_classifies_login_decisions_with_bounded_labels() {
     }
 }
 
+fn diagnostic_detail(event: &LoginDiagnostic<'_>) -> String {
+    match event {
+        LoginDiagnostic::SessionFailure {
+            operation,
+            phase,
+            error,
+        } => {
+            assert_eq!(error.kind(), SessionErrorKind::Unavailable);
+            format!("{operation:?}/{phase:?}: {}", error_chain(*error))
+        }
+        LoginDiagnostic::StrandedCookies { count } => format!("stranded={count}"),
+    }
+}
+
 #[test]
 fn telemetry_finalizes_once_and_preserves_handled_failure_diagnostics() {
     use crate::metrics_test_support::{assert_counter, with_metrics};
@@ -1656,20 +1670,19 @@ fn telemetry_finalizes_once_and_preserves_handled_failure_diagnostics() {
                 .fail_revoke(fail)
                 .save_cookies(vec![HeaderValue::from_static("mock-session=updated")])
                 .build();
-            let proxy = build_proxy(store).await.diagnostics(move |event| {
-                let detail = match event {
-                    LoginDiagnostic::SessionFailure {
-                        operation,
-                        phase,
-                        error,
-                    } => {
-                        assert_eq!(error.kind(), SessionErrorKind::Unavailable);
-                        format!("{operation:?}/{phase:?}: {}", error_chain(error))
-                    }
-                    LoginDiagnostic::StrandedCookies { count } => format!("stranded={count}"),
-                };
-                captured.lock().unwrap().push(detail);
-            });
+            let proxy = LoginProxy::builder()
+                .inner(InnerProxy::new())
+                .engine(build_engine(store).await)
+                .path_guard(crate::login::GuardConfig::new(
+                    crate::login::CaseSensitivity::Sensitive,
+                    crate::login::DecodeDepth::UpToOne,
+                ))
+                .diagnostics(move |event| {
+                    let detail = diagnostic_detail(&event);
+                    captured.lock().unwrap().push(detail);
+                })
+                .build()
+                .expect("valid routes");
             let (mut session, _client) = make_session("GET", "/api", "").await;
             let mut ctx = proxy.new_ctx();
             proxy.request_filter(&mut session, &mut ctx).await.unwrap();
@@ -1797,9 +1810,16 @@ fn telemetry_load_failure_preserves_the_original_error_without_metrics() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&events);
     let ((), counters) = with_metrics(async {
-        let proxy = build_proxy(MockSessionDriver::builder().fail_load(true).build())
-            .await
+        let proxy = LoginProxy::builder()
+            .inner(InnerProxy::new())
+            .engine(build_engine(MockSessionDriver::builder().fail_load(true).build()).await)
+            .path_guard(crate::login::GuardConfig::new(
+                crate::login::CaseSensitivity::Sensitive,
+                crate::login::DecodeDepth::UpToOne,
+            ))
             .diagnostics(|_| panic!("replaced handler must not run"))
+            .build()
+            .expect("valid routes")
             .diagnostics(move |event| {
                 let LoginDiagnostic::SessionFailure {
                     operation,

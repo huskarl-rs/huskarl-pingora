@@ -159,7 +159,7 @@ fn split_resource_metadata(
 ///     .subtree("/public", Rule::public())
 ///     .build()
 ///     .expect("valid policy");
-/// let guard = Guard::new(validator, policy, None);
+/// let guard = Guard::builder().validator(validator).policy(policy).build();
 /// let proxy = AuthProxy::new(inner, guard);
 /// # }
 /// ```
@@ -218,7 +218,7 @@ where
 
 /// An authenticated proxy bound to exactly one resource definition.
 ///
-/// Construct through [`super::BoundResource::new`]. Its mandatory binding fixes
+/// Construct through [`super::BoundResource::builder`]. Its mandatory binding fixes
 /// the accepted audiences and public resource boundary. It cannot be rebound.
 /// The bundle carries the matching metadata to the server's publication boundary.
 pub struct ProtectedResourceProxy<P, V, E = ()>
@@ -508,15 +508,15 @@ where
                     required_scopes: details.required_scopes.as_deref(),
                     challenges: &challenges,
                 });
-                write_challenge_response(
-                    session,
-                    status,
-                    &challenges,
-                    dpop_nonce.as_deref(),
-                    retry_after,
-                    &body,
-                )
-                .await?;
+                write_challenge_response()
+                    .session(session)
+                    .status(status)
+                    .challenges(&challenges)
+                    .maybe_dpop_nonce(dpop_nonce.as_deref())
+                    .maybe_retry_after(retry_after)
+                    .body(&body)
+                    .call()
+                    .await?;
                 return Ok(true);
             }
         }
@@ -568,7 +568,13 @@ where
                 required_scopes: None,
                 challenges: &[],
             });
-            write_challenge_response(session, status, &[], None, None, &body).await?;
+            write_challenge_response()
+                .session(session)
+                .status(status)
+                .challenges(&[])
+                .body(&body)
+                .call()
+                .await?;
             return Ok(true);
         }
 
@@ -774,9 +780,13 @@ mod tests {
                 audience,
             )
             .unwrap();
-            let bound =
-                crate::resource::BoundResource::new(definition, validator, policy, self.inner)?
-                    .error_body(self.error_body);
+            let bound = crate::resource::BoundResource::builder()
+                .definition(definition)
+                .validator(validator)
+                .policy(policy)
+                .inner(self.inner)
+                .build()?
+                .error_body(self.error_body);
             let (_, proxy, endpoint) = bound.into_parts();
             Ok((proxy, endpoint))
         }
@@ -805,14 +815,14 @@ mod tests {
         for (pattern, rule) in routes {
             builder = builder.route(pattern, rule);
         }
-        let guard = Guard::new(
-            validator,
-            builder.build().unwrap(),
-            Some(
+        let guard = Guard::builder()
+            .validator(validator)
+            .policy(builder.build().unwrap())
+            .url_mapping(
                 crate::resource_server::core::url_mapping::PublicUrlMapping::new(base_uri, "/")
                     .unwrap(),
-            ),
-        );
+            )
+            .build();
         AuthProxy::new(InnerProxy::new(), guard)
     }
 
@@ -901,13 +911,13 @@ mod tests {
             .subtree("/app", Rule::required().scopes(["guard.read"]))
             .build()
             .unwrap();
-        let bound = crate::resource::BoundResource::new(
-            definition,
-            validator,
-            resource_policy,
-            InnerProxy::new(),
-        )
-        .unwrap();
+        let bound = crate::resource::BoundResource::builder()
+            .definition(definition)
+            .validator(validator)
+            .policy(resource_policy)
+            .inner(InnerProxy::new())
+            .build()
+            .unwrap();
         let (_, auth, metadata) = bound.into_parts();
         let canonical = metadata.publication().uri.clone();
         let exported = metadata.publication().body.to_vec();
@@ -1082,17 +1092,17 @@ mod tests {
             ))
             .build()
             .map(|policy| {
-                Guard::new(
-                    MockValidator(MockOutcome::Missing),
-                    policy,
-                    Some(
+                Guard::builder()
+                    .validator(MockValidator(MockOutcome::Missing))
+                    .policy(policy)
+                    .url_mapping(
                         crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                             "https://api.example.com",
                             "/",
                         )
                         .unwrap(),
-                    ),
-                )
+                    )
+                    .build()
             })
             .unwrap();
         let (_payments, payments_metadata) = AuthProxy::new(InnerProxy::new(), payments_guard)
@@ -1105,17 +1115,17 @@ mod tests {
             ))
             .build()
             .map(|policy| {
-                Guard::new(
-                    MockValidator(MockOutcome::Missing),
-                    policy,
-                    Some(
+                Guard::builder()
+                    .validator(MockValidator(MockOutcome::Missing))
+                    .policy(policy)
+                    .url_mapping(
                         crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                             "https://api.example.com",
                             "/",
                         )
                         .unwrap(),
-                    ),
-                )
+                    )
+                    .build()
             })
             .unwrap();
         let (_inventory, inventory_metadata) = AuthProxy::new(InnerProxy::new(), inventory_guard)
@@ -1158,20 +1168,20 @@ mod tests {
             .default(Rule::required().strip_credentials(false))
             .build()
             .map(|policy| {
-                Guard::new(
-                    MockValidator(MockOutcome::ValidFor(
+                Guard::builder()
+                    .validator(MockValidator(MockOutcome::ValidFor(
                         MockClaims { scopes: None },
                         vec!["https://api.example.com/mcp/inventory".to_owned()],
-                    )),
-                    policy,
-                    Some(
+                    )))
+                    .policy(policy)
+                    .url_mapping(
                         crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                             "https://api.example.com",
                             "/",
                         )
                         .unwrap(),
-                    ),
-                )
+                    )
+                    .build()
             })
             .unwrap();
         let (inventory, inventory_metadata) = AuthProxy::new(InnerProxy::new(), inventory_guard)
@@ -1185,17 +1195,17 @@ mod tests {
             ))
             .build()
             .map(|policy| {
-                Guard::new(
-                    MockValidator(MockOutcome::Missing),
-                    policy,
-                    Some(
+                Guard::builder()
+                    .validator(MockValidator(MockOutcome::Missing))
+                    .policy(policy)
+                    .url_mapping(
                         crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                             "https://api.example.com",
                             "/",
                         )
                         .unwrap(),
-                    ),
-                )
+                    )
+                    .build()
             })
             .unwrap();
         let (payments, payments_metadata) = AuthProxy::new(InnerProxy::new(), payments_guard)
@@ -1313,16 +1323,16 @@ mod tests {
             ))
             .build()
             .unwrap();
-        let bound = crate::resource::BoundResource::new(
-            definition.clone(),
-            MockValidator(MockOutcome::ValidFor(
+        let bound = crate::resource::BoundResource::builder()
+            .definition(definition.clone())
+            .validator(MockValidator(MockOutcome::ValidFor(
                 MockClaims { scopes: None },
                 definition.audiences().to_vec(),
-            )),
-            policy,
-            InnerProxy::new(),
-        )
-        .unwrap();
+            )))
+            .policy(policy)
+            .inner(InnerProxy::new())
+            .build()
+            .unwrap();
         let (_, proxy, _) = bound.into_parts();
         for (path, allowed) in [
             ("/proxy", false),
@@ -1352,17 +1362,17 @@ mod tests {
             ))
             .build()
             .map(|policy| {
-                Guard::new(
-                    MockValidator(MockOutcome::Missing),
-                    policy,
-                    Some(
+                Guard::builder()
+                    .validator(MockValidator(MockOutcome::Missing))
+                    .policy(policy)
+                    .url_mapping(
                         crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                             "https://api.example.com/gateway",
                             "/internal",
                         )
                         .unwrap(),
-                    ),
-                )
+                    )
+                    .build()
             })
             .unwrap();
         let (proxy, metadata) = AuthProxy::new(InnerProxy::new(), guard)
@@ -1463,17 +1473,17 @@ mod tests {
                 ))
                 .build()
                 .map(|policy| {
-                    Guard::new(
-                        MockValidator(MockOutcome::Missing),
-                        policy,
-                        Some(
+                    Guard::builder()
+                        .validator(MockValidator(MockOutcome::Missing))
+                        .policy(policy)
+                        .url_mapping(
                             crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                                 "https://api.example.com",
                                 "/internal",
                             )
                             .unwrap(),
-                        ),
-                    )
+                        )
+                        .build()
                 })
                 .unwrap();
             let (proxy, _metadata) = AuthProxy::new(InnerProxy::new(), guard)
@@ -1907,8 +1917,13 @@ mod tests {
             .path_guard(policy.clone())
             .build()
             .unwrap();
-        let bound =
-            BoundResource::new(definition, validator, resource_policy, InnerProxy::new()).unwrap();
+        let bound = BoundResource::builder()
+            .definition(definition)
+            .validator(validator)
+            .policy(resource_policy)
+            .inner(InnerProxy::new())
+            .build()
+            .unwrap();
         let metadata_uri = bound.metadata().uri().clone();
         let metadata_body = bound.metadata().publication().body.to_vec();
         // Replace a non-default renderer too, retaining the validated bundle.
@@ -1921,11 +1936,11 @@ mod tests {
         let proxy = ResourceAssembly::new(mapping)
             .register_bound(bound)
             .unwrap()
-            .build(
-                route(InnerProxy::new()),
-                context_lens!(TestContext, ctx => ctx.route),
-                policy,
-            )
+            .assemble()
+            .fallback(route(InnerProxy::new()))
+            .slot(context_lens!(TestContext, ctx => ctx.route))
+            .path_guard(policy)
+            .call()
             .unwrap();
 
         for (method, path, status) in [
@@ -2005,13 +2020,18 @@ mod tests {
             let proxy = ResourceAssembly::new(
                 PublicUrlMapping::new("https://api.example.com", "/metadata-ingress").unwrap(),
             )
-            .register(&definition, validator, resource_policy, InnerProxy::new())
+            .register()
+            .definition(&definition)
+            .validator(validator)
+            .policy(resource_policy)
+            .inner(InnerProxy::new())
+            .call()
             .unwrap()
-            .build(
-                route(InnerProxy::new()),
-                context_lens!(TestContext, ctx => ctx.route),
-                policy,
-            )
+            .assemble()
+            .fallback(route(InnerProxy::new()))
+            .slot(context_lens!(TestContext, ctx => ctx.route))
+            .path_guard(policy)
+            .call()
             .unwrap();
             let (mut session, _client) = make_session("GET", path).await;
             let mut ctx = proxy.new_ctx();
@@ -2074,13 +2094,18 @@ mod tests {
             .build()
             .unwrap();
         let proxy = ResourceAssembly::new(mapping)
-            .register(&definition, validator, resource_policy, InnerProxy::new())
+            .register()
+            .definition(&definition)
+            .validator(validator)
+            .policy(resource_policy)
+            .inner(InnerProxy::new())
+            .call()
             .unwrap()
-            .build(
-                route(InnerProxy::new()),
-                context_lens!(TestContext, ctx => ctx.route),
-                policy,
-            )
+            .assemble()
+            .fallback(route(InnerProxy::new()))
+            .slot(context_lens!(TestContext, ctx => ctx.route))
+            .path_guard(policy)
+            .call()
             .unwrap();
         for (method, path, expected) in [
             ("GET", "/.well-known/oauth-protected-resource", 200),
@@ -2134,14 +2159,14 @@ mod tests {
             .path_guard(policy.clone())
             .build()
             .unwrap();
-        let (_, proxy, _) = crate::resource::BoundResource::new(
-            definition,
-            validator,
-            resource_policy,
-            InnerProxy::new(),
-        )
-        .unwrap()
-        .into_parts();
+        let (_, proxy, _) = crate::resource::BoundResource::builder()
+            .definition(definition)
+            .validator(validator)
+            .policy(resource_policy)
+            .inner(InnerProxy::new())
+            .build()
+            .unwrap()
+            .into_parts();
         assert_eq!(
             proxy
                 .auth
@@ -2160,7 +2185,12 @@ mod tests {
             .unwrap();
         assert!(
             ResourceAssembly::new(PublicUrlMapping::new("https://api.example.com", "/").unwrap())
-                .register(&definition, validator, resource_policy, InnerProxy::new())
+                .register()
+                .definition(&definition)
+                .validator(validator)
+                .policy(resource_policy)
+                .inner(InnerProxy::new())
+                .call()
                 .is_err()
         );
     }
@@ -2192,13 +2222,18 @@ mod tests {
             .build()
             .unwrap();
         let proxy = ResourceAssembly::new(metadata_mapping)
-            .register(&definition, validator, resource_policy, InnerProxy::new())
+            .register()
+            .definition(&definition)
+            .validator(validator)
+            .policy(resource_policy)
+            .inner(InnerProxy::new())
+            .call()
             .unwrap()
-            .build(
-                route(InnerProxy::new()),
-                context_lens!(TestContext, ctx => ctx.route),
-                policy,
-            )
+            .assemble()
+            .fallback(route(InnerProxy::new()))
+            .slot(context_lens!(TestContext, ctx => ctx.route))
+            .path_guard(policy)
+            .call()
             .unwrap();
         for (path, status) in [
             ("/app", 200),
@@ -2247,17 +2282,17 @@ mod tests {
                     ))
                     .build()
                     .map(|policy| {
-                        Guard::new(
-                            MockValidator(MockOutcome::Missing),
-                            policy,
-                            Some(
+                        Guard::builder()
+                            .validator(MockValidator(MockOutcome::Missing))
+                            .policy(policy)
+                            .url_mapping(
                                 crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                                     "https://api.example.com",
                                     "/edge",
                                 )
                                 .unwrap(),
-                            ),
-                        )
+                            )
+                            .build()
                     })
                     .unwrap();
                 let (proxy, _) = AuthProxy::new(InnerProxy::new(), guard)
@@ -2318,13 +2353,18 @@ mod tests {
                 .unwrap();
             let proxy = ResourceAssembly::new(mapping)
                 .metrics_name("router")
-                .register(&definition, validator, resource_policy, InnerProxy::new())
+                .register()
+                .definition(&definition)
+                .validator(validator)
+                .policy(resource_policy)
+                .inner(InnerProxy::new())
+                .call()
                 .unwrap()
-                .build(
-                    route(InnerProxy::new()),
-                    context_lens!(TestContext, ctx => ctx.route),
-                    policy,
-                )
+                .assemble()
+                .fallback(route(InnerProxy::new()))
+                .slot(context_lens!(TestContext, ctx => ctx.route))
+                .path_guard(policy)
+                .call()
                 .unwrap();
             for path in [
                 "/api",

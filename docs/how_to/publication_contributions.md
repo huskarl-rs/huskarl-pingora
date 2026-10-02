@@ -32,7 +32,12 @@ fn bind<P, V>(definition: ResourceDefinition, validator: V, policy: ResourcePoli
     -> Result<BoundResource<ProtectedResourceProxy<P, V>>, ConfigError>
 where V: AccessTokenValidator + ProvideValidatorMetadata
 {
-    BoundResource::new(definition, validator, policy, inner)
+    BoundResource::builder()
+        .definition(definition)
+        .validator(validator)
+        .policy(policy)
+        .inner(inner)
+        .build()
 }
 ```
 

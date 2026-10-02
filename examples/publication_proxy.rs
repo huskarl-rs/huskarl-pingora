@@ -361,28 +361,28 @@ fn main() {
             .path_guard(path_guard.clone())
             .build()
             .expect("failed to build payments policy");
-        let inventory = BoundResource::new(
-            inventory_definition.clone(),
-            inventory_validator,
-            inventory_policy,
-            Upstream {
+        let inventory = BoundResource::builder()
+            .definition(inventory_definition.clone())
+            .validator(inventory_validator)
+            .policy(inventory_policy)
+            .inner(Upstream {
                 address: std::env::var("INVENTORY_UPSTREAM")
                     .unwrap_or_else(|_| "127.0.0.1:3001".into()),
-            },
-        )
-        .expect("failed to bind inventory")
-        .into_route();
-        let payments = BoundResource::new(
-            payments_definition.clone(),
-            payments_validator,
-            payments_policy,
-            Upstream {
+            })
+            .build()
+            .expect("failed to bind inventory")
+            .into_route();
+        let payments = BoundResource::builder()
+            .definition(payments_definition.clone())
+            .validator(payments_validator)
+            .policy(payments_policy)
+            .inner(Upstream {
                 address: std::env::var("PAYMENTS_UPSTREAM")
                     .unwrap_or_else(|_| "127.0.0.1:3002".into()),
-            },
-        )
-        .expect("failed to bind payments")
-        .into_route();
+            })
+            .build()
+            .expect("failed to bind payments")
+            .into_route();
         let security_txt = std::env::var_os("SECURITY_TXT_FILE").map(|path| {
             Bytes::from(
                 std::fs::read_to_string(path).expect("failed to read SECURITY_TXT_FILE as UTF-8"),

@@ -28,19 +28,23 @@ assert_eq!(inventory.incoming_mount(), "/edge/mcp/inventory");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-You can prepare a `BoundResource::new(definition, validator, policy, inner)` and pass
+You can prepare a resource with `BoundResource::builder()` and pass
 `bound.into_route()` to `ResourceAssembly::register_bound`. Its definition,
 authenticated branch, and metadata remain paired until the assembly consumes it.
 For a custom consuming server, see the publication contribution guide.
 
 Alternatively, pass the definition, validator, validated policy, and inner proxy
-to `ResourceAssembly::register`. `ResourcePolicy` contains access rules and
+to `ResourceAssembly::register` using `.register().definition(&definition)`
+followed by `.validator(validator).policy(policy).inner(inner).call()`.
+`ResourcePolicy` contains access rules and
 path-guard assumptions; it cannot carry a validator or URL mapping. The definition
 supplies the only resource mapping. Policy routes use incoming request coordinates,
 including the ingress prefix and resource mount (for example, `/edge/mcp/inventory`).
 The assembly binds authentication, mounts its branch, collects metadata, and
-checks consistency. `build` consumes the fallback route, application route-slot
-lens, and a server-wide `GuardConfig`. Path ambiguity is checked before selecting
+checks consistency. Finish with `.assemble().fallback(fallback).slot(slot)`
+followed by `.path_guard(path_guard).call()`, supplying the fallback route,
+application route-slot lens, and a server-wide `GuardConfig`.
+Path ambiguity is checked before selecting
 a branch or invoking its early hooks. The existing router still owns hook
 delegation and module initialization. For composition with unrelated public
 endpoints, the advanced `publication_proxy` example consumes the contributions directly
@@ -102,13 +106,13 @@ return 400. Arbitrary non-prefix rewrites require a custom adapter contract.
 
 ## Standalone authentication and limits
 
-For authentication without a resource definition, construct
-`Guard::new(validator, policy, mapping)` and wrap it with `AuthProxy::new`.
-The mapping is `Some(PublicUrlMapping)` for trusted public URL reconstruction,
-or `None` to pass the original request URI to the validator. DPoP validation
+For authentication without a resource definition, use `Guard::builder()` with
+`.validator(validator)` and `.policy(policy)`, then wrap the built guard with
+`AuthProxy::new`. Set `.url_mapping(mapping)` for trusted public URL reconstruction,
+or omit it to pass the original request URI to the validator. DPoP validation
 requires a public target; origin-form requests with no mapping fail closed.
 
-Resource-bound proxies are constructed only through `BoundResource::new` and
+Resource-bound proxies are constructed only through `BoundResource::builder` and
 cannot be rebound. Legacy resource `base_uri`, `strip_prefix`, and binding setters
 have been removed. Use `PublicUrlMapping` for all resource URL reconstruction.
 Bare prefixes and trailing slashes remain distinct: mapping `/edge` to

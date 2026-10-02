@@ -136,14 +136,14 @@ fn branch(
         .path_guard(guard_config())
         .build()
         .unwrap();
-    BoundResource::new(
-        definition,
-        validator,
-        policy,
-        Application(Arc::clone(observed)),
-    )
-    .unwrap()
-    .into_route()
+    BoundResource::builder()
+        .definition(definition)
+        .validator(validator)
+        .policy(policy)
+        .inner(Application(Arc::clone(observed)))
+        .build()
+        .unwrap()
+        .into_route()
 }
 
 async fn exchange(
@@ -343,11 +343,11 @@ fn convenience_assembly_consumes_bound_resource_without_repreparing() {
     let _proxy = huskarl_pingora::resource::assembly::ResourceAssembly::new(mapping)
         .register_bound(bound)
         .unwrap()
-        .build(
-            route(NotFound),
-            context_lens!(AppContext, ctx => ctx.route),
-            guard_config(),
-        )
+        .assemble()
+        .fallback(route(NotFound))
+        .slot(context_lens!(AppContext, ctx => ctx.route))
+        .path_guard(guard_config())
+        .call()
         .unwrap();
     // Assembly consumes the binding, rather than asking the validator to prepare
     // a potentially different document a second time.

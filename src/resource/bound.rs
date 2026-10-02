@@ -30,7 +30,12 @@ use crate::resource_server::{
 /// };
 /// fn bind<P, V>(definition: ResourceDefinition, validator: V, guard: Guard<V>, inner: P)
 /// where V: AccessTokenValidator + ProvideValidatorMetadata {
-///     let _ = BoundResource::new(definition, validator, guard, inner);
+///     let _ = BoundResource::builder()
+///         .definition(definition)
+///         .validator(validator)
+///         .policy(guard)
+///         .inner(inner)
+///         .build();
 /// }
 /// ```
 ///
@@ -62,21 +67,30 @@ pub struct BoundResource<P> {
     metadata: ResourceMetadataEndpoint,
 }
 
+#[bon::bon]
 impl<P, V> BoundResource<ProtectedResourceProxy<P, V>>
 where
     V: AccessTokenValidator + ProvideValidatorMetadata,
 {
-    /// Binds authentication and prepares its matching publication contribution.
+    /// Starts a builder for an authenticated proxy and its matching metadata.
+    /// Call [`BoundResourceBuilder::build`] to bind authentication and prepare
+    /// the publication contribution.
     /// No HTTP route is installed. Policy paths use incoming request coordinates,
     /// including the ingress prefix and resource mount. The definition alone
     /// supplies resource identity, accepted audiences and URL reconstruction.
     ///
     /// # Errors
-    /// Rejects inconsistent validator metadata or metadata serialization failures.
+    /// [`BoundResourceBuilder::build`] rejects inconsistent validator metadata
+    /// or metadata serialization failures.
+    #[builder]
     pub fn new(
+        /// Resource identity, accepted audiences, and trusted public URL mapping.
         definition: ResourceDefinition,
+        /// Access-token validator for this resource.
         validator: V,
+        /// Validated access rules in incoming request coordinates.
         policy: ResourcePolicy<V::Claims>,
+        /// Inner proxy to invoke after authentication and authorization succeed.
         inner: P,
     ) -> Result<Self, ConfigError> {
         let (proxy, metadata) = ProtectedResourceProxy::new(&definition, validator, policy, inner)?;

@@ -383,14 +383,20 @@ async fn run_case_with_protocol(
     fail_save: bool,
     http2: bool,
 ) -> (String, Vec<&'static str>) {
-    run_case_with_protocols(path, fail_save, http2, false).await
+    run_case_with_protocols()
+        .path(path)
+        .fail_save(fail_save)
+        .http2(http2)
+        .call()
+        .await
 }
 
+#[bon::builder]
 async fn run_case_with_protocols(
     path: ResponsePath,
-    fail_save: bool,
-    http2: bool,
-    upstream_h2: bool,
+    #[builder(default)] fail_save: bool,
+    #[builder(default)] http2: bool,
+    #[builder(default)] upstream_h2: bool,
 ) -> (String, Vec<&'static str>) {
     let key = format!("finalization-{}", NEXT_KEY.fetch_add(1, Ordering::Relaxed));
     if matches!(path, ResponsePath::CacheHit | ResponsePath::Revalidated) {
@@ -812,8 +818,13 @@ async fn http2_upstreams_finalize_for_both_downstream_protocols() {
             ResponsePath::Revalidated,
         ] {
             for fail_save in [false, true] {
-                let (wire, events) =
-                    run_case_with_protocols(path, fail_save, downstream_h2, true).await;
+                let (wire, events) = run_case_with_protocols()
+                    .path(path)
+                    .fail_save(fail_save)
+                    .http2(downstream_h2)
+                    .upstream_h2(true)
+                    .call()
+                    .await;
                 let status = if fail_save { 503 } else { 200 };
                 let protocol = if downstream_h2 { "HTTP/2" } else { "HTTP/1.1" };
                 assert!(

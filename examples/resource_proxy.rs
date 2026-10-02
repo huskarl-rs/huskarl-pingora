@@ -51,13 +51,18 @@ fn main() {
         // 3. Install /api and its descendants plus the derived public metadata
         // endpoint. Other paths return 404. register() performs binding for us.
         ResourceAssembly::new(mapping)
-            .register(&definition, validator, policy, upstream)
+            .register()
+            .definition(&definition)
+            .validator(validator)
+            .policy(policy)
+            .inner(upstream)
+            .call()
             .expect("resource registration failed")
-            .build(
-                route(NotFound),
-                context_lens!(AppContext, ctx => ctx.route),
-                paths,
-            )
+            .assemble()
+            .fallback(route(NotFound))
+            .slot(context_lens!(AppContext, ctx => ctx.route))
+            .path_guard(paths)
+            .call()
             .expect("invalid server routing")
     });
 }

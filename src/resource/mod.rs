@@ -6,7 +6,7 @@
 //! Use [`assembly::ResourceAssembly`] to mount resource bundles together.
 //!
 //! For standalone authentication without a resource definition, combine
-//! [`Guard::new`] and [`AuthProxy::new`]. Both proxies implement
+//! [`Guard::builder`] and [`AuthProxy::new`]. Both proxies implement
 //! [`ProxyHttp`](pingora_proxy::ProxyHttp) with the inner proxy's context.
 //!
 //! Access control is defined through path-based [`Rule`]s registered on a
@@ -64,11 +64,13 @@ pub mod scopes;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use bound::BoundResource;
+pub use bound::{BoundResource, BoundResourceBuilder};
 pub use ctx::{AuthCtx, HasAuthState};
 pub use error::ConfigError;
-pub use error_body::{ErrorBody, ErrorBodyResponse, ErrorDetails, FailureDetails};
-pub use guard::{ClientCertDer, Guard};
+pub use error_body::{
+    ErrorBody, ErrorBodyResponse, ErrorDetails, ErrorDetailsBuilder, FailureDetails,
+};
+pub use guard::{ClientCertDer, Guard, GuardBuilder};
 pub use outcome::Outcome;
 pub use policy::{ResourcePolicy, ResourcePolicyBuilder};
 pub use proxy::{

@@ -56,6 +56,7 @@ pub struct ResourceAssembly<C> {
     endpoints: Vec<ResourceMetadataEndpoint>,
     metrics_name: Option<String>,
 }
+#[bon::bon]
 impl<C: Send + Sync + 'static> ResourceAssembly<C> {
     /// Creates an assembly with explicit mapping for the metadata namespace.
     #[must_use]
@@ -77,14 +78,22 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
         self
     }
 
-    /// Binds authentication and records its incoming mount and metadata endpoint.
+    /// Starts registration of a resource and its metadata endpoint.
+    /// Set `definition`, `validator`, `policy`, and `inner`, then call `call()`
+    /// to validate and return the updated assembly.
     /// # Errors
-    /// Rejects inconsistent mappings, overlapping mounts, or metadata conflicts.
+    /// [`ResourceAssemblyRegisterBuilder::call`] rejects inconsistent mappings,
+    /// overlapping mounts, or metadata conflicts.
+    #[builder]
     pub fn register<P, V>(
         self,
+        /// Resource identity, accepted audiences, and trusted public URL mapping.
         definition: &ResourceDefinition,
+        /// Access-token validator for this resource.
         validator: V,
+        /// Validated access rules in incoming request coordinates.
         policy: ResourcePolicy<V::Claims>,
+        /// Inner proxy to invoke after authentication and authorization succeed.
         inner: P,
     ) -> Result<Self, AssemblyError>
     where
@@ -93,7 +102,12 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
         V::Claims: HasScopes + Send + Sync,
         C: HasAuthState<V::Claims>,
     {
-        let bound = BoundResource::new(definition.clone(), validator, policy, inner)
+        let bound = BoundResource::builder()
+            .definition(definition.clone())
+            .validator(validator)
+            .policy(policy)
+            .inner(inner)
+            .build()
             .map_err(AssemblyError::Configuration)?;
         self.register_bound(bound.into_route())
     }
@@ -123,14 +137,22 @@ impl<C: Send + Sync + 'static> ResourceAssembly<C> {
         self.endpoints.push(endpoint);
         Ok(self)
     }
-    /// Builds a router using the existing application context and route slot.
+    /// Starts assembly of a router using the existing application context and route slot.
     /// `path_guard` must reflect the parsing assumptions of all mounted branches.
+    /// Set `fallback`, `slot`, and `path_guard`, then call `call()` to validate
+    /// and produce the router.
     /// # Errors
-    /// Rejects noncanonical route patterns or conflicting metadata publication.
-    pub fn build(
+    /// [`ResourceAssemblyAssembleBuilder::call`] rejects noncanonical route
+    /// patterns or conflicting metadata publication.
+    #[builder]
+    pub fn assemble(
         self,
+        /// Route to invoke when no resource or metadata path matches.
         fallback: Route<C>,
+        /// Lens for the router's selected-route slot in the application context.
         slot: Lens<C, RouteSlot<C>>,
+        /// Required path-confusion configuration shared by the mounted branches.
+        /// Declare their downstream case-sensitivity and decoding assumptions.
         path_guard: GuardConfig,
     ) -> Result<AssembledResources<C>, AssemblyError>
     where

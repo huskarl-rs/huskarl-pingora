@@ -9,8 +9,8 @@ use crate::routing::RouteKind;
 
 /// Validated route rules in incoming request coordinates, including the mount prefix.
 ///
-/// A policy owns no validator or URL mapping. Pass it to [`super::BoundResource::new`]
-/// for a defined resource, or [`super::Guard::new`] for standalone authentication.
+/// A policy owns no validator or URL mapping. Pass it to [`super::BoundResource::builder`]
+/// for a defined resource, or [`super::Guard::builder`] for standalone authentication.
 /// Unmatched paths require authentication unless an explicit default overrides it.
 pub struct ResourcePolicy<C> {
     pub(crate) routes: RuleRouter<Rule<C>>,
@@ -20,15 +20,14 @@ pub struct ResourcePolicy<C> {
 
 #[bon]
 impl<C> ResourcePolicy<C> {
-    /// Validates access rules in incoming request coordinates.
+    /// Starts a builder for access rules in incoming request coordinates.
     ///
-    /// Use [`ResourcePolicy::builder`] to set routes and
-    /// configuration; this constructor is the builder's terminal `build`
-    /// step.
+    /// Set routes and configuration, then call [`ResourcePolicyBuilder::build`]
+    /// to validate the policy.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if a route pattern is
+    /// [`ResourcePolicyBuilder::build`] returns [`ConfigError`] if a route pattern is
     /// invalid, or if a public rule has constraints that can never be enforced.
     #[builder]
     pub fn new(

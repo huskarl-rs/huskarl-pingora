@@ -136,7 +136,7 @@ configuration, not arbitrary Host or forwarding headers.
 | `huskarl-resource-server` | `ResourceDefinition`, audiences, prepared metadata and challenge consistency | Keep resource relationship validation; separate local publication checks from binding so external publication is possible |
 | `huskarl-core` | `PublicUrlMapping` | Reuse per publication where appropriate; no universal well-known URL derivation |
 | `huskarl-login` | Login configuration and session engine | No general publication registry |
-| Pingora | `BoundResource::new`, `ResourceMetadataProxy`, existing lifecycle router | Expose metadata information and a native handler; provide supported mapped publication beyond private `mount_at` |
+| Pingora | `BoundResource::builder`, `ResourceMetadataProxy`, existing lifecycle router | Expose metadata information and a native handler; provide supported mapped publication beyond private `mount_at` |
 | Axum | `ValidatorLayer::for_resource`, `ResourceMetadataService`, native `Router` | Expose metadata information alongside the native service; preserve state and `OriginalUri` when mounted |
 
 The low-level binding APIs already return authentication and metadata separately.

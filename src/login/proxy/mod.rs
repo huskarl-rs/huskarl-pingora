@@ -159,7 +159,8 @@ where
     P::CTX: HasLoginSession<SD::SessionType> + Send + Sync,
     SD: SessionDriver + Send + Sync,
 {
-    /// Creates a new `LoginProxy` from a pre-built [`LoginEngine`].
+    /// Starts a builder for a login proxy using a pre-built [`LoginEngine`].
+    /// Call [`LoginProxyBuilder::build`] to validate routes and create the proxy.
     ///
     /// Use [`LoginEngine::builder`] to construct the engine, then wrap it in
     /// an [`Arc`] so it can be shared between this proxy and any other
@@ -175,7 +176,9 @@ where
         /// `RuleRouter::from_registrations` at build time.
         #[builder(field)]
         routes: Vec<(RouteKind, String, LoginRule<SD::SessionType>)>,
+        /// Inner proxy to invoke when the login rule permits the request.
         inner: P,
+        /// Shared login engine that handles the OAuth flow and session lifecycle.
         engine: Arc<LoginEngine<SD>>,
         /// Fallback rule for paths that don't match any registered route.
         /// Defaults to [`LoginRule::required`] — i.e. everything is protected
@@ -221,6 +224,11 @@ where
         /// Requires `metrics`. The shared engine retains its separately configured name.
         #[builder(into)]
         metrics_name: Option<String>,
+        /// Handler for internally handled failures and stranded cookies.
+        /// No handler is installed when omitted. Available without `metrics`.
+        /// See [`LoginProxy::diagnostics`] for handler requirements.
+        #[builder(with = |handler: impl Fn(LoginDiagnostic<'_>) + Send + Sync + 'static| Arc::new(handler) as DiagnosticHandler)]
+        diagnostics: Option<DiagnosticHandler>,
     ) -> Result<Self, RouteConfigError> {
         for (_kind, pattern, rule) in &routes {
             if rule.public_check_requested() {
@@ -243,7 +251,7 @@ where
             persist_failure_policy,
             cors_passthrough,
             metrics_name,
-            diagnostics: None,
+            diagnostics,
         })
     }
 }
@@ -318,6 +326,7 @@ where
     /// For asynchronous export, copy only the needed fields into a bounded queue.
     /// The application owns redaction, sampling, queue overflow, and delivery policy.
     /// No handler is installed by default. Repeated calls replace the handler.
+    /// To configure it during construction, use [`LoginProxyBuilder::diagnostics`].
     #[must_use]
     pub fn diagnostics(
         mut self,

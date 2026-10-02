@@ -47,16 +47,21 @@ fn main() {
                     .unwrap_or_else(|_| default_upstream.into()),
             };
             server = server
-                .register(&definition, validator, policy, upstream)
+                .register()
+                .definition(&definition)
+                .validator(validator)
+                .policy(policy)
+                .inner(upstream)
+                .call()
                 .expect("resource registration failed");
         }
         // The assembly checks overlaps and publishes both metadata contributions.
         server
-            .build(
-                route(NotFound),
-                context_lens!(AppContext, ctx => ctx.route),
-                paths,
-            )
+            .assemble()
+            .fallback(route(NotFound))
+            .slot(context_lens!(AppContext, ctx => ctx.route))
+            .path_guard(paths)
+            .call()
             .expect("invalid server routing")
     });
 }

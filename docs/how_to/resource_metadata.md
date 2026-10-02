@@ -54,7 +54,12 @@ let policy = ResourcePolicy::builder()
     .path_guard(GuardConfig::new(CaseSensitivity::Sensitive, DecodeDepth::UpToOne))
     .subtree("/mcp/inventory", Rule::required().scopes(["inventory.read"]))
     .build()?;
-let bound = BoundResource::new(definition, validator, policy, inner)?;
+let bound = BoundResource::builder()
+    .definition(definition)
+    .validator(validator)
+    .policy(policy)
+    .inner(inner)
+    .build()?;
 let (_definition, inventory, metadata) = bound.into_parts();
 let proxy = ResourceMetadataProxy::new(inventory).publish(metadata)?;
 # let _ = proxy;

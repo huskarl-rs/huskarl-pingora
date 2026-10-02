@@ -127,7 +127,7 @@ fn main() {
             .build()
             .expect("failed to build policy");
 
-        let guard = Guard::new(validator, policy, None);
+        let guard = Guard::builder().validator(validator).policy(policy).build();
         AuthProxy::new(Upstream(upstream.clone()), guard)
     });
     drop(rt);

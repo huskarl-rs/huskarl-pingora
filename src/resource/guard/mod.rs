@@ -101,7 +101,10 @@ fn client_cert_der(session: &Session) -> Option<&[u8]> {
 ///     .route("/health", Rule::public())
 ///     .build()
 ///     .expect("route");
-/// let guard = Guard::new(my_validator, policy, None);
+/// let guard = Guard::builder()
+///     .validator(my_validator)
+///     .policy(policy)
+///     .build();
 /// # }
 /// ```
 pub struct Guard<V: AccessTokenValidator + ProvideValidatorMetadata> {
@@ -130,17 +133,25 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata> std::fmt::Debug for Gua
     }
 }
 
+#[bon::bon]
 impl<V: AccessTokenValidator + ProvideValidatorMetadata> Guard<V> {
-    /// Creates a standalone guard from validated policy and a token validator.
+    /// Starts a builder for a standalone guard.
+    /// Call [`GuardBuilder::build`] to combine the validated policy and token validator.
     ///
-    /// Supply a trusted URL mapping when accepting `DPoP` tokens. With `None`,
+    /// Supply a trusted URL mapping when accepting `DPoP` tokens. When omitted,
     /// the original request URI is passed to the validator; origin-form requests
     /// cannot establish a public `DPoP` target. Incoming Host headers are never trusted.
-    /// For a defined resource, use [`super::BoundResource::new`] instead: its
+    /// For a defined resource, use [`super::BoundResource::builder`] instead: its
     /// definition supplies the only URL mapping.
+    #[builder]
     pub fn new(
+        /// Access-token validator used by this guard.
         validator: V,
+        /// Validated access rules in incoming request coordinates.
         policy: ResourcePolicy<V::Claims>,
+        /// Trusted mapping used to reconstruct the public request URL for `DPoP`.
+        /// When omitted, the original request URI is passed to the validator;
+        /// an origin-form URI cannot establish a public `DPoP` target.
         url_mapping: Option<PublicUrlMapping>,
     ) -> Self {
         let metadata = validator.validator_metadata(None);

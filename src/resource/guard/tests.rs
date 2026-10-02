@@ -126,7 +126,10 @@ fn build_guard(
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
-    Guard::new(validator, builder.build().unwrap(), None)
+    Guard::builder()
+        .validator(validator)
+        .policy(builder.build().unwrap())
+        .build()
 }
 
 fn build_guard_with_base_uri(
@@ -142,11 +145,11 @@ fn build_guard_with_base_uri(
     for (pattern, rule) in routes {
         builder = builder.route(pattern, rule);
     }
-    Guard::new(
-        validator,
-        builder.build().unwrap(),
-        Some(PublicUrlMapping::new(base_uri, strip_prefix.unwrap_or("/")).unwrap()),
-    )
+    Guard::builder()
+        .validator(validator)
+        .policy(builder.build().unwrap())
+        .url_mapping(PublicUrlMapping::new(base_uri, strip_prefix.unwrap_or("/")).unwrap())
+        .build()
 }
 
 async fn check(
@@ -191,7 +194,7 @@ fn subtree_guard(
         ))
         .subtree(pattern, rule)
         .build()
-        .map(|policy| Guard::new(validator, policy, None))
+        .map(|policy| Guard::builder().validator(validator).policy(policy).build())
         .unwrap()
 }
 
@@ -350,17 +353,17 @@ async fn one_origin_can_back_distinct_resource_guards() {
             .route(&request_path, Rule::required())
             .build()
             .map(|policy| {
-                Guard::new(
-                    MockValidator::no_token(),
-                    policy,
-                    Some(
+                Guard::builder()
+                    .validator(MockValidator::no_token())
+                    .policy(policy)
+                    .url_mapping(
                         crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                             "https://api.example.com",
                             "/",
                         )
                         .unwrap(),
-                    ),
-                )
+                    )
+                    .build()
             })
             .unwrap();
         let (guard, config) = bind_guard(guard, &resource).unwrap();
@@ -434,7 +437,12 @@ async fn explicit_validator_metadata_url_is_not_overwritten() {
         ))
         .route("/api", Rule::required())
         .build()
-        .map(|policy| Guard::new(CustomUrlValidator(MockValidator::no_token()), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(CustomUrlValidator(MockValidator::no_token()))
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     // Called directly: the shared `check` helper is typed to `Guard<MockValidator>`.
@@ -557,7 +565,12 @@ async fn default_rule_applies_to_unmatched_paths() {
         .route("/health", Rule::public())
         .default(Rule::optional())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/health").await;
@@ -817,7 +830,12 @@ async fn subtree_exact_route_carve_out_wins() {
         .subtree("/admin", Rule::required())
         .route("/admin/health", Rule::public())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     // The more-specific exact route is public — no token still forwards.
@@ -919,17 +937,17 @@ async fn guard_400_challenges_carry_no_scope_hint() {
         .default(Rule::required().scopes(["admin"]))
         .build()
         .map(|policy| {
-            Guard::new(
-                MockValidator::no_token(),
-                policy,
-                Some(
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .url_mapping(
                     crate::resource_server::core::url_mapping::PublicUrlMapping::new(
                         "https://api.example.com",
                         "/proxy",
                     )
                     .unwrap(),
-                ),
-            )
+                )
+                .build()
         })
         .unwrap();
     let (status, challenges) = deny_parts(check(&guard, &http::Method::GET, "/other/users").await);
@@ -976,7 +994,12 @@ async fn blob_subtree_tolerates_structural_byte_in_key() {
         ))
         .blob_subtree("/files", Rule::public())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     let forwarded = check(&guard, &http::Method::GET, "/files/a%2fb").await;
@@ -1000,7 +1023,12 @@ async fn method_specific_rule_closes_other_methods_no_backtrack() {
         .route("/{*rest}", Rule::public()) // catch-all, any method, public
         .route("/admin", Rule::public().method(http::Method::GET)) // GET /admin public
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     // GET /admin → its GET rule → public.
@@ -1026,7 +1054,12 @@ async fn method_wildcard_fallback_is_per_terminal() {
         .route("/admin", Rule::public().method(http::Method::GET)) // GET public
         .route("/admin", Rule::required()) // every other method requires a token
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     assert_forward(&check(&guard, &http::Method::GET, "/admin").await);
@@ -1047,7 +1080,12 @@ async fn method_gap_denies_with_public_default() {
         .default(Rule::public()) // permissive fallback
         .route("/admin", Rule::required().method(http::Method::POST)) // only POST is protected
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     // POST /admin → its method rule → required → 401 without a token.
@@ -1072,7 +1110,12 @@ fn blob_subtree_with_nested_route_is_build_error() {
         .blob_subtree("/files", Rule::public())
         .route("/files/secret", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        });
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::Route { .. })
@@ -1103,7 +1146,12 @@ async fn plain_subtree_scopes_structural_byte_to_its_uniformity() {
         .subtree("/files", Rule::public())
         .route("/files/secret", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     let denied = check(&nested, &http::Method::GET, "/files/a%2fb").await;
@@ -1158,7 +1206,12 @@ async fn guard_off_allows_traversal() {
         )
         .subtree("/admin", Rule::required().scopes(["admin"]))
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/x/../admin/secret").await;
@@ -1178,7 +1231,12 @@ fn build_rejects_pattern_with_empty_segment() {
         .route("/a/b", Rule::public())
         .route("/a//b", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        });
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::Route { pattern, reason })
@@ -1196,7 +1254,12 @@ fn build_rejects_traversal_pattern() {
         ))
         .route("/x/../b", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        });
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::NonCanonicalPattern { .. })
@@ -1218,7 +1281,12 @@ fn build_allows_noncanonical_pattern_when_guard_off() {
         .route("/a/b", Rule::public())
         .route("/a%2fb", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        });
     assert!(result.is_ok());
 }
 
@@ -1233,7 +1301,12 @@ fn build_rejects_public_rule_with_check() {
         ))
         .route("/health", Rule::public().check(|_| Ok(())))
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        });
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::PublicRuleWithConstraints(p)) if p == "/health"
@@ -1249,7 +1322,12 @@ fn build_rejects_public_default_rule_with_check() {
         ))
         .default(Rule::public().check(|_| Ok(())))
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        });
     assert!(matches!(
         result,
         Err(crate::resource::ConfigError::PublicRuleWithConstraints(p)) if p == "<default>"
@@ -1267,7 +1345,12 @@ fn build_allows_distinct_canonical_trailing_slash_routes() {
         .route("/admin", Rule::public())
         .route("/admin/", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None));
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        });
     assert!(result.is_ok());
 }
 
@@ -1282,7 +1365,12 @@ async fn structural_case_opt_in_catches_relocation() {
         ))
         .subtree("/admin", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     // `/Admin/x` carries uppercase a case-insensitive backend would fold onto the
@@ -1318,7 +1406,12 @@ async fn hygiene_rejects_noncanonical_even_when_same_rule() {
         )
         .subtree("/files", Rule::public())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/files/a%2fb").await;
@@ -1338,7 +1431,12 @@ async fn hygiene_allows_canonical_path() {
         )
         .subtree("/files", Rule::public())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     // A clean path is canonical → allowed (public → forward).
@@ -1374,7 +1472,12 @@ async fn custom_probe_denies_aliased_prefix() {
         )
         .subtree("/admin", Rule::required().scopes(["admin"]))
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     // `/danger/secret` carries the probe's form → denied 400 (break-glass).
@@ -1401,7 +1504,12 @@ async fn structural_overlong_opt_in_catches_relocation() {
         )
         .subtree("/admin", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/x%c0%af..%c0%afadmin/secret").await;
@@ -1431,7 +1539,12 @@ async fn structural_null_truncation_denied_by_default() {
         ))
         .subtree("/admin", Rule::required())
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
 
     let outcome = check(&guard, &http::Method::GET, "/admin%00/secret").await;
@@ -1766,11 +1879,10 @@ async fn rejection_builds_exactly_one_challenge() {
         .route("/api", Rule::required())
         .build()
         .map(|policy| {
-            Guard::new(
-                CountingValidator(std::sync::Arc::clone(&counter)),
-                policy,
-                None,
-            )
+            Guard::builder()
+                .validator(CountingValidator(std::sync::Arc::clone(&counter)))
+                .policy(policy)
+                .build()
         })
         .unwrap();
 
@@ -1893,7 +2005,12 @@ fn metrics_name_label_present_when_configured() {
             .metrics_name("edge")
             .route("/health", Rule::public())
             .build()
-            .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+            .map(|policy| {
+                Guard::builder()
+                    .validator(MockValidator::no_token())
+                    .policy(policy)
+                    .build()
+            })
             .unwrap();
         check(&guard, &http::Method::GET, "/health").await
     });
@@ -1925,7 +2042,12 @@ async fn disabled_guard_still_denies_method_gaps() {
         .default(Rule::public())
         .route("/admin", Rule::public().method(http::Method::GET))
         .build()
-        .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+        .map(|policy| {
+            Guard::builder()
+                .validator(MockValidator::no_token())
+                .policy(policy)
+                .build()
+        })
         .unwrap();
     assert_deny(
         &check(&guard, &http::Method::POST, "/admin").await,
@@ -1947,7 +2069,12 @@ async fn configured_analysis_budget_applies_to_encoded_paths() {
             )
             .subtree("/files", Rule::public())
             .build()
-            .map(|policy| Guard::new(MockValidator::no_token(), policy, None))
+            .map(|policy| {
+                Guard::builder()
+                    .validator(MockValidator::no_token())
+                    .policy(policy)
+                    .build()
+            })
             .unwrap();
         let outcome = check(&guard, &http::Method::GET, "/files/a%2Fb").await;
         if allowed {
