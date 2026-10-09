@@ -1986,7 +1986,7 @@ mod tests {
             client.read_to_string(&mut wire).await.unwrap();
             let (_, body) = wire.split_once("\r\n\r\n").unwrap();
             if method == "HEAD" {
-                assert!(body.is_empty());
+                assert_eq!(body, "");
             } else if status == 200 {
                 assert_eq!(body.as_bytes(), metadata_body);
             } else {

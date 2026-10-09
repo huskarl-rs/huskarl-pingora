@@ -224,8 +224,8 @@ mod tests {
     fn public_rule_defaults() {
         let rule = Rule::<()>::public();
         assert_eq!(rule.token, TokenRequirement::None);
-        assert!(rule.audiences.is_empty());
-        assert!(rule.scopes.is_empty());
+        assert_eq!(rule.audiences, [] as [std::string::String; 0]);
+        assert_eq!(rule.scopes, [] as [std::string::String; 0]);
         assert!(rule.scope_param.is_none());
         assert!(rule.strip_credentials);
         assert!(rule.check.is_none());

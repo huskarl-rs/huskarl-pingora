@@ -1648,7 +1648,7 @@ async fn interim_headers_preserve_work_until_final_or_upgrade_response() {
                 .response_filter(&mut session, &mut header, &mut ctx)
                 .await
                 .unwrap();
-            assert!(set_cookies(&header).is_empty());
+            assert_eq!(set_cookies(&header), [] as [&str; 0]);
             assert_eq!(proxy.inner.store.as_ref().unwrap().save_count(), 0);
             assert!(ctx.login_state().pending.is_some());
         }
